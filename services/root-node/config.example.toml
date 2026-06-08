@@ -1,0 +1,44 @@
+[server]
+host = "127.0.0.1"
+port = 8000
+endpoint = "http://localhost:8000"
+
+[cors]
+allowed_origins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://openagenet.github.io",
+  "https://openagenet.github.io/oan-site",
+]
+
+[node]
+name = "Root Node"
+role = "root"
+did_semantic_code = "AGRT"
+
+[security.admin]
+mode = "static-token"
+static_tokens = ["local-dev-admin-token"]
+
+[security.trust_indexer]
+enabled = false
+endpoint = "http://127.0.0.1:9100"
+fail_mode = "closed"
+timeout_ms = 500
+poll_interval_ms = 3000
+
+[events]
+enabled = true
+backend = "nats-jetstream"
+endpoint = "nats://127.0.0.1:4222"
+stream = "OAN_RESOURCE_PUBLICATION"
+cdn_publish_subject = "oan.resource.cdn.publish.requested"
+publish_timeout_ms = 1000
+failure_mode = "closed"
+
+[paths]
+data_dir = "../../data/root"
+keys_dir = "../../data/root/keys"
+bulletin_file = "../../data/root/bulletin.json"
+capability_tree_file = "../../docs/capability-tree-v1.json"
+database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_root"

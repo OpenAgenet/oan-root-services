@@ -1,0 +1,37 @@
+﻿[package]
+name = "root-node"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-nats.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+oan-bulletin.workspace = true
+oan-core.workspace = true
+oan-credentials.workspace = true
+oan-crypto.workspace = true
+oan-package.workspace = true
+oan-publication-events.workspace = true
+oan-protocol.workspace = true
+oan-service-security.workspace = true
+oan-storage.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tower-http.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+hyper = { version = "1", features = ["server", "http1"] }
+tempfile.workspace = true
+

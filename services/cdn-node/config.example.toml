@@ -1,0 +1,35 @@
+[server]
+host = "127.0.0.1"
+port = 8003
+endpoint = "http://localhost:8003"
+
+[cors]
+allowed_origins = [
+  "http://localhost:5173",
+  "http://127.0.0.1:5173",
+  "https://openagenet.github.io",
+  "https://openagenet.github.io/oan-site",
+]
+
+[service]
+name = "CDN Service"
+role = "cdn-service"
+provider = "local"
+
+[security.admin]
+mode = "static-token"
+static_tokens = ["local-dev-admin-token"]
+
+[security.trusted_upstream]
+root_did = "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz"
+
+[upstream]
+root_endpoint = "http://localhost:8000"
+
+[paths]
+data_dir = "../../data/cdn"
+manifest_file = "../../data/cdn/manifest.json"
+documents_dir = "../../data/cdn/documents"
+metadata_dir = "../../data/cdn/metadata"
+resources_dir = "../../data/cdn/resources"
+database_url = "postgres://postgres:postgres@127.0.0.1:5432/oan_cdn"

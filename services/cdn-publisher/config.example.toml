@@ -1,0 +1,23 @@
+[server]
+host = "127.0.0.1"
+port = 8010
+
+[events]
+endpoint = "nats://127.0.0.1:4222"
+stream = "OAN_RESOURCE_PUBLICATION"
+subject = "oan.resource.cdn.publish.requested"
+durable_consumer = "oan-cdn-publisher"
+batch_size = 100
+fetch_timeout_ms = 1000
+max_in_flight = 16
+
+[root]
+endpoint = "http://127.0.0.1:8000"
+keys_dir = "../../data/root/keys"
+admin_token = "local-dev-admin-token"
+mark_published_path = "/root/internal/cdn-publication-jobs/mark-published"
+
+[cdn]
+endpoint = "http://127.0.0.1:8003"
+publish_batch_path = "/cdn/resources/batch"
+http_timeout_seconds = 30
