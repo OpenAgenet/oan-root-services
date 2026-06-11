@@ -11,9 +11,9 @@ Root-side worker for event-driven ResourcePackage publication.
 ## Role
 
 `cdn-publisher` consumes Root-emitted NATS JetStream
-`cdn_publish_requested` events, fetches the Root-approved ResourcePackage from
-Root, verifies the event hashes against the fetched package, and publishes one
-bounded batch to CDN through `/cdn/resources/batch`.
+`cdn_publish_requested` events, fetches Root-approved ResourcePackages from
+Root in bounded batches, verifies the event hashes against the fetched
+packages, and publishes one bounded batch to CDN through `/cdn/resources/batch`.
 
 It is not an OAN infrastructure role. It does not have a service-node DID, does
 not participate in chain-governed authorization, and does not change the CDN

@@ -7,14 +7,15 @@ endpoint = "nats://127.0.0.1:4222"
 stream = "OAN_RESOURCE_PUBLICATION"
 subject = "oan.resource.cdn.publish.requested"
 durable_consumer = "oan-cdn-publisher"
-batch_size = 100
+batch_size = 200
 fetch_timeout_ms = 1000
-max_in_flight = 16
+max_in_flight = 200
 
 [root]
 endpoint = "http://127.0.0.1:8000"
 keys_dir = "../../data/root/keys"
 admin_token = "local-dev-admin-token"
+package_batch_path = "/root/internal/cdn-publication-jobs/packages"
 mark_published_path = "/root/internal/cdn-publication-jobs/mark-published"
 
 [cdn]

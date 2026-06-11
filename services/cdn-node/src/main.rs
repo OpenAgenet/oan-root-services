@@ -52,6 +52,12 @@ struct ResourceIndexQuery {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct ResourceBatchGetRequest {
+    #[serde(rename = "resourceDids")]
+    resource_dids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct Config {
     server: ServerConfig,
     #[serde(default)]
@@ -267,6 +273,10 @@ async fn main() -> Result<()> {
     let public_routes = Router::new()
         .route("/health", get(health))
         .route("/cdn/resources/{did}", get(get_resource_package))
+        .route(
+            "/cdn/resources/batch-get",
+            post(api_get_resource_packages_batch),
+        )
         .route("/cdn/resources/index", get(api_resource_index))
         .route("/cdn/documents/{did}", get(get_document))
         .route("/cdn/metadata/{did}", get(get_metadata))
@@ -676,6 +686,35 @@ async fn get_resource_package(
     AxumPath(did): AxumPath<String>,
 ) -> ApiResult<ResourcePackage> {
     read_by_did(&state, "resources", &did).await
+}
+
+async fn api_get_resource_packages_batch(
+    State(state): State<AppState>,
+    Json(request): Json<ResourceBatchGetRequest>,
+) -> ApiResult<serde_json::Value> {
+    if request.resource_dids.is_empty() {
+        return Err(ApiError::bad_request("empty_resource_dids"));
+    }
+    let packages = read_resource_packages_by_dids(&state, &request.resource_dids)
+        .await
+        .map_err(ApiError::internal)?;
+    let items = request
+        .resource_dids
+        .iter()
+        .filter_map(|did| {
+            packages.get(did).map(|package| {
+                json!({
+                    "resourceDid": did,
+                    "package": package
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "requestedCount": request.resource_dids.len(),
+        "foundCount": items.len(),
+        "items": items
+    })))
 }
 
 async fn get_document(
@@ -1324,6 +1363,60 @@ async fn read_resource_package_by_did(
     Ok(None)
 }
 
+async fn read_resource_packages_by_dids(
+    state: &AppState,
+    dids: &[String],
+) -> Result<BTreeMap<String, ResourcePackage>> {
+    if dids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let mut packages = BTreeMap::new();
+        for chunk in dids.chunks(500) {
+            let mut builder = QueryBuilder::<Sqlite>::new(format!(
+                "SELECT resource_did, package_json FROM {CDN_RESOURCE_PACKAGE_TABLE} WHERE resource_did IN ("
+            ));
+            let mut separated = builder.separated(", ");
+            for did in chunk {
+                separated.push_bind(did);
+            }
+            separated.push_unseparated(")");
+            let rows = builder.build().fetch_all(sqlite.pool()).await?;
+            for row in rows {
+                packages.insert(
+                    row.get::<String, _>(0),
+                    serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+                );
+            }
+        }
+        return Ok(packages);
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            "SELECT resource_did, package_json::text FROM {CDN_RESOURCE_PACKAGE_TABLE} WHERE resource_did = ANY($1)"
+        ))
+        .bind(dids)
+        .fetch_all(postgres.pool())
+        .await?;
+        let mut packages = BTreeMap::new();
+        for row in rows {
+            packages.insert(
+                row.get::<String, _>(0),
+                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+            );
+        }
+        return Ok(packages);
+    }
+    let index = state
+        .data
+        .read::<BTreeMap<String, ResourcePackage>>("resources/index.json")
+        .unwrap_or_default();
+    Ok(dids
+        .iter()
+        .filter_map(|did| index.get(did).map(|package| (did.clone(), package.clone())))
+        .collect())
+}
+
 async fn read_by_did<T: serde::de::DeserializeOwned>(
     state: &AppState,
     kind: &str,
@@ -1820,6 +1913,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(purge.0["status"], "accepted");
+    }
+
+    #[tokio::test]
+    async fn api_get_resource_packages_batch_returns_existing_resources_in_request_order() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let first = sample_resource_package();
+        let second =
+            sample_resource_package_with_did("did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu");
+        let missing = "did:oan:SKLG:missing-resource".to_owned();
+        let index = BTreeMap::from([
+            (first.resource_did.clone(), first.clone()),
+            (second.resource_did.clone(), second.clone()),
+        ]);
+        state.data.write("resources/index.json", &index).unwrap();
+
+        let response = api_get_resource_packages_batch(
+            State(state),
+            Json(ResourceBatchGetRequest {
+                resource_dids: vec![
+                    second.resource_did.clone(),
+                    missing,
+                    first.resource_did.clone(),
+                ],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["requestedCount"], 3);
+        assert_eq!(response.0["foundCount"], 2);
+        assert_eq!(response.0["items"][0]["resourceDid"], second.resource_did);
+        assert_eq!(response.0["items"][1]["resourceDid"], first.resource_did);
     }
 
     #[tokio::test]

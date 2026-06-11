@@ -554,7 +554,7 @@ pub(super) async fn persist_resource_acceptance_impl(
 
         let mut tx = postgres.pool().begin().await?;
 
-        sqlx::query(&format!(
+        let publication_cursor = sqlx::query(&format!(
             r#"
             INSERT INTO {ROOT_SUBJECT_VERSION_TABLE}(
                 subject_did, version, did_document_hash, metadata_hash, package_json, archive_path, accepted_at
@@ -567,6 +567,7 @@ pub(super) async fn persist_resource_acceptance_impl(
                 package_json = excluded.package_json,
                 archive_path = excluded.archive_path,
                 accepted_at = excluded.accepted_at
+            RETURNING publication_cursor
             "#
         ))
         .bind(resource_did)
@@ -576,8 +577,9 @@ pub(super) async fn persist_resource_acceptance_impl(
         .bind(&package_json)
         .bind(&archive_path)
         .bind(&now)
-        .execute(&mut *tx)
-        .await?;
+        .fetch_one(&mut *tx)
+        .await?
+        .get::<i64, _>(0);
 
         sqlx::query(&format!(
             r#"
@@ -622,15 +624,6 @@ pub(super) async fn persist_resource_acceptance_impl(
         .bind(now)
         .execute(&mut *tx)
         .await?;
-
-        let publication_cursor = sqlx::query(&format!(
-            "SELECT publication_cursor FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = $1 AND version = $2"
-        ))
-        .bind(resource_did)
-        .bind(version)
-        .fetch_one(&mut *tx)
-        .await?
-        .get::<i64, _>(0);
 
         sqlx::query(&format!(
             r#"
@@ -1292,53 +1285,50 @@ pub(super) async fn claim_cdn_outbox_events_impl(
     Ok(Vec::new())
 }
 
-pub(super) async fn mark_cdn_outbox_event_published_impl(
+pub(super) async fn mark_cdn_outbox_events_published_batch_impl(
     state: &AppState,
-    job_key: &str,
-) -> Result<()> {
+    job_keys: &[String],
+) -> Result<u64> {
+    if job_keys.is_empty() {
+        return Ok(0);
+    }
     if let Some(sqlite) = &state.sqlite {
-        sqlite
-            .mark_leased_job_succeeded(ROOT_CDN_OUTBOX_TABLE, job_key)
-            .await?;
-        return Ok(());
+        return sqlite
+            .mark_leased_jobs_succeeded(ROOT_CDN_OUTBOX_TABLE, job_keys)
+            .await
+            .map_err(Into::into);
     }
     if let Some(postgres) = &state.postgres {
-        postgres
-            .mark_leased_job_succeeded(ROOT_CDN_OUTBOX_TABLE, job_key)
-            .await?;
+        return postgres
+            .mark_leased_jobs_succeeded(ROOT_CDN_OUTBOX_TABLE, job_keys)
+            .await
+            .map_err(Into::into);
     }
-    Ok(())
+    Ok(0)
 }
 
-pub(super) async fn mark_cdn_outbox_event_retry_impl(
+pub(super) async fn mark_cdn_outbox_events_retry_batch_impl(
     state: &AppState,
-    job_key: &str,
-    error: &str,
-) -> Result<()> {
+    jobs: &[(String, String)],
+) -> Result<u64> {
+    if jobs.is_empty() {
+        return Ok(0);
+    }
     let retry_after =
         Utc::now() + chrono::Duration::seconds(state.config.security.workers.retry_backoff_seconds);
     if let Some(sqlite) = &state.sqlite {
-        sqlite
-            .mark_leased_job_retry(
-                ROOT_CDN_OUTBOX_TABLE,
-                job_key,
-                &retry_after.to_rfc3339(),
-                Some(error),
-            )
-            .await?;
-        return Ok(());
+        return sqlite
+            .mark_leased_jobs_retry(ROOT_CDN_OUTBOX_TABLE, jobs, &retry_after.to_rfc3339())
+            .await
+            .map_err(Into::into);
     }
     if let Some(postgres) = &state.postgres {
-        postgres
-            .mark_leased_job_retry(
-                ROOT_CDN_OUTBOX_TABLE,
-                job_key,
-                &retry_after.to_rfc3339(),
-                Some(error),
-            )
-            .await?;
+        return postgres
+            .mark_leased_jobs_retry(ROOT_CDN_OUTBOX_TABLE, jobs, &retry_after.to_rfc3339())
+            .await
+            .map_err(Into::into);
     }
-    Ok(())
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -1453,31 +1443,29 @@ pub(super) async fn resource_packages_for_jobs_impl(
         return Ok(packages);
     }
     if let Some(postgres) = &state.postgres {
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "SELECT subject_did, version, package_json::text, publication_cursor FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
-        ));
-        for (index, (_, subject_did, version)) in pairs.iter().enumerate() {
-            if index > 0 {
-                builder.push(" OR ");
-            }
-            builder
-                .push("(subject_did = ")
+        let mut builder =
+            QueryBuilder::<Postgres>::new("WITH requested(job_key, subject_did, version) AS (");
+        builder.push_values(pairs.iter(), |mut row, (job_key, subject_did, version)| {
+            row.push_bind(job_key)
                 .push_bind(subject_did)
-                .push(" AND version = ")
-                .push_bind(version)
-                .push(")");
-        }
+                .push_bind(version);
+        });
+        builder.push(format!(
+            r#")
+            SELECT requested.job_key, versions.package_json::text, versions.publication_cursor
+            FROM requested
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = requested.subject_did
+             AND versions.version = requested.version
+            "#
+        ));
         let rows = builder.build().fetch_all(postgres.pool()).await?;
         let mut packages = BTreeMap::new();
         for row in rows {
-            let subject_did = row.get::<String, _>(0);
-            let version = row.get::<String, _>(1);
-            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(2))?;
-            let publication_cursor = row.get::<i64, _>(3);
-            packages.insert(
-                format!("{subject_did}:{version}"),
-                (package, publication_cursor),
-            );
+            let job_key = row.get::<String, _>(0);
+            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
+            let publication_cursor = row.get::<i64, _>(2);
+            packages.insert(job_key, (package, publication_cursor));
         }
         return Ok(packages);
     }
