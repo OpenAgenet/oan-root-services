@@ -25,6 +25,7 @@ use oan_storage::JsonStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -104,8 +105,35 @@ struct PublisherRuntime {
     total_acked_count: u64,
     total_failed_count: u64,
     last_elapsed_ms: u128,
+    last_fetch_elapsed_ms: u128,
+    last_prepare_elapsed_ms: u128,
+    last_publish_elapsed_ms: u128,
+    last_callback_elapsed_ms: u128,
+    last_ack_elapsed_ms: u128,
+    last_effective_batch_size: usize,
+    last_ack_concurrency: usize,
     last_error: Option<String>,
     updated_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PublisherCycleMetrics {
+    fetch_elapsed_ms: u128,
+    prepare_elapsed_ms: u128,
+    publish_elapsed_ms: u128,
+    callback_elapsed_ms: u128,
+    ack_elapsed_ms: u128,
+    effective_batch_size: usize,
+    ack_concurrency: usize,
+}
+
+#[derive(Clone, Debug, Default)]
+struct CdnBatchPublishOutcome {
+    published_cursors: BTreeSet<i64>,
+    published_count: usize,
+    failed_count: usize,
+    publish_elapsed_ms: u128,
+    callback_elapsed_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -263,6 +291,7 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
 
     loop {
         let started = std::time::Instant::now();
+        let mut cycle_metrics = PublisherCycleMetrics::default();
         let mut fetched = 0usize;
         let mut acked = 0usize;
         let mut failed = 0usize;
@@ -280,6 +309,7 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
             ))
             .messages()
             .await?;
+        let fetch_started = std::time::Instant::now();
 
         let mut batch = Vec::new();
         while let Some(message) = messages.next().await {
@@ -294,6 +324,7 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
                         acked,
                         failed,
                         started.elapsed().as_millis(),
+                        cycle_metrics.clone(),
                         Some(err.to_string()),
                     );
                     continue;
@@ -302,11 +333,18 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
             let decoded = decode_event_payload(&message.payload);
             batch.push((message, decoded));
         }
+        cycle_metrics.fetch_elapsed_ms = fetch_started.elapsed().as_millis();
+        cycle_metrics.effective_batch_size = batch.len();
         let mut prepared = Vec::new();
         if !batch.is_empty() {
+            let prepare_started = std::time::Instant::now();
             match prepare_publish_batch(&state, batch).await {
-                Ok(items) => prepared = items,
+                Ok(items) => {
+                    cycle_metrics.prepare_elapsed_ms = prepare_started.elapsed().as_millis();
+                    prepared = items;
+                }
                 Err(err) => {
+                    cycle_metrics.prepare_elapsed_ms = prepare_started.elapsed().as_millis();
                     failed += fetched.saturating_sub(acked);
                     eprintln!("cdn-publisher failed to prepare batch: {err}");
                 }
@@ -317,16 +355,37 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
                 .iter()
                 .map(|(_, publication_cursor, package)| (*publication_cursor, package.clone()))
                 .collect::<Vec<_>>();
+            let publish_started = std::time::Instant::now();
             match publish_packages_to_cdn(&state, items).await {
-                Ok(()) => {
+                Ok(outcome) => {
+                    if outcome.publish_elapsed_ms > 0 {
+                        cycle_metrics.publish_elapsed_ms = outcome.publish_elapsed_ms;
+                    } else {
+                        cycle_metrics.publish_elapsed_ms = publish_started.elapsed().as_millis();
+                    }
+                    cycle_metrics.callback_elapsed_ms = outcome.callback_elapsed_ms;
+                    failed += outcome.failed_count;
                     let messages = prepared
                         .into_iter()
-                        .map(|(message, _, _)| message)
+                        .filter_map(|(message, publication_cursor, _)| {
+                            outcome
+                                .published_cursors
+                                .contains(&publication_cursor)
+                                .then_some(message)
+                        })
                         .collect::<Vec<_>>();
-                    acked +=
-                        ack_messages(messages, state.config.events.max_in_flight.max(1)).await?;
+                    let ack_concurrency = state.config.events.max_in_flight.max(1);
+                    cycle_metrics.ack_concurrency = ack_concurrency;
+                    let ack_started = std::time::Instant::now();
+                    let acked_batch = ack_messages(messages, ack_concurrency).await?;
+                    acked += acked_batch;
+                    cycle_metrics.ack_elapsed_ms = ack_started.elapsed().as_millis();
+                    if acked_batch < outcome.published_count {
+                        failed += outcome.published_count - acked_batch;
+                    }
                 }
                 Err(err) => {
+                    cycle_metrics.publish_elapsed_ms = publish_started.elapsed().as_millis();
                     failed += prepared.len();
                     eprintln!("cdn-publisher batch failed: {err}");
                 }
@@ -338,6 +397,7 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
             acked,
             failed,
             started.elapsed().as_millis(),
+            cycle_metrics,
             None,
         );
         if fetched == 0 {
@@ -409,15 +469,14 @@ async fn prepare_publish_batch(
         .iter()
         .map(|(_, event)| event.clone())
         .collect::<Vec<_>>();
-    let packages = prepare_packages_for_events(state, &events).await?;
+    let mut packages = prepare_packages_for_events(state, &events).await?;
     let mut prepared = Vec::new();
     for (message, event) in decoded {
         let job_key = format!("{}:{}", event.resource_did, event.package_version);
-        let Some((publication_cursor, package)) = packages.get(&job_key) else {
+        let Some((publication_cursor, package)) = packages.remove(&job_key) else {
             return Err(anyhow!("root_package_missing:{job_key}"));
         };
-        validate_package_matches_event(package, &event)?;
-        prepared.push((message, *publication_cursor, package.clone()));
+        prepared.push((message, publication_cursor, package));
     }
     Ok(prepared)
 }
@@ -557,31 +616,69 @@ fn root_package_batch_url(root_endpoint: &str, path: &str) -> Result<Url> {
 async fn publish_packages_to_cdn(
     state: &AppState,
     packages: Vec<(i64, ResourcePackage)>,
-) -> Result<()> {
+) -> Result<CdnBatchPublishOutcome> {
     if packages.is_empty() {
-        return Ok(());
+        return Ok(CdnBatchPublishOutcome::default());
     }
     let request = build_cdn_batch_publish_request(state, packages)?;
     let url = cdn_publish_batch_url(
         &state.config.cdn.endpoint,
         &state.config.cdn.publish_batch_path,
     )?;
+    let publish_started = std::time::Instant::now();
     let response = state.client.post(url).json(&request).send().await?;
+    let publish_elapsed_ms = publish_started.elapsed().as_millis();
     let status = response.status();
     let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     if !status.is_success() {
         return Err(anyhow!("cdn_publish_failed:{status}:{value}"));
     }
-    if value
+    let published_cursors = extract_published_cursors(&value)?;
+    let failed_count = value
         .get("failedCount")
         .and_then(Value::as_u64)
-        .unwrap_or(0)
-        > 0
-    {
-        return Err(anyhow!("cdn_publish_partial:{value}"));
+        .unwrap_or(0) as usize;
+    if published_cursors.len() + failed_count != request.items.len() {
+        return Err(anyhow!(
+            "cdn_publish_response_count_mismatch:accepted={} failed={} requested={}",
+            published_cursors.len(),
+            failed_count,
+            request.items.len()
+        ));
     }
-    mark_root_jobs_published(state, &request.items).await?;
-    Ok(())
+    let published_items = request
+        .items
+        .iter()
+        .filter(|item| published_cursors.contains(&item.publication_cursor))
+        .cloned()
+        .collect::<Vec<_>>();
+    let callback_started = std::time::Instant::now();
+    if !published_items.is_empty() {
+        mark_root_jobs_published(state, &published_items).await?;
+    }
+    Ok(CdnBatchPublishOutcome {
+        published_count: published_items.len(),
+        failed_count,
+        published_cursors,
+        publish_elapsed_ms,
+        callback_elapsed_ms: callback_started.elapsed().as_millis(),
+    })
+}
+
+fn extract_published_cursors(value: &Value) -> Result<BTreeSet<i64>> {
+    let mut cursors = BTreeSet::new();
+    let items = value
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("cdn_publish_items_missing"))?;
+    for item in items {
+        let cursor = item
+            .get("publicationCursor")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("cdn_publish_item_cursor_missing"))?;
+        cursors.insert(cursor);
+    }
+    Ok(cursors)
 }
 
 async fn mark_root_jobs_published(
@@ -692,6 +789,7 @@ fn record_cycle(
     acked: usize,
     failed: usize,
     elapsed_ms: u128,
+    metrics: PublisherCycleMetrics,
     error: Option<String>,
 ) {
     if let Ok(mut runtime) = state.runtime.lock() {
@@ -701,6 +799,13 @@ fn record_cycle(
         runtime.total_acked_count = runtime.total_acked_count.saturating_add(acked as u64);
         runtime.total_failed_count = runtime.total_failed_count.saturating_add(failed as u64);
         runtime.last_elapsed_ms = elapsed_ms;
+        runtime.last_fetch_elapsed_ms = metrics.fetch_elapsed_ms;
+        runtime.last_prepare_elapsed_ms = metrics.prepare_elapsed_ms;
+        runtime.last_publish_elapsed_ms = metrics.publish_elapsed_ms;
+        runtime.last_callback_elapsed_ms = metrics.callback_elapsed_ms;
+        runtime.last_ack_elapsed_ms = metrics.ack_elapsed_ms;
+        runtime.last_effective_batch_size = metrics.effective_batch_size;
+        runtime.last_ack_concurrency = metrics.ack_concurrency;
         if error.is_some() {
             runtime.last_error = error;
         }
@@ -999,12 +1104,57 @@ mod tests {
     #[test]
     fn record_cycle_updates_runtime_counters() {
         let state = test_state();
-        record_cycle(&state, 3, 2, 1, 12, Some("err".to_owned()));
+        record_cycle(
+            &state,
+            3,
+            2,
+            1,
+            12,
+            PublisherCycleMetrics {
+                fetch_elapsed_ms: 2,
+                prepare_elapsed_ms: 3,
+                publish_elapsed_ms: 4,
+                callback_elapsed_ms: 5,
+                ack_elapsed_ms: 1,
+                effective_batch_size: 3,
+                ack_concurrency: 2,
+            },
+            Some("err".to_owned()),
+        );
         let runtime = state.runtime.lock().unwrap().clone();
         assert_eq!(runtime.last_fetched_count, 3);
         assert_eq!(runtime.total_acked_count, 2);
         assert_eq!(runtime.total_failed_count, 1);
+        assert_eq!(runtime.last_fetch_elapsed_ms, 2);
+        assert_eq!(runtime.last_prepare_elapsed_ms, 3);
+        assert_eq!(runtime.last_publish_elapsed_ms, 4);
+        assert_eq!(runtime.last_callback_elapsed_ms, 5);
+        assert_eq!(runtime.last_ack_elapsed_ms, 1);
+        assert_eq!(runtime.last_effective_batch_size, 3);
+        assert_eq!(runtime.last_ack_concurrency, 2);
         assert_eq!(runtime.last_error.as_deref(), Some("err"));
+    }
+
+    #[test]
+    fn extracts_published_cursors_from_partial_cdn_response() {
+        let value = json!({
+            "status": "partial",
+            "acceptedCount": 2,
+            "failedCount": 1,
+            "items": [
+                { "resourceDid": "did:oan:AGUS:test", "publicationCursor": 42, "status": "published" },
+                { "resourceDid": "did:oan:AGUS:test2", "publicationCursor": 43, "status": "published" }
+            ],
+            "failed": [
+                { "resourceDid": "did:oan:AGUS:test3", "publicationCursor": 44, "error": "bad_hash" }
+            ]
+        });
+
+        let cursors = extract_published_cursors(&value).unwrap();
+
+        assert_eq!(cursors.len(), 2);
+        assert!(cursors.contains(&42));
+        assert!(cursors.contains(&43));
     }
 
     #[test]

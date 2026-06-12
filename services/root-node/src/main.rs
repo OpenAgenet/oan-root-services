@@ -69,12 +69,14 @@ mod repository;
 const ROOT_CDN_JOB_TABLE: &str = "root_cdn_publish_jobs";
 const ROOT_CDN_OUTBOX_TABLE: &str = "root_cdn_publish_outbox";
 const ROOT_DISCOVERY_TARGET_TABLE: &str = "root_discovery_target_notifications";
+const ROOT_DISCOVERY_ITEM_TABLE: &str = "root_discovery_notification_items";
 const ROOT_BULLETIN_EVENT_TABLE: &str = "root_bulletin_events";
 const ROOT_SUBJECT_LATEST_TABLE: &str = "root_subject_latest";
 const ROOT_SUBJECT_VERSION_TABLE: &str = "root_subject_versions";
 const ROOT_PACKAGE_JOB_TABLE: &str = "root_verified_package_jobs";
 const ROOT_DEBUG_EXPORT_INTERVAL_MS: u64 = 2_000;
 const ROOT_STATUS_CACHE_TTL_MS: u64 = 100;
+const ROOT_WORKER_MAX_IMMEDIATE_DRAIN_CYCLES: usize = 8;
 
 #[derive(Clone, Debug, Deserialize)]
 struct Config {
@@ -414,7 +416,7 @@ struct AppState {
     tag_tree: CapabilityTagTree,
     sqlite: Option<SqliteJsonStore>,
     postgres: Option<PostgresJsonStore>,
-    authorization_state: AuthorizationState,
+    authorization_state: Arc<Mutex<AuthorizationState>>,
     client: reqwest::Client,
     trust_indexer_client: reqwest::Client,
     event_publisher: EventPublisher,
@@ -422,9 +424,18 @@ struct AppState {
     event_runtime: Arc<Mutex<EventRuntimeState>>,
     admission_runtime: Arc<Mutex<AdmissionRuntimeState>>,
     status_counts_cache: Arc<Mutex<Option<CachedRootStatusCounts>>>,
+    worker_wake_state: Arc<Mutex<WorkerWakeState>>,
     admission_semaphore: Arc<Semaphore>,
     cdn_worker_notify: Arc<Notify>,
     discovery_worker_notify: Arc<Notify>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkerWakeState {
+    cdn_last_event_signal_at: Option<Instant>,
+    discovery_last_event_signal_at: Option<Instant>,
+    cdn_pending_event_signal_count: u64,
+    discovery_pending_event_signal_count: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -441,17 +452,65 @@ struct WorkerRuntimeState {
     cdn_last_progress_elapsed_ms: u128,
     cdn_last_progress_success_count: usize,
     cdn_last_progress_failed_count: usize,
+    cdn_last_progress_trigger_type: Option<String>,
+    cdn_last_claim_elapsed_ms: u128,
+    cdn_last_publish_elapsed_ms: u128,
+    cdn_last_mark_published_elapsed_ms: u128,
+    cdn_last_mark_retry_elapsed_ms: u128,
     cdn_effective_batch_size: usize,
     cdn_effective_concurrency: usize,
+    cdn_last_trigger_type: Option<String>,
+    cdn_last_event_to_cycle_start_ms: u128,
+    cdn_oldest_pending_age_ms: u128,
+    cdn_event_trigger_count: u64,
+    cdn_timer_trigger_count: u64,
+    cdn_noop_cycle_count: u64,
     discovery_last_elapsed_ms: u128,
     discovery_last_success_count: usize,
     discovery_last_failed_count: usize,
     discovery_last_progress_elapsed_ms: u128,
     discovery_last_progress_success_count: usize,
     discovery_last_progress_failed_count: usize,
+    discovery_last_progress_trigger_type: Option<String>,
+    discovery_last_claim_elapsed_ms: u128,
+    discovery_last_prepare_elapsed_ms: u128,
+    discovery_last_notify_elapsed_ms: u128,
     discovery_effective_batch_size: usize,
     discovery_effective_concurrency: usize,
+    discovery_last_trigger_type: Option<String>,
+    discovery_last_event_to_cycle_start_ms: u128,
+    discovery_oldest_pending_age_ms: u128,
+    discovery_event_trigger_count: u64,
+    discovery_timer_trigger_count: u64,
+    discovery_noop_cycle_count: u64,
+    mark_published_last_fetch_elapsed_ms: u128,
+    mark_published_last_update_elapsed_ms: u128,
+    mark_published_last_watermark_elapsed_ms: u128,
+    mark_published_last_total_elapsed_ms: u128,
+    mark_published_last_job_count: usize,
+    mark_published_total_call_count: u64,
     updated_at: Option<chrono::DateTime<Utc>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum WorkerTriggerType {
+    Event,
+    Timer,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct CdnWorkerStageMetrics {
+    claim_elapsed_ms: u128,
+    publish_elapsed_ms: u128,
+    mark_published_elapsed_ms: u128,
+    mark_retry_elapsed_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DiscoveryWorkerStageMetrics {
+    claim_elapsed_ms: u128,
+    prepare_elapsed_ms: u128,
+    notify_elapsed_ms: u128,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -890,6 +949,12 @@ struct DiscoveryNotificationItem {
     capability_tags: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct DiscoveryNotificationTargetItem {
+    discovery_did: String,
+    item: DiscoveryNotificationItem,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = env::args()
@@ -933,7 +998,7 @@ async fn main() -> Result<()> {
             .unwrap_or_else(|_| default_tag_tree()),
         sqlite,
         postgres,
-        authorization_state,
+        authorization_state: Arc::new(Mutex::new(authorization_state)),
         client: reqwest::Client::builder()
             .timeout(TokioDuration::from_secs(
                 config.security.workers.http_timeout_seconds,
@@ -955,6 +1020,7 @@ async fn main() -> Result<()> {
         })),
         admission_runtime: Arc::new(Mutex::new(AdmissionRuntimeState::default())),
         status_counts_cache: Arc::new(Mutex::new(None)),
+        worker_wake_state: Arc::new(Mutex::new(WorkerWakeState::default())),
         admission_semaphore: Arc::new(Semaphore::new(
             config.security.workers.admission_concurrency.max(1),
         )),
@@ -1189,57 +1255,93 @@ fn spawn_trust_indexer_watcher(state: AppState) {
 
 async fn root_cdn_outbox_relay_loop(state: AppState) {
     let interval_ms = state.config.security.workers.cdn_interval_ms.max(100);
+    let mut immediate_drain_cycles = 0usize;
     loop {
-        let made_progress = match run_cdn_outbox_relay_cycle(&state).await {
-            Ok(result) => {
-                result
-                    .get("attemptedCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-            }
+        let cycle = match run_cdn_outbox_relay_cycle(&state).await {
+            Ok(result) => Some(result),
             Err(err) => {
                 eprintln!("root cdn outbox relay cycle failed: {err}");
-                false
+                None
             }
         };
-        if made_progress {
+        let made_progress = cycle.as_ref().map(cdn_cycle_made_progress).unwrap_or(false);
+        let should_continue_immediately = cycle
+            .as_ref()
+            .map(cdn_cycle_should_continue_immediately)
+            .unwrap_or(false);
+        if should_continue_immediately {
+            immediate_drain_cycles = immediate_drain_cycles.saturating_add(1);
+            if immediate_drain_cycles < ROOT_WORKER_MAX_IMMEDIATE_DRAIN_CYCLES {
+                continue;
+            }
+            immediate_drain_cycles = 0;
+            tokio::task::yield_now().await;
             continue;
         }
+        if made_progress {
+            immediate_drain_cycles = 0;
+            continue;
+        }
+        immediate_drain_cycles = 0;
+        record_worker_noop_cycle(&state, true);
         tokio::select! {
-            _ = state.cdn_worker_notify.notified() => {}
-            _ = sleep(TokioDuration::from_millis(interval_ms)) => {}
+            _ = state.cdn_worker_notify.notified() => {
+                record_worker_trigger(&state, true, WorkerTriggerType::Event);
+                if let Some(delay_ms) = take_worker_event_delay_ms(&state, true) {
+                    record_worker_event_delay(&state, true, delay_ms);
+                }
+            }
+            _ = sleep(TokioDuration::from_millis(interval_ms)) => {
+                record_worker_trigger(&state, true, WorkerTriggerType::Timer);
+            }
         }
     }
 }
 
 async fn root_discovery_worker_loop(state: AppState) {
     let interval_ms = state.config.security.workers.discovery_interval_ms.max(100);
+    let mut immediate_drain_cycles = 0usize;
     loop {
-        let made_progress = match run_discovery_notify_cycle(&state).await {
-            Ok(result) => {
-                result
-                    .get("notifiedCount")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0)
-                    > 0
-                    || result
-                        .get("failedCount")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0)
-                        > 0
-            }
+        let cycle = match run_discovery_notify_cycle(&state).await {
+            Ok(result) => Some(result),
             Err(err) => {
                 eprintln!("root discovery worker cycle failed: {err}");
-                false
+                None
             }
         };
-        if made_progress {
+        let made_progress = cycle
+            .as_ref()
+            .map(discovery_cycle_made_progress)
+            .unwrap_or(false);
+        let should_continue_immediately = cycle
+            .as_ref()
+            .map(discovery_cycle_should_continue_immediately)
+            .unwrap_or(false);
+        if should_continue_immediately {
+            immediate_drain_cycles = immediate_drain_cycles.saturating_add(1);
+            if immediate_drain_cycles < ROOT_WORKER_MAX_IMMEDIATE_DRAIN_CYCLES {
+                continue;
+            }
+            immediate_drain_cycles = 0;
+            tokio::task::yield_now().await;
             continue;
         }
+        if made_progress {
+            immediate_drain_cycles = 0;
+            continue;
+        }
+        immediate_drain_cycles = 0;
+        record_worker_noop_cycle(&state, false);
         tokio::select! {
-            _ = state.discovery_worker_notify.notified() => {}
-            _ = sleep(TokioDuration::from_millis(interval_ms)) => {}
+            _ = state.discovery_worker_notify.notified() => {
+                record_worker_trigger(&state, false, WorkerTriggerType::Event);
+                if let Some(delay_ms) = take_worker_event_delay_ms(&state, false) {
+                    record_worker_event_delay(&state, false, delay_ms);
+                }
+            }
+            _ = sleep(TokioDuration::from_millis(interval_ms)) => {
+                record_worker_trigger(&state, false, WorkerTriggerType::Timer);
+            }
         }
     }
 }
@@ -1260,9 +1362,7 @@ async fn reconcile_governance_state(state: &AppState) -> Result<()> {
     if !state.config.security.trust_indexer.enabled {
         return Ok(());
     }
-    let authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let authorization_state = current_authorization_state(state);
 
     for did in authorization_state.registrars.keys() {
         match ensure_governance_active(state, GovernanceSubjectType::Registrar, did).await {
@@ -1525,9 +1625,7 @@ fn mark_local_governance_inactive(
     if reason.starts_with("trust_indexer_unavailable_fail_open") {
         return Ok(());
     }
-    let mut authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let mut authorization_state = current_authorization_state(state);
     match subject_type {
         GovernanceSubjectType::Registrar => {
             if let Some(entry) = authorization_state.registrars.get_mut(did) {
@@ -1575,9 +1673,7 @@ fn restore_local_governance_active(
     subject_type: GovernanceSubjectType,
     did: &str,
 ) -> Result<()> {
-    let mut authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let mut authorization_state = current_authorization_state(state);
     let mut changed = false;
     match subject_type {
         GovernanceSubjectType::Registrar => {
@@ -1686,6 +1782,18 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 last_error TEXT,
                 updated_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS {ROOT_DISCOVERY_ITEM_TABLE} (
+                discovery_did TEXT NOT NULL,
+                publication_cursor INTEGER NOT NULL,
+                resource_did TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                package_hash TEXT NOT NULL,
+                metadata_hash TEXT NOT NULL,
+                did_document_hash TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                capability_tags_json TEXT NOT NULL,
+                PRIMARY KEY(discovery_did, publication_cursor)
+            );
             "#
         ))
         .await?;
@@ -1752,12 +1860,26 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 last_error TEXT,
                 updated_at TIMESTAMPTZ NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS {ROOT_DISCOVERY_ITEM_TABLE} (
+                discovery_did TEXT NOT NULL,
+                publication_cursor BIGINT NOT NULL,
+                resource_did TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                package_hash TEXT NOT NULL,
+                metadata_hash TEXT NOT NULL,
+                did_document_hash TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                capability_tags_json JSONB NOT NULL,
+                PRIMARY KEY(discovery_did, publication_cursor)
+            );
             CREATE INDEX IF NOT EXISTS idx_root_subject_versions_subject_version
             ON {ROOT_SUBJECT_VERSION_TABLE}(subject_did, accepted_at DESC);
             CREATE INDEX IF NOT EXISTS idx_root_bulletin_events_sequence
             ON {ROOT_BULLETIN_EVENT_TABLE}(sequence);
             CREATE INDEX IF NOT EXISTS idx_root_discovery_target_schedule
             ON {ROOT_DISCOVERY_TARGET_TABLE}(status, pending_cursor, delivered_cursor, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_root_discovery_items_target_cursor
+            ON {ROOT_DISCOVERY_ITEM_TABLE}(discovery_did, publication_cursor);
             "#
         ))
         .await?;
@@ -2141,19 +2263,12 @@ async fn update_discovery_domains(
         payload,
     )
     .map_err(ApiError::internal)?;
-    let mut authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let mut authorization_state = current_authorization_state(&state);
     if let Some(entry) = authorization_state.discovery_nodes.get_mut(&did) {
         entry.authorized_domains = domains;
         entry.tag_tree_version = state.tag_tree.version;
         entry.updated_at = Utc::now();
-        JsonStore::new(".")
-            .write(
-                &state.config.paths.authorization_state_file,
-                &authorization_state,
-            )
-            .map_err(ApiError::internal)?;
+        persist_authorization_state(&state, authorization_state).map_err(ApiError::internal)?;
     }
     Ok(Json(json!({"status": "ok"})))
 }
@@ -2172,9 +2287,7 @@ async fn revoke_node(
 }
 
 async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
-    let authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let authorization_state = current_authorization_state(&state);
     if let Some(counts) = cached_root_status_counts_from_database(&state)
         .await
         .map_err(ApiError::internal)?
@@ -2192,6 +2305,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
             "discoveryQueueCount": counts.discovery_ready_queue_count,
             "discoveryReadyQueueCount": counts.discovery_ready_queue_count,
             "discoveryPendingQueueCount": counts.discovery_pending_queue_count,
+            "discoveryItemPendingCount": counts.discovery_item_pending_count,
             "statusBackend": counts.backend,
             "capabilityTreeVersion": state.tag_tree.version,
             "registrarAuthorizationCount": authorization_state.registrars.len(),
@@ -2235,6 +2349,7 @@ async fn api_status(State(state): State<AppState>) -> ApiResult<Value> {
         "discoveryQueueCount": discovery_ready_queue.len(),
         "discoveryReadyQueueCount": discovery_ready_queue.len(),
         "discoveryPendingQueueCount": discovery_pending_queue.len(),
+        "discoveryItemPendingCount": 0,
         "capabilityTreeVersion": state.tag_tree.version,
         "registrarAuthorizationCount": authorization_state.registrars.len(),
         "discoveryAuthorizationCount": authorization_state.discovery_nodes.len(),
@@ -2321,8 +2436,10 @@ fn record_discovery_worker_runtime(
     failed_count: usize,
     batch_size: usize,
     concurrency: usize,
+    stage_metrics: DiscoveryWorkerStageMetrics,
 ) {
     if let Ok(mut runtime) = state.worker_runtime.lock() {
+        let trigger_type = runtime.discovery_last_trigger_type.clone();
         runtime.discovery_last_elapsed_ms = elapsed_ms;
         runtime.discovery_last_success_count = success_count;
         runtime.discovery_last_failed_count = failed_count;
@@ -2330,7 +2447,11 @@ fn record_discovery_worker_runtime(
             runtime.discovery_last_progress_elapsed_ms = elapsed_ms;
             runtime.discovery_last_progress_success_count = success_count;
             runtime.discovery_last_progress_failed_count = failed_count;
+            runtime.discovery_last_progress_trigger_type = trigger_type;
         }
+        runtime.discovery_last_claim_elapsed_ms = stage_metrics.claim_elapsed_ms;
+        runtime.discovery_last_prepare_elapsed_ms = stage_metrics.prepare_elapsed_ms;
+        runtime.discovery_last_notify_elapsed_ms = stage_metrics.notify_elapsed_ms;
         runtime.discovery_effective_batch_size = batch_size;
         runtime.discovery_effective_concurrency = concurrency;
         runtime.updated_at = Some(Utc::now());
@@ -2364,8 +2485,10 @@ fn record_cdn_worker_runtime(
     failed_count: usize,
     batch_size: usize,
     concurrency: usize,
+    stage_metrics: CdnWorkerStageMetrics,
 ) {
     if let Ok(mut runtime) = state.worker_runtime.lock() {
+        let trigger_type = runtime.cdn_last_trigger_type.clone();
         runtime.cdn_last_elapsed_ms = elapsed_ms;
         runtime.cdn_last_success_count = success_count;
         runtime.cdn_last_failed_count = failed_count;
@@ -2373,9 +2496,165 @@ fn record_cdn_worker_runtime(
             runtime.cdn_last_progress_elapsed_ms = elapsed_ms;
             runtime.cdn_last_progress_success_count = success_count;
             runtime.cdn_last_progress_failed_count = failed_count;
+            runtime.cdn_last_progress_trigger_type = trigger_type;
         }
+        runtime.cdn_last_claim_elapsed_ms = stage_metrics.claim_elapsed_ms;
+        runtime.cdn_last_publish_elapsed_ms = stage_metrics.publish_elapsed_ms;
+        runtime.cdn_last_mark_published_elapsed_ms = stage_metrics.mark_published_elapsed_ms;
+        runtime.cdn_last_mark_retry_elapsed_ms = stage_metrics.mark_retry_elapsed_ms;
         runtime.cdn_effective_batch_size = batch_size;
         runtime.cdn_effective_concurrency = concurrency;
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn record_worker_trigger(state: &AppState, cdn_worker: bool, trigger: WorkerTriggerType) {
+    if let Ok(mut runtime) = state.worker_runtime.lock() {
+        match (cdn_worker, trigger) {
+            (true, WorkerTriggerType::Event) => {
+                runtime.cdn_event_trigger_count = runtime.cdn_event_trigger_count.saturating_add(1);
+                runtime.cdn_last_trigger_type = Some("event".to_owned());
+            }
+            (true, WorkerTriggerType::Timer) => {
+                runtime.cdn_timer_trigger_count = runtime.cdn_timer_trigger_count.saturating_add(1);
+                runtime.cdn_last_trigger_type = Some("timer".to_owned());
+            }
+            (false, WorkerTriggerType::Event) => {
+                runtime.discovery_event_trigger_count =
+                    runtime.discovery_event_trigger_count.saturating_add(1);
+                runtime.discovery_last_trigger_type = Some("event".to_owned());
+            }
+            (false, WorkerTriggerType::Timer) => {
+                runtime.discovery_timer_trigger_count =
+                    runtime.discovery_timer_trigger_count.saturating_add(1);
+                runtime.discovery_last_trigger_type = Some("timer".to_owned());
+            }
+        }
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn signal_worker_event(state: &AppState, cdn_worker: bool) {
+    if let Ok(mut wake_state) = state.worker_wake_state.lock() {
+        if cdn_worker {
+            wake_state.cdn_last_event_signal_at = Some(Instant::now());
+            wake_state.cdn_pending_event_signal_count =
+                wake_state.cdn_pending_event_signal_count.saturating_add(1);
+        } else {
+            wake_state.discovery_last_event_signal_at = Some(Instant::now());
+            wake_state.discovery_pending_event_signal_count = wake_state
+                .discovery_pending_event_signal_count
+                .saturating_add(1);
+        }
+    }
+    if cdn_worker {
+        state.cdn_worker_notify.notify_one();
+    } else {
+        state.discovery_worker_notify.notify_one();
+    }
+}
+
+fn take_worker_event_delay_ms(state: &AppState, cdn_worker: bool) -> Option<u128> {
+    let signaled_at = state
+        .worker_wake_state
+        .lock()
+        .ok()
+        .and_then(|mut wake_state| {
+            if cdn_worker {
+                wake_state.cdn_pending_event_signal_count =
+                    wake_state.cdn_pending_event_signal_count.saturating_sub(1);
+                if wake_state.cdn_pending_event_signal_count == 0 {
+                    wake_state.cdn_last_event_signal_at.take()
+                } else {
+                    wake_state.cdn_last_event_signal_at
+                }
+            } else {
+                wake_state.discovery_pending_event_signal_count = wake_state
+                    .discovery_pending_event_signal_count
+                    .saturating_sub(1);
+                if wake_state.discovery_pending_event_signal_count == 0 {
+                    wake_state.discovery_last_event_signal_at.take()
+                } else {
+                    wake_state.discovery_last_event_signal_at
+                }
+            }
+        })?;
+    Some(signaled_at.elapsed().as_millis())
+}
+
+fn record_worker_event_delay(state: &AppState, cdn_worker: bool, delay_ms: u128) {
+    if let Ok(mut runtime) = state.worker_runtime.lock() {
+        if cdn_worker {
+            runtime.cdn_last_event_to_cycle_start_ms = delay_ms;
+        } else {
+            runtime.discovery_last_event_to_cycle_start_ms = delay_ms;
+        }
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn record_worker_oldest_pending_age(state: &AppState, cdn_worker: bool, age_ms: u128) {
+    if let Ok(mut runtime) = state.worker_runtime.lock() {
+        if cdn_worker {
+            runtime.cdn_oldest_pending_age_ms = age_ms;
+        } else {
+            runtime.discovery_oldest_pending_age_ms = age_ms;
+        }
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn resource_package_oldest_age_ms(items: &[ResourcePackage]) -> u128 {
+    let now = Utc::now();
+    items
+        .iter()
+        .filter_map(|item| (now - item.created_at).to_std().ok())
+        .map(|duration| duration.as_millis())
+        .max()
+        .unwrap_or(0)
+}
+
+fn discovery_queue_oldest_age_ms(items: &[Value]) -> u128 {
+    let now = Utc::now();
+    items
+        .iter()
+        .filter_map(|item| item.get("updatedAt").and_then(Value::as_str))
+        .filter_map(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+        .map(|value| now.signed_duration_since(value.with_timezone(&Utc)))
+        .filter_map(|duration| duration.to_std().ok())
+        .map(|duration| duration.as_millis())
+        .max()
+        .unwrap_or(0)
+}
+
+fn record_worker_noop_cycle(state: &AppState, cdn_worker: bool) {
+    if let Ok(mut runtime) = state.worker_runtime.lock() {
+        if cdn_worker {
+            runtime.cdn_noop_cycle_count = runtime.cdn_noop_cycle_count.saturating_add(1);
+        } else {
+            runtime.discovery_noop_cycle_count =
+                runtime.discovery_noop_cycle_count.saturating_add(1);
+        }
+        runtime.updated_at = Some(Utc::now());
+    }
+}
+
+fn record_mark_published_runtime(
+    state: &AppState,
+    job_count: usize,
+    fetch_elapsed_ms: u128,
+    update_elapsed_ms: u128,
+    watermark_elapsed_ms: u128,
+    total_elapsed_ms: u128,
+) {
+    if let Ok(mut runtime) = state.worker_runtime.lock() {
+        runtime.mark_published_last_job_count = job_count;
+        runtime.mark_published_last_fetch_elapsed_ms = fetch_elapsed_ms;
+        runtime.mark_published_last_update_elapsed_ms = update_elapsed_ms;
+        runtime.mark_published_last_watermark_elapsed_ms = watermark_elapsed_ms;
+        runtime.mark_published_last_total_elapsed_ms = total_elapsed_ms;
+        runtime.mark_published_total_call_count =
+            runtime.mark_published_total_call_count.saturating_add(1);
         runtime.updated_at = Some(Utc::now());
     }
 }
@@ -2407,6 +2686,7 @@ struct RootStatusCounts {
     cdn_outbox_active_count: i64,
     discovery_ready_queue_count: i64,
     discovery_pending_queue_count: i64,
+    discovery_item_pending_count: i64,
 }
 
 async fn cached_root_status_counts_from_database(
@@ -2502,6 +2782,11 @@ async fn root_status_counts_from_database(state: &AppState) -> Result<Option<Roo
         .fetch_one(sqlite.pool())
         .await?
         .get::<i64, _>(0);
+        let discovery_item_pending_count =
+            sqlx::query(&format!("SELECT COUNT(*) FROM {ROOT_DISCOVERY_ITEM_TABLE}"))
+                .fetch_one(sqlite.pool())
+                .await?
+                .get::<i64, _>(0);
         return Ok(Some(RootStatusCounts {
             backend: "sqlite",
             bulletin_event_count,
@@ -2512,6 +2797,7 @@ async fn root_status_counts_from_database(state: &AppState) -> Result<Option<Roo
             cdn_outbox_active_count,
             discovery_ready_queue_count,
             discovery_pending_queue_count,
+            discovery_item_pending_count,
         }));
     }
     if let Some(postgres) = &state.postgres {
@@ -2550,7 +2836,10 @@ async fn root_status_counts_from_database(state: &AppState) -> Result<Option<Roo
                 (
                     SELECT COUNT(*) FROM {ROOT_DISCOVERY_TARGET_TABLE}
                     WHERE status = 'active' AND pending_cursor > delivered_cursor
-                ) AS discovery_pending_queue_count
+                ) AS discovery_pending_queue_count,
+                (
+                    SELECT COUNT(*) FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                ) AS discovery_item_pending_count
             "#
         ))
         .bind(&now)
@@ -2566,15 +2855,14 @@ async fn root_status_counts_from_database(state: &AppState) -> Result<Option<Roo
             cdn_outbox_active_count: row.get::<i64, _>("cdn_outbox_active_count"),
             discovery_ready_queue_count: row.get::<i64, _>("discovery_ready_queue_count"),
             discovery_pending_queue_count: row.get::<i64, _>("discovery_pending_queue_count"),
+            discovery_item_pending_count: row.get::<i64, _>("discovery_item_pending_count"),
         }));
     }
     Ok(None)
 }
 
 async fn api_registrars(State(state): State<AppState>) -> ApiResult<Value> {
-    let authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let authorization_state = current_authorization_state(&state);
     let items: Vec<Value> = authorization_state
         .registrars
         .into_iter()
@@ -2627,9 +2915,7 @@ async fn api_registrar_detail(
 }
 
 async fn api_discovery_nodes(State(state): State<AppState>) -> ApiResult<Value> {
-    let authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let authorization_state = current_authorization_state(&state);
     let items: Vec<Value> = authorization_state
         .discovery_nodes
         .into_iter()
@@ -2778,6 +3064,7 @@ async fn api_mark_cdn_publication_jobs_published(
     State(state): State<AppState>,
     Json(request): Json<MarkCdnPublicationJobsPublishedRequest>,
 ) -> ApiResult<Value> {
+    let started = Instant::now();
     let _principal = require_admin(&headers, &state)?;
     if request.jobs.is_empty() {
         return Err(ApiError::bad_request("empty_jobs"));
@@ -2796,24 +3083,49 @@ async fn api_mark_cdn_publication_jobs_published(
         .iter()
         .map(|(job_key, _)| job_key.clone())
         .collect::<Vec<_>>();
-    let published_packages = resource_packages_for_jobs(&state, &job_keys)
+    let fetch_started = Instant::now();
+    let notification_items = discovery_notification_targets_for_jobs(&state, &job_keys)
         .await
         .map_err(ApiError::internal)?;
+    let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
+    let update_started = Instant::now();
     mark_cdn_jobs_published_batch(&state, &jobs)
         .await
         .map_err(ApiError::internal)?;
-    let package_cursors = published_packages.into_values().collect::<Vec<_>>();
-    let advanced_discovery_count =
-        advance_discovery_target_watermarks_batch(&state, &package_cursors)
+    let update_elapsed_ms = update_started.elapsed().as_millis();
+    let watermark_started = Instant::now();
+    let stored_notification_count =
+        repository::store_discovery_notification_items_impl(&state, &notification_items)
             .await
             .map_err(ApiError::internal)?;
+    let advanced_discovery_count =
+        advance_discovery_target_watermarks_for_items(&state, &notification_items)
+            .await
+            .map_err(ApiError::internal)?;
+    let watermark_elapsed_ms = watermark_started.elapsed().as_millis();
+    let total_elapsed_ms = started.elapsed().as_millis();
+    record_mark_published_runtime(
+        &state,
+        jobs.len(),
+        fetch_elapsed_ms,
+        update_elapsed_ms,
+        watermark_elapsed_ms,
+        total_elapsed_ms,
+    );
     if advanced_discovery_count > 0 {
-        state.discovery_worker_notify.notify_waiters();
+        signal_worker_event(&state, false);
     }
     Ok(Json(json!({
         "status": "ok",
         "markedCount": jobs.len(),
-        "advancedDiscoveryCount": advanced_discovery_count
+        "storedNotificationCount": stored_notification_count,
+        "advancedDiscoveryCount": advanced_discovery_count,
+        "timing": {
+            "fetchElapsedMs": fetch_elapsed_ms,
+            "updateElapsedMs": update_elapsed_ms,
+            "watermarkElapsedMs": watermark_elapsed_ms,
+            "totalElapsedMs": total_elapsed_ms
+        }
     })))
 }
 
@@ -2932,9 +3244,7 @@ fn load_authorized_registrar_entry(
     state: &AppState,
     did: &str,
 ) -> std::result::Result<NodeAuthorizationState, String> {
-    let authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let authorization_state = current_authorization_state(state);
     let entry = authorization_state
         .registrars
         .get(did)
@@ -3469,7 +3779,7 @@ fn archive_resource_verified(state: &AppState, package: &ResourcePackage) -> Res
 async fn persist_resource_acceptance(state: &AppState, package: &ResourcePackage) -> Result<()> {
     repository::persist_resource_acceptance_impl(state, package).await?;
     invalidate_status_counts_cache(state);
-    state.cdn_worker_notify.notify_one();
+    signal_worker_event(state, true);
     Ok(())
 }
 
@@ -3593,6 +3903,28 @@ fn load_authorization_state(path: &Path) -> Result<AuthorizationState> {
     }
 }
 
+fn current_authorization_state(state: &AppState) -> AuthorizationState {
+    state
+        .authorization_state
+        .lock()
+        .map(|value| value.clone())
+        .unwrap_or_default()
+}
+
+fn persist_authorization_state(
+    state: &AppState,
+    authorization_state: AuthorizationState,
+) -> Result<()> {
+    JsonStore::new(".").write(
+        &state.config.paths.authorization_state_file,
+        &authorization_state,
+    )?;
+    if let Ok(mut current) = state.authorization_state.lock() {
+        *current = authorization_state;
+    }
+    Ok(())
+}
+
 fn update_authorization_state(
     state: &AppState,
     did: &str,
@@ -3600,9 +3932,7 @@ fn update_authorization_state(
     role: &str,
     discovery: Option<DiscoveryAuthorizationState>,
 ) -> Result<()> {
-    let mut authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let mut authorization_state = current_authorization_state(state);
     match role {
         "registrar" | "Registrar" | "Registrar Node" => {
             authorization_state.registrars.insert(did.to_owned(), entry);
@@ -3621,10 +3951,7 @@ fn update_authorization_state(
             authorization_state.registrars.insert(did.to_owned(), entry);
         }
     }
-    JsonStore::new(".").write(
-        &state.config.paths.authorization_state_file,
-        &authorization_state,
-    )?;
+    persist_authorization_state(state, authorization_state)?;
     Ok(())
 }
 
@@ -3634,16 +3961,11 @@ fn update_discovery_authorization_state(
     entry: DiscoveryAuthorizationState,
 ) -> Result<()> {
     let entry_status = entry.status.clone();
-    let mut authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let mut authorization_state = current_authorization_state(state);
     authorization_state
         .discovery_nodes
         .insert(did.to_owned(), entry);
-    JsonStore::new(".").write(
-        &state.config.paths.authorization_state_file,
-        &authorization_state,
-    )?;
+    persist_authorization_state(state, authorization_state)?;
     if state.sqlite.is_some() || state.postgres.is_some() {
         sync_discovery_target_state(state, did, &entry_status)?;
     }
@@ -3651,9 +3973,7 @@ fn update_discovery_authorization_state(
 }
 
 fn revoke_authorization_state(state: &AppState, did: &str) -> Result<()> {
-    let mut authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let mut authorization_state = current_authorization_state(state);
     if let Some(entry) = authorization_state.registrars.get_mut(did) {
         entry.status = "revoked".to_owned();
         entry.updated_at = Utc::now();
@@ -3666,10 +3986,7 @@ fn revoke_authorization_state(state: &AppState, did: &str) -> Result<()> {
         entry.status = "revoked".to_owned();
         entry.updated_at = Utc::now();
     }
-    JsonStore::new(".").write(
-        &state.config.paths.authorization_state_file,
-        &authorization_state,
-    )?;
+    persist_authorization_state(state, authorization_state)?;
     if state.sqlite.is_some() || state.postgres.is_some() {
         sync_discovery_target_state(state, did, "revoked")?;
     }
@@ -3838,6 +4155,14 @@ async fn claim_discovery_targets(
     repository::claim_discovery_targets_impl(state, worker_id, limit, lease_seconds).await
 }
 
+async fn oldest_ready_discovery_target_age_ms(state: &AppState) -> Result<Option<u128>> {
+    if state.sqlite.is_some() || state.postgres.is_some() {
+        return repository::oldest_ready_discovery_target_age_ms_impl(state).await;
+    }
+    let queue = read_ready_discovery_queue(state).await?;
+    Ok(Some(discovery_queue_oldest_age_ms(&queue)))
+}
+
 async fn mark_discovery_target_notified(
     state: &AppState,
     discovery_did: &str,
@@ -3858,6 +4183,7 @@ async fn mark_discovery_target_retry(
     Ok(())
 }
 
+#[cfg(test)]
 async fn advance_discovery_target_watermarks_batch(
     state: &AppState,
     packages: &[(ResourcePackage, i64)],
@@ -3892,6 +4218,14 @@ async fn claim_cdn_outbox_events(
     repository::claim_cdn_outbox_events_impl(state, worker_id, limit, lease_seconds).await
 }
 
+async fn oldest_ready_cdn_outbox_age_ms(state: &AppState) -> Result<Option<u128>> {
+    if state.sqlite.is_some() || state.postgres.is_some() {
+        return repository::oldest_ready_cdn_outbox_age_ms_impl(state).await;
+    }
+    let queue = read_ready_cdn_queue(state).await?;
+    Ok(Some(resource_package_oldest_age_ms(&queue)))
+}
+
 async fn mark_cdn_outbox_events_published_batch(
     state: &AppState,
     job_keys: &[String],
@@ -3924,21 +4258,49 @@ async fn publication_cursors_for_jobs(
 
 async fn authorized_discovery_summary_items(
     state: &AppState,
-    auth: &DiscoveryAuthorizationState,
+    discovery_did: &str,
     delivered_cursor: i64,
     target_cursor: i64,
 ) -> Result<Vec<DiscoveryNotificationItem>> {
     repository::authorized_discovery_summary_items_impl(
         state,
-        auth,
+        discovery_did,
         delivered_cursor,
         target_cursor,
     )
     .await
 }
 
+async fn discovery_notification_targets_for_jobs(
+    state: &AppState,
+    job_keys: &[String],
+) -> Result<Vec<DiscoveryNotificationTargetItem>> {
+    repository::discovery_notification_targets_for_jobs_impl(state, job_keys).await
+}
+
+async fn advance_discovery_target_watermarks_for_items(
+    state: &AppState,
+    items: &[DiscoveryNotificationTargetItem],
+) -> Result<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let mut target_cursors = BTreeMap::<String, i64>::new();
+    for item in items {
+        target_cursors
+            .entry(item.discovery_did.clone())
+            .and_modify(|cursor| *cursor = (*cursor).max(item.item.publication_cursor))
+            .or_insert(item.item.publication_cursor);
+    }
+    repository::advance_discovery_target_cursors_impl(state, target_cursors).await
+}
+
 async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
     let started = std::time::Instant::now();
+    if let Some(age_ms) = oldest_ready_cdn_outbox_age_ms(state).await? {
+        record_worker_oldest_pending_age(state, true, age_ms);
+    }
+    let (ready_depth_before, active_depth_before) = cdn_queue_depths(state).await?;
     let batch_size = state
         .config
         .security
@@ -3948,6 +4310,7 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
         .saturating_mul(4)
         .min(5_000);
     let worker_id = request_id("root-cdn-outbox-relay");
+    let claim_started = std::time::Instant::now();
     let claimed = claim_cdn_outbox_events(
         state,
         &worker_id,
@@ -3955,12 +4318,14 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
         state.config.security.workers.lease_seconds,
     )
     .await?;
+    let claim_elapsed_ms = claim_started.elapsed().as_millis();
     let attempted_count = claimed.len();
     let concurrency = state.config.security.workers.cdn_concurrency.max(1);
     let mut published = Vec::new();
     let mut failed = Vec::new();
     let mut in_flight = JoinSet::new();
     let mut claimed_iter = claimed.into_iter();
+    let publish_started = std::time::Instant::now();
     loop {
         while in_flight.len() < concurrency {
             let Some((job_key, event)) = claimed_iter.next() else {
@@ -3998,9 +4363,15 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
             ))
         })
         .collect::<Vec<_>>();
+    let publish_elapsed_ms = publish_started.elapsed().as_millis();
+    let mark_published_started = std::time::Instant::now();
     let marked_published_count = mark_cdn_outbox_events_published_batch(state, &published).await?;
+    let mark_published_elapsed_ms = mark_published_started.elapsed().as_millis();
+    let mark_retry_started = std::time::Instant::now();
     let marked_retry_count = mark_cdn_outbox_events_retry_batch(state, &failed_jobs).await?;
+    let mark_retry_elapsed_ms = mark_retry_started.elapsed().as_millis();
     let elapsed_ms = started.elapsed().as_millis();
+    let (ready_depth_after, active_depth_after) = cdn_queue_depths(state).await?;
     record_cdn_worker_runtime(
         state,
         elapsed_ms,
@@ -4008,6 +4379,12 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
         failed.len(),
         batch_size,
         concurrency,
+        CdnWorkerStageMetrics {
+            claim_elapsed_ms,
+            publish_elapsed_ms,
+            mark_published_elapsed_ms,
+            mark_retry_elapsed_ms,
+        },
     );
     Ok(json!({
         "enabled": true,
@@ -4016,10 +4393,18 @@ async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
         "failedCount": failed.len(),
         "concurrency": concurrency,
         "effectiveBatchSize": batch_size,
+        "claimElapsedMs": claim_elapsed_ms,
+        "publishElapsedMs": publish_elapsed_ms,
+        "markPublishedElapsedMs": mark_published_elapsed_ms,
+        "markRetryElapsedMs": mark_retry_elapsed_ms,
         "elapsedMs": elapsed_ms,
         "drainRatePerSec": drain_rate_per_sec(published.len(), elapsed_ms),
         "markedPublishedCount": marked_published_count,
         "markedRetryCount": marked_retry_count,
+        "readyQueueDepthBefore": ready_depth_before,
+        "activeQueueDepthBefore": active_depth_before,
+        "readyQueueDepthAfter": ready_depth_after,
+        "activeQueueDepthAfter": active_depth_after,
         "published": published,
         "failed": failed
     }))
@@ -4048,7 +4433,11 @@ fn discovery_sync_url(auth: &DiscoveryAuthorizationState) -> Result<String> {
 
 async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
     let started = std::time::Instant::now();
+    if let Some(age_ms) = oldest_ready_discovery_target_age_ms(state).await? {
+        record_worker_oldest_pending_age(state, false, age_ms);
+    }
     let (ready_depth_before, pending_depth_before) = discovery_queue_depths(state).await?;
+    let claim_started = std::time::Instant::now();
     let targets = claim_discovery_targets(
         state,
         "root-discovery-worker",
@@ -4060,19 +4449,19 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
         state.config.security.workers.lease_seconds,
     )
     .await?;
+    let claim_elapsed_ms = claim_started.elapsed().as_millis();
     let claimed_count = targets.len();
     let claimed_cursor_lag: i64 = targets
         .iter()
         .map(|target| (target.target_cursor - target.delivered_cursor).max(0))
         .sum();
-    let authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
+    let authorization_state = current_authorization_state(state);
     let mut notified = Vec::new();
     let mut failed = Vec::<Value>::new();
     let concurrency = state.config.security.workers.discovery_concurrency.max(1);
     let mut in_flight = JoinSet::new();
     let mut target_iter = targets.into_iter();
+    let notify_started = std::time::Instant::now();
 
     loop {
         while in_flight.len() < concurrency {
@@ -4143,19 +4532,29 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         }));
                     }
                 };
-                let summary_items = authorized_discovery_summary_items(
+                let mut summary_items = authorized_discovery_summary_items(
                     &state,
-                    &auth,
+                    &lease.discovery_did,
                     lease.delivered_cursor,
                     lease.target_cursor,
                 )
                 .await?;
+                let max_items = state.config.security.workers.discovery_batch_size.max(1);
+                if summary_items.len() > max_items {
+                    summary_items.truncate(max_items);
+                }
+                let batch_target_cursor = summary_items
+                    .last()
+                    .map(|item| item.publication_cursor)
+                    .unwrap_or(lease.target_cursor)
+                    .min(lease.target_cursor)
+                    .max(lease.delivered_cursor);
                 let response = state
                     .client
                     .post(&sync_url)
                     .json(&json!({
                         "maxPublications": state.config.security.workers.discovery_batch_size,
-                        "cursorHint": lease.target_cursor,
+                        "cursorHint": batch_target_cursor,
                         "items": summary_items
                     }))
                     .send()
@@ -4165,9 +4564,10 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         let response_body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
                         let delivered_cursor = response_body
                             .get("toCursor")
-                            .and_then(Value::as_i64)
-                            .unwrap_or(lease.target_cursor)
-                            .min(lease.target_cursor)
+                            .and_then(Value::as_i64);
+                        let delivered_cursor = delivered_cursor
+                            .unwrap_or(batch_target_cursor)
+                            .min(batch_target_cursor)
                             .max(lease.delivered_cursor);
                         let rejected_count = response_body
                             .get("rejectedCount")
@@ -4176,7 +4576,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         let cursor_lag = response_body
                             .get("cursorLag")
                             .and_then(Value::as_i64)
-                            .unwrap_or_else(|| lease.target_cursor.saturating_sub(delivered_cursor));
+                            .unwrap_or_else(|| batch_target_cursor.saturating_sub(delivered_cursor));
                         if delivered_cursor > lease.delivered_cursor {
                             mark_discovery_target_notified(
                                 &state,
@@ -4185,10 +4585,10 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                             )
                             .await?;
                         }
-                        if rejected_count > 0 || cursor_lag > 0 || delivered_cursor < lease.target_cursor {
+                        if rejected_count > 0 || cursor_lag > 0 || delivered_cursor < batch_target_cursor {
                             let error = format!(
                                 "discovery_partial_sync:delivered={delivered_cursor}:target={}:rejected={rejected_count}:cursorLag={cursor_lag}",
-                                lease.target_cursor
+                                batch_target_cursor
                             );
                             mark_discovery_target_retry(&state, &lease.discovery_did, &error)
                                 .await?;
@@ -4199,7 +4599,8 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 "authorizedDomains": auth.authorized_domains,
                                 "itemCount": summary_items.len(),
                                 "deliveredCursor": delivered_cursor,
-                                "targetCursor": lease.target_cursor,
+                                "targetCursor": batch_target_cursor,
+                                "pendingTargetCursor": lease.target_cursor,
                                 "previousDeliveredCursor": lease.delivered_cursor,
                                 "syncUrl": sync_url,
                                 "syncResult": response_body,
@@ -4207,19 +4608,15 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 "createdAt": Utc::now()
                             }));
                         }
-                        mark_discovery_target_notified(
-                            &state,
-                            &lease.discovery_did,
-                            lease.target_cursor,
-                        )
-                        .await?;
                         Ok(json!({
                             "kind": "notified",
                             "rootDid": state.root_did,
                             "targetDiscoveryDid": lease.discovery_did,
                             "authorizedDomains": auth.authorized_domains,
                             "itemCount": summary_items.len(),
-                            "deliveredCursor": lease.target_cursor,
+                            "deliveredCursor": delivered_cursor,
+                            "targetCursor": batch_target_cursor,
+                            "pendingTargetCursor": lease.target_cursor,
                             "previousDeliveredCursor": lease.delivered_cursor,
                             "syncUrl": sync_url,
                             "syncResult": response_body,
@@ -4268,6 +4665,8 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
         }
     }
     let elapsed_ms = started.elapsed().as_millis();
+    let notify_elapsed_ms = notify_started.elapsed().as_millis();
+    let prepare_elapsed_ms = elapsed_ms.saturating_sub(claim_elapsed_ms + notify_elapsed_ms);
     let (ready_depth_after, pending_depth_after) = discovery_queue_depths(state).await?;
     record_discovery_worker_runtime(
         state,
@@ -4280,6 +4679,11 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
             2,
         ),
         concurrency,
+        DiscoveryWorkerStageMetrics {
+            claim_elapsed_ms,
+            prepare_elapsed_ms,
+            notify_elapsed_ms,
+        },
     );
     let result = json!({
         "status": if failed.is_empty() { "ok" } else { "partial" },
@@ -4289,6 +4693,9 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
         "successCount": notified.len(),
         "notifiedCount": notified.len(),
         "failedCount": failed.len(),
+        "claimElapsedMs": claim_elapsed_ms,
+        "prepareElapsedMs": prepare_elapsed_ms,
+        "notifyElapsedMs": notify_elapsed_ms,
         "elapsedMs": elapsed_ms,
         "drainRatePerSec": drain_rate_per_sec(notified.len(), elapsed_ms),
         "claimedCursorLag": claimed_cursor_lag,
@@ -4322,6 +4729,38 @@ fn drain_rate_per_sec(success_count: usize, elapsed_ms: u128) -> f64 {
     }
     let elapsed_seconds = (elapsed_ms as f64 / 1000.0).max(0.001);
     success_count as f64 / elapsed_seconds
+}
+
+fn value_u64(result: &Value, field: &str) -> u64 {
+    result.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn cdn_cycle_made_progress(result: &Value) -> bool {
+    value_u64(result, "attemptedCount") > 0
+}
+
+fn cdn_cycle_should_continue_immediately(result: &Value) -> bool {
+    cdn_cycle_made_progress(result) && value_u64(result, "readyQueueDepthAfter") > 0
+}
+
+fn discovery_cycle_made_progress(result: &Value) -> bool {
+    value_u64(result, "notifiedCount") > 0 || value_u64(result, "failedCount") > 0
+}
+
+fn discovery_cycle_should_continue_immediately(result: &Value) -> bool {
+    discovery_cycle_made_progress(result) && value_u64(result, "readyQueueDepthAfter") > 0
+}
+
+async fn cdn_queue_depths(state: &AppState) -> Result<(usize, usize)> {
+    if let Some(counts) = root_status_counts_from_database(state).await? {
+        return Ok((
+            counts.cdn_outbox_ready_count.max(0) as usize,
+            counts.cdn_outbox_active_count.max(0) as usize,
+        ));
+    }
+    let ready = read_ready_cdn_queue(state).await?.len();
+    let active = read_cdn_queue(state).await?.len();
+    Ok((ready, active))
 }
 
 async fn discovery_queue_depths(state: &AppState) -> Result<(usize, usize)> {
@@ -4657,7 +5096,7 @@ mod tests {
             tag_tree: default_tag_tree(),
             sqlite: None,
             postgres: None,
-            authorization_state: AuthorizationState::default(),
+            authorization_state: Arc::new(Mutex::new(AuthorizationState::default())),
             client: reqwest::Client::new(),
             trust_indexer_client: reqwest::Client::new(),
             event_publisher: EventPublisher::Succeed,
@@ -4665,6 +5104,7 @@ mod tests {
             event_runtime: Arc::new(Mutex::new(EventRuntimeState::default())),
             admission_runtime: Arc::new(Mutex::new(AdmissionRuntimeState::default())),
             status_counts_cache: Arc::new(Mutex::new(None)),
+            worker_wake_state: Arc::new(Mutex::new(WorkerWakeState::default())),
             admission_semaphore: Arc::new(Semaphore::new(
                 SecurityConfig::default()
                     .workers
@@ -4949,6 +5389,15 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn overwrite_authorization_state_for_test(
+        state: &AppState,
+        mutate: impl FnOnce(&mut AuthorizationState),
+    ) {
+        let mut authorization_state = current_authorization_state(state);
+        mutate(&mut authorization_state);
+        persist_authorization_state(state, authorization_state).unwrap();
     }
 
     fn resource_verify_request(
@@ -5290,21 +5739,13 @@ mod tests {
         .await;
         let registrar_key = generate_ed25519_keypair();
         authorize_registrar(&state, &registrar_key);
-        {
-            let mut authorization_state =
-                load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        overwrite_authorization_state_for_test(&state, |authorization_state| {
             authorization_state
                 .registrars
                 .get_mut(registrar_did())
                 .unwrap()
                 .status = "governance_inactive".to_owned();
-            JsonStore::new(".")
-                .write(
-                    &state.config.paths.authorization_state_file,
-                    &authorization_state,
-                )
-                .unwrap();
-        }
+        });
 
         reconcile_governance_state(&state).await.unwrap();
 
@@ -5319,21 +5760,13 @@ mod tests {
             "active"
         );
 
-        {
-            let mut authorization_state =
-                load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        overwrite_authorization_state_for_test(&state, |authorization_state| {
             authorization_state
                 .registrars
                 .get_mut(registrar_did())
                 .unwrap()
                 .status = "revoked".to_owned();
-            JsonStore::new(".")
-                .write(
-                    &state.config.paths.authorization_state_file,
-                    &authorization_state,
-                )
-                .unwrap();
-        }
+        });
         reconcile_governance_state(&state).await.unwrap();
         let authorization_state =
             load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
@@ -5659,6 +6092,11 @@ mod tests {
         assert_eq!(first["effectiveBatchSize"], 8);
         assert_eq!(first["markedPublishedCount"], 8);
         assert_eq!(first["failedCount"], 0);
+        assert_eq!(first["readyQueueDepthBefore"], 10);
+        assert_eq!(first["activeQueueDepthBefore"], 10);
+        assert_eq!(first["readyQueueDepthAfter"], 2);
+        assert_eq!(first["activeQueueDepthAfter"], 2);
+        assert!(cdn_cycle_should_continue_immediately(&first));
 
         let counts = root_status_counts_from_database(&state)
             .await
@@ -5674,6 +6112,9 @@ mod tests {
         let second = run_cdn_outbox_relay_cycle(&state).await.unwrap();
         assert_eq!(second["attemptedCount"], 2);
         assert_eq!(second["publishedCount"], 2);
+        assert_eq!(second["readyQueueDepthAfter"], 0);
+        assert_eq!(second["activeQueueDepthAfter"], 0);
+        assert!(!cdn_cycle_should_continue_immediately(&second));
         let counts = root_status_counts_from_database(&state)
             .await
             .unwrap()
@@ -6205,18 +6646,87 @@ capability_tree_file = "../capability-tree.json"
             .await
             .unwrap();
 
-        let mut authorization_state =
-            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
-        let auth = authorization_state
-            .discovery_nodes
-            .remove(discovery_did())
+        let notification_items = discovery_notification_targets_for_jobs(
+            &state,
+            &[
+                format!("{}:{}", matching.resource_did, matching.package_version),
+                format!("{}:{}", unassigned.resource_did, unassigned.package_version),
+            ],
+        )
+        .await
+        .unwrap();
+        repository::store_discovery_notification_items_impl(&state, &notification_items)
+            .await
             .unwrap();
-        let items = authorized_discovery_summary_items(&state, &auth, 0, i64::MAX)
+        let items = authorized_discovery_summary_items(&state, discovery_did(), 0, i64::MAX)
             .await
             .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].package_version, "1");
         assert_eq!(items[0].capability_tags, vec!["openagenet.local.agent"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn authorized_discovery_summary_reads_versions_when_notification_store_is_empty() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        let registrar_key = generate_ed25519_keypair();
+        let discovery_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            "http://127.0.0.1:1",
+            vec!["openagenet.local".to_owned()],
+        );
+
+        let resource_key_a = generate_ed25519_keypair();
+        let request_a = resource_verify_request_with_version(
+            &state,
+            &registrar_key,
+            &resource_key_a,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+            "1",
+        );
+        let mut package_a = package_from_request(&state, &request_a);
+        package_a.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        persist_resource_acceptance(&state, &package_a)
+            .await
+            .unwrap();
+
+        let resource_key_b = generate_ed25519_keypair();
+        let request_b = resource_verify_request_with_version(
+            &state,
+            &registrar_key,
+            &resource_key_b,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+            "1",
+        );
+        let mut package_b = package_from_request(&state, &request_b);
+        package_b.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package_b.resource_did = "did:oan:AGSG:derivedsummarysecondresource".to_owned();
+        package_b.did_document.id = package_b.resource_did.clone();
+        if let Some(method) = package_b.did_document.verification_method.get_mut(0) {
+            method.id = format!("{}#key-1", package_b.resource_did);
+            method.controller = package_b.resource_did.clone();
+        }
+        package_b.did_document.authentication = vec![format!("{}#key-1", package_b.resource_did)];
+        package_b.did_document.assertion_method = vec![format!("{}#key-1", package_b.resource_did)];
+        package_b.metadata.resource_did = package_b.resource_did.clone();
+        package_b.metadata.subject_did = Some(package_b.resource_did.clone());
+        persist_resource_acceptance(&state, &package_b)
+            .await
+            .unwrap();
+
+        let items = authorized_discovery_summary_items(&state, discovery_did(), 0, i64::MAX)
+            .await
+            .unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].publication_cursor, 1);
+        assert_eq!(items[1].publication_cursor, 2);
+        assert_eq!(items[0].resource_did, package_a.resource_did);
+        assert_eq!(items[1].resource_did, package_b.resource_did);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6473,5 +6983,132 @@ capability_tree_file = "../capability-tree.json"
 
         let status = api_status(State(state)).await.unwrap();
         assert_eq!(status.0["discoveryPendingQueueCount"], 0);
+    }
+
+    #[test]
+    fn worker_event_signal_count_is_not_lost_when_signaled_multiple_times() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+
+        signal_worker_event(&state, true);
+        signal_worker_event(&state, true);
+
+        let first_delay = take_worker_event_delay_ms(&state, true);
+        let second_delay = take_worker_event_delay_ms(&state, true);
+        let third_delay = take_worker_event_delay_ms(&state, true);
+
+        assert!(first_delay.is_some());
+        assert!(second_delay.is_some());
+        assert!(third_delay.is_none());
+    }
+
+    #[test]
+    fn adaptive_worker_drain_only_continues_when_ready_work_remains() {
+        let cdn_continue = json!({
+            "attemptedCount": 8,
+            "readyQueueDepthAfter": 2
+        });
+        let cdn_stop = json!({
+            "attemptedCount": 8,
+            "readyQueueDepthAfter": 0
+        });
+        let discovery_continue = json!({
+            "notifiedCount": 1,
+            "failedCount": 0,
+            "readyQueueDepthAfter": 1
+        });
+        let discovery_stop = json!({
+            "notifiedCount": 1,
+            "failedCount": 0,
+            "readyQueueDepthAfter": 0
+        });
+
+        assert!(cdn_cycle_made_progress(&cdn_continue));
+        assert!(cdn_cycle_should_continue_immediately(&cdn_continue));
+        assert!(!cdn_cycle_should_continue_immediately(&cdn_stop));
+        assert!(discovery_cycle_made_progress(&discovery_continue));
+        assert!(discovery_cycle_should_continue_immediately(
+            &discovery_continue
+        ));
+        assert!(!discovery_cycle_should_continue_immediately(
+            &discovery_stop
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_worker_signal_preserves_permit_when_sent_before_wait() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+
+        signal_worker_event(&state, false);
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.discovery_worker_notify.notified(),
+        )
+        .await
+        .expect("discovery worker signal should retain a permit");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_worker_runtime_records_event_trigger_for_progress() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let discovery_key = generate_ed25519_keypair();
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+
+        async fn sync_handler(Json(_payload): Json<Value>) -> Json<Value> {
+            Json(json!({"status": "synced", "syncedResourceCount": 1}))
+        }
+        let app = Router::new().route("/discovery/resources/sync-authorized", post(sync_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint(&state, &discovery_key, &format!("http://{addr}"));
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let metadata = build_resource_metadata(&request.submission).unwrap();
+        let package = ResourcePackage {
+            package_version: request.submission.package_version.clone(),
+            resource_did: request.submission.resource_did.clone(),
+            resource_type: request.submission.resource_type.clone(),
+            did_document: request.submission.did_document.clone(),
+            did_document_hash: request.submission.did_document_hash.clone(),
+            metadata_hash: request.submission.metadata_hash.clone(),
+            package_hash: request.submission.package_hash.clone(),
+            hash_algorithm: request.submission.hash_algorithm.clone(),
+            metadata,
+            root_proof: RootProof {
+                root_did: state.root_did.clone(),
+                bulletin_event_hash: None,
+                signature: None,
+                package_claims: None,
+                proof: None,
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                hash_algorithm: Some("sha256".to_owned()),
+            },
+            created_at: Utc::now(),
+        };
+        advance_discovery_target_watermarks_batch(&state, &[(package, 7)])
+            .await
+            .unwrap();
+
+        record_worker_trigger(&state, false, WorkerTriggerType::Event);
+        let _ = run_discovery_notify_cycle(&state).await.unwrap();
+
+        let status = api_status(State(state)).await.unwrap();
+        assert_eq!(
+            status.0["workerRuntime"]["discovery_last_progress_trigger_type"],
+            "event"
+        );
     }
 }

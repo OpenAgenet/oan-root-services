@@ -1002,6 +1002,16 @@ pub(super) async fn mark_discovery_target_notified_impl(
         .bind(discovery_did)
         .execute(sqlite.pool())
         .await?;
+        sqlx::query(&format!(
+            r#"
+            DELETE FROM {ROOT_DISCOVERY_ITEM_TABLE}
+            WHERE discovery_did = ? AND publication_cursor <= ?
+            "#
+        ))
+        .bind(discovery_did)
+        .bind(delivered_cursor)
+        .execute(sqlite.pool())
+        .await?;
         return Ok(());
     }
     if let Some(postgres) = &state.postgres {
@@ -1022,6 +1032,16 @@ pub(super) async fn mark_discovery_target_notified_impl(
         .bind(now)
         .bind(now)
         .bind(discovery_did)
+        .execute(postgres.pool())
+        .await?;
+        sqlx::query(&format!(
+            r#"
+            DELETE FROM {ROOT_DISCOVERY_ITEM_TABLE}
+            WHERE discovery_did = $1 AND publication_cursor <= $2
+            "#
+        ))
+        .bind(discovery_did)
+        .bind(delivered_cursor)
         .execute(postgres.pool())
         .await?;
     }
@@ -1079,6 +1099,7 @@ pub(super) async fn mark_discovery_target_retry_impl(
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) async fn advance_discovery_target_watermarks_batch_impl(
     state: &AppState,
     packages: &[(ResourcePackage, i64)],
@@ -1086,11 +1107,7 @@ pub(super) async fn advance_discovery_target_watermarks_batch_impl(
     if packages.is_empty() {
         return Ok(0);
     }
-    let authorization_state =
-        load_authorization_state(&state.config.paths.authorization_state_file)
-            .unwrap_or_else(|_| state.authorization_state.clone());
-    let now = Utc::now();
-    let now_text = now.to_rfc3339();
+    let authorization_state = super::current_authorization_state(state);
     let mut target_cursors = BTreeMap::<String, i64>::new();
     for (discovery_did, auth) in authorization_state.discovery_nodes {
         if auth.status != "active" {
@@ -1111,10 +1128,19 @@ pub(super) async fn advance_discovery_target_watermarks_batch_impl(
         };
         target_cursors.insert(discovery_did, publication_cursor);
     }
+    advance_discovery_target_cursors_impl(state, target_cursors).await
+}
+
+pub(super) async fn advance_discovery_target_cursors_impl(
+    state: &AppState,
+    target_cursors: BTreeMap<String, i64>,
+) -> Result<usize> {
     let advanced = target_cursors.len();
     if advanced == 0 {
         return Ok(0);
     }
+    let now = Utc::now();
+    let now_text = now.to_rfc3339();
     if let Some(sqlite) = &state.sqlite {
         let mut tx = sqlite.pool().begin().await?;
         let rows = target_cursors.into_iter().collect::<Vec<_>>();
@@ -1283,6 +1309,126 @@ pub(super) async fn claim_cdn_outbox_events_impl(
             .collect());
     }
     Ok(Vec::new())
+}
+
+pub(super) async fn oldest_ready_cdn_outbox_age_ms_impl(state: &AppState) -> Result<Option<u128>> {
+    let now = Utc::now();
+    let now_rfc3339 = now.to_rfc3339();
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT MIN(next_attempt_at)
+            FROM {ROOT_CDN_OUTBOX_TABLE}
+            WHERE
+                status = 'ready'
+                OR (status = 'retry-wait' AND next_attempt_at <= ?)
+                OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?)
+            "#
+        ))
+        .bind(&now_rfc3339)
+        .bind(&now_rfc3339)
+        .fetch_one(sqlite.pool())
+        .await?;
+        let oldest = row.get::<Option<String>, _>(0);
+        return Ok(oldest
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .and_then(|value| {
+                now.signed_duration_since(value.with_timezone(&Utc))
+                    .to_std()
+                    .ok()
+            })
+            .map(|duration| duration.as_millis()));
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT to_char(
+                MIN(next_attempt_at) AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            )
+            FROM {ROOT_CDN_OUTBOX_TABLE}
+            WHERE
+                status = 'ready'
+                OR (status = 'retry-wait' AND next_attempt_at <= $1::timestamptz)
+                OR (status = 'leased' AND lease_expires_at IS NOT NULL AND lease_expires_at <= $2::timestamptz)
+            "#
+        ))
+        .bind(now)
+        .bind(now)
+        .fetch_one(postgres.pool())
+        .await?;
+        let oldest = row.get::<Option<String>, _>(0);
+        return Ok(oldest
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .and_then(|value| {
+                now.signed_duration_since(value.with_timezone(&Utc))
+                    .to_std()
+                    .ok()
+            })
+            .map(|duration| duration.as_millis()));
+    }
+    Ok(None)
+}
+
+pub(super) async fn oldest_ready_discovery_target_age_ms_impl(
+    state: &AppState,
+) -> Result<Option<u128>> {
+    let now = Utc::now();
+    let now_rfc3339 = now.to_rfc3339();
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT MIN(updated_at)
+            FROM {ROOT_DISCOVERY_TARGET_TABLE}
+            WHERE status = 'active'
+              AND pending_cursor > delivered_cursor
+              AND next_attempt_at <= ?
+              AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
+            "#
+        ))
+        .bind(&now_rfc3339)
+        .bind(&now_rfc3339)
+        .fetch_one(sqlite.pool())
+        .await?;
+        let oldest = row.get::<Option<String>, _>(0);
+        return Ok(oldest
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .and_then(|value| {
+                now.signed_duration_since(value.with_timezone(&Utc))
+                    .to_std()
+                    .ok()
+            })
+            .map(|duration| duration.as_millis()));
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT to_char(
+                MIN(updated_at) AT TIME ZONE 'UTC',
+                'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+            )
+            FROM {ROOT_DISCOVERY_TARGET_TABLE}
+            WHERE status = 'active'
+              AND pending_cursor > delivered_cursor
+              AND next_attempt_at <= $1::timestamptz
+              AND (lease_expires_at IS NULL OR lease_expires_at <= $2::timestamptz)
+            "#
+        ))
+        .bind(now)
+        .bind(now)
+        .fetch_one(postgres.pool())
+        .await?;
+        let oldest = row.get::<Option<String>, _>(0);
+        return Ok(oldest
+            .and_then(|value| chrono::DateTime::parse_from_rfc3339(&value).ok())
+            .and_then(|value| {
+                now.signed_duration_since(value.with_timezone(&Utc))
+                    .to_std()
+                    .ok()
+            })
+            .map(|duration| duration.as_millis()));
+    }
+    Ok(None)
 }
 
 pub(super) async fn mark_cdn_outbox_events_published_batch_impl(
@@ -1472,64 +1618,79 @@ pub(super) async fn resource_packages_for_jobs_impl(
     Ok(BTreeMap::new())
 }
 
-pub(super) async fn authorized_discovery_summary_items_impl(
+pub(super) async fn discovery_notification_targets_for_jobs_impl(
     state: &AppState,
-    auth: &DiscoveryAuthorizationState,
-    delivered_cursor: i64,
-    target_cursor: i64,
-) -> Result<Vec<DiscoveryNotificationItem>> {
-    if target_cursor <= delivered_cursor {
+    job_keys: &[String],
+) -> Result<Vec<DiscoveryNotificationTargetItem>> {
+    let pairs = job_keys
+        .iter()
+        .filter_map(|job_key| {
+            job_key
+                .rsplit_once(':')
+                .map(|(subject_did, version)| (subject_did.to_owned(), version.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    if pairs.is_empty() {
         return Ok(Vec::new());
     }
-    let mut rows = Vec::<(ResourcePackage, i64)>::new();
+    let authorization_state = super::current_authorization_state(state);
+    let active_discoveries = authorization_state
+        .discovery_nodes
+        .into_iter()
+        .filter(|(_, auth)| auth.status == "active")
+        .collect::<Vec<_>>();
+    if active_discoveries.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut packages = Vec::<(ResourcePackage, i64)>::new();
     if let Some(sqlite) = &state.sqlite {
-        let db_rows = sqlx::query(&format!(
-            r#"
-            SELECT package_json, rowid
-            FROM {ROOT_SUBJECT_VERSION_TABLE}
-            WHERE rowid > ? AND rowid <= ?
-            ORDER BY rowid
-            "#
-        ))
-        .bind(delivered_cursor)
-        .bind(target_cursor)
-        .fetch_all(sqlite.pool())
-        .await?;
-        for row in db_rows {
-            rows.push((
+        let mut builder = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT package_json, rowid FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
+        ));
+        for (index, (subject_did, version)) in pairs.iter().enumerate() {
+            if index > 0 {
+                builder.push(" OR ");
+            }
+            builder
+                .push("(subject_did = ")
+                .push_bind(subject_did)
+                .push(" AND version = ")
+                .push_bind(version)
+                .push(")");
+        }
+        let rows = builder.build().fetch_all(sqlite.pool()).await?;
+        for row in rows {
+            packages.push((
                 serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?,
                 row.get::<i64, _>(1),
             ));
         }
     } else if let Some(postgres) = &state.postgres {
-        let db_rows = sqlx::query(&format!(
-            r#"
-            SELECT package_json::text, publication_cursor
-            FROM {ROOT_SUBJECT_VERSION_TABLE}
-            WHERE publication_cursor > $1 AND publication_cursor <= $2
-            ORDER BY publication_cursor
+        let mut builder =
+            QueryBuilder::<Postgres>::new("WITH requested(subject_did, version) AS (");
+        builder.push_values(pairs.iter(), |mut row, (subject_did, version)| {
+            row.push_bind(subject_did).push_bind(version);
+        });
+        builder.push(format!(
+            r#")
+            SELECT versions.package_json::text, versions.publication_cursor
+            FROM requested
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = requested.subject_did
+             AND versions.version = requested.version
             "#
-        ))
-        .bind(delivered_cursor)
-        .bind(target_cursor)
-        .fetch_all(postgres.pool())
-        .await?;
-        for row in db_rows {
-            rows.push((
+        ));
+        let rows = builder.build().fetch_all(postgres.pool()).await?;
+        for row in rows {
+            packages.push((
                 serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?,
                 row.get::<i64, _>(1),
             ));
         }
     }
-    Ok(rows
-        .into_iter()
-        .filter(|(package, _)| {
-            state.tag_tree.matches_authorized_domains(
-                &package.metadata.capability_tags,
-                &auth.authorized_domains,
-            )
-        })
-        .map(|(package, publication_cursor)| DiscoveryNotificationItem {
+    let mut items = Vec::new();
+    for (package, publication_cursor) in packages {
+        let item = DiscoveryNotificationItem {
             resource_did: package.resource_did,
             package_version: package.package_version,
             publication_cursor,
@@ -1541,6 +1702,269 @@ pub(super) async fn authorized_discovery_summary_items_impl(
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .unwrap_or_else(|| "unknown".to_owned()),
             capability_tags: package.metadata.capability_tags,
-        })
-        .collect())
+        };
+        for (discovery_did, auth) in &active_discoveries {
+            if state
+                .tag_tree
+                .matches_authorized_domains(&item.capability_tags, &auth.authorized_domains)
+            {
+                items.push(DiscoveryNotificationTargetItem {
+                    discovery_did: discovery_did.clone(),
+                    item: item.clone(),
+                });
+            }
+        }
+    }
+    Ok(items)
+}
+
+pub(super) async fn authorized_discovery_summary_items_impl(
+    state: &AppState,
+    discovery_did: &str,
+    delivered_cursor: i64,
+    target_cursor: i64,
+) -> Result<Vec<DiscoveryNotificationItem>> {
+    if target_cursor <= delivered_cursor {
+        return Ok(Vec::new());
+    }
+    let Some(discovery_auth) = super::current_authorization_state(state)
+        .discovery_nodes
+        .get(discovery_did)
+        .cloned()
+    else {
+        return Ok(Vec::new());
+    };
+    if discovery_auth.status != "active" {
+        return Ok(Vec::new());
+    }
+
+    let stored_items = load_authorized_discovery_summary_items_from_store(
+        state,
+        discovery_did,
+        delivered_cursor,
+        target_cursor,
+    )
+    .await?;
+    let mut items_by_cursor = std::collections::BTreeMap::<i64, DiscoveryNotificationItem>::new();
+    for item in stored_items {
+        items_by_cursor.insert(item.publication_cursor, item);
+    }
+
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT rowid, package_json
+            FROM {ROOT_SUBJECT_VERSION_TABLE}
+            WHERE rowid > ? AND rowid <= ?
+            ORDER BY rowid
+            "#
+        ))
+        .bind(delivered_cursor)
+        .bind(target_cursor)
+        .fetch_all(sqlite.pool())
+        .await?;
+        for row in rows {
+            let publication_cursor = row.get::<i64, _>(0);
+            if items_by_cursor.contains_key(&publication_cursor) {
+                continue;
+            }
+            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
+            let item = discovery_notification_item_from_package(publication_cursor, package)?;
+            if state.tag_tree.matches_authorized_domains(
+                &item.capability_tags,
+                &discovery_auth.authorized_domains,
+            ) {
+                items_by_cursor.insert(publication_cursor, item);
+            }
+        }
+        return Ok(items_by_cursor.into_values().collect());
+    } else if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT publication_cursor, package_json::text
+            FROM {ROOT_SUBJECT_VERSION_TABLE}
+            WHERE publication_cursor > $1 AND publication_cursor <= $2
+            ORDER BY publication_cursor
+            "#
+        ))
+        .bind(delivered_cursor)
+        .bind(target_cursor)
+        .fetch_all(postgres.pool())
+        .await?;
+        for row in rows {
+            let publication_cursor = row.get::<i64, _>(0);
+            if items_by_cursor.contains_key(&publication_cursor) {
+                continue;
+            }
+            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
+            let item = discovery_notification_item_from_package(publication_cursor, package)?;
+            if state.tag_tree.matches_authorized_domains(
+                &item.capability_tags,
+                &discovery_auth.authorized_domains,
+            ) {
+                items_by_cursor.insert(publication_cursor, item);
+            }
+        }
+        return Ok(items_by_cursor.into_values().collect());
+    }
+    Ok(items_by_cursor.into_values().collect())
+}
+
+async fn load_authorized_discovery_summary_items_from_store(
+    state: &AppState,
+    discovery_did: &str,
+    delivered_cursor: i64,
+    target_cursor: i64,
+) -> Result<Vec<DiscoveryNotificationItem>> {
+    if let Some(sqlite) = &state.sqlite {
+        let db_rows = sqlx::query(&format!(
+            r#"
+            SELECT publication_cursor, resource_did, package_version, package_hash,
+                   metadata_hash, did_document_hash, resource_type, capability_tags_json
+            FROM {ROOT_DISCOVERY_ITEM_TABLE}
+            WHERE discovery_did = ? AND publication_cursor > ? AND publication_cursor <= ?
+            ORDER BY publication_cursor
+            "#
+        ))
+        .bind(discovery_did)
+        .bind(delivered_cursor)
+        .bind(target_cursor)
+        .fetch_all(sqlite.pool())
+        .await?;
+        return db_rows
+            .into_iter()
+            .map(|row| {
+                Ok(DiscoveryNotificationItem {
+                    publication_cursor: row.get::<i64, _>(0),
+                    resource_did: row.get::<String, _>(1),
+                    package_version: row.get::<String, _>(2),
+                    package_hash: row.get::<String, _>(3),
+                    metadata_hash: row.get::<String, _>(4),
+                    did_document_hash: row.get::<String, _>(5),
+                    resource_type: row.get::<String, _>(6),
+                    capability_tags: serde_json::from_str::<Vec<String>>(&row.get::<String, _>(7))?,
+                })
+            })
+            .collect();
+    } else if let Some(postgres) = &state.postgres {
+        let db_rows = sqlx::query(&format!(
+            r#"
+            SELECT publication_cursor, resource_did, package_version, package_hash,
+                   metadata_hash, did_document_hash, resource_type,
+                   capability_tags_json::text
+            FROM {ROOT_DISCOVERY_ITEM_TABLE}
+            WHERE discovery_did = $1 AND publication_cursor > $2 AND publication_cursor <= $3
+            ORDER BY publication_cursor
+            "#
+        ))
+        .bind(discovery_did)
+        .bind(delivered_cursor)
+        .bind(target_cursor)
+        .fetch_all(postgres.pool())
+        .await?;
+        return db_rows
+            .into_iter()
+            .map(|row| {
+                Ok(DiscoveryNotificationItem {
+                    publication_cursor: row.get::<i64, _>(0),
+                    resource_did: row.get::<String, _>(1),
+                    package_version: row.get::<String, _>(2),
+                    package_hash: row.get::<String, _>(3),
+                    metadata_hash: row.get::<String, _>(4),
+                    did_document_hash: row.get::<String, _>(5),
+                    resource_type: row.get::<String, _>(6),
+                    capability_tags: serde_json::from_str::<Vec<String>>(&row.get::<String, _>(7))?,
+                })
+            })
+            .collect();
+    }
+    Ok(Vec::new())
+}
+
+fn discovery_notification_item_from_package(
+    publication_cursor: i64,
+    package: ResourcePackage,
+) -> Result<DiscoveryNotificationItem> {
+    Ok(DiscoveryNotificationItem {
+        publication_cursor,
+        resource_did: package.resource_did,
+        package_version: package.package_version,
+        package_hash: package.package_hash,
+        metadata_hash: package.metadata_hash,
+        did_document_hash: package.did_document_hash,
+        resource_type: serde_json::to_value(&package.resource_type)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned()),
+        capability_tags: package.metadata.capability_tags,
+    })
+}
+
+pub(super) async fn store_discovery_notification_items_impl(
+    state: &AppState,
+    items: &[DiscoveryNotificationTargetItem],
+) -> Result<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    if let Some(sqlite) = &state.sqlite {
+        let mut tx = sqlite.pool().begin().await?;
+        for chunk in items.chunks(250) {
+            let mut builder = QueryBuilder::<Sqlite>::new(format!(
+                r#"
+                INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
+                    discovery_did, publication_cursor, resource_did, package_version,
+                    package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
+                )
+                "#
+            ));
+            builder.push_values(chunk, |mut row, item| {
+                row.push_bind(&item.discovery_did)
+                    .push_bind(item.item.publication_cursor)
+                    .push_bind(&item.item.resource_did)
+                    .push_bind(&item.item.package_version)
+                    .push_bind(&item.item.package_hash)
+                    .push_bind(&item.item.metadata_hash)
+                    .push_bind(&item.item.did_document_hash)
+                    .push_bind(&item.item.resource_type)
+                    .push_bind(
+                        serde_json::to_string(&item.item.capability_tags)
+                            .unwrap_or_else(|_| "[]".to_owned()),
+                    );
+            });
+            builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
+            builder.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        return Ok(items.len());
+    }
+    if let Some(postgres) = &state.postgres {
+        let mut tx = postgres.pool().begin().await?;
+        for chunk in items.chunks(250) {
+            let mut builder = QueryBuilder::<Postgres>::new(format!(
+                r#"
+                INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
+                    discovery_did, publication_cursor, resource_did, package_version,
+                    package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
+                )
+                "#
+            ));
+            builder.push_values(chunk, |mut row, item| {
+                row.push_bind(&item.discovery_did)
+                    .push_bind(item.item.publication_cursor)
+                    .push_bind(&item.item.resource_did)
+                    .push_bind(&item.item.package_version)
+                    .push_bind(&item.item.package_hash)
+                    .push_bind(&item.item.metadata_hash)
+                    .push_bind(&item.item.did_document_hash)
+                    .push_bind(&item.item.resource_type)
+                    .push_bind(sqlx::types::Json(item.item.capability_tags.clone()));
+            });
+            builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
+            builder.build().execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        return Ok(items.len());
+    }
+    Ok(0)
 }
