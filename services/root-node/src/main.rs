@@ -920,8 +920,20 @@ struct CdnPublicationJobRef {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+struct CdnPublicationJobCompletionRef {
+    #[serde(rename = "jobKey", default)]
+    job_key: String,
+    resource_did: String,
+    package_version: String,
+    #[serde(rename = "publicationCursor", default)]
+    publication_cursor: i64,
+    #[serde(rename = "packageHash", default)]
+    package_hash: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 struct MarkCdnPublicationJobsPublishedRequest {
-    jobs: Vec<CdnPublicationJobRef>,
+    jobs: Vec<CdnPublicationJobCompletionRef>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -3073,10 +3085,12 @@ async fn api_mark_cdn_publication_jobs_published(
         .jobs
         .iter()
         .map(|job| {
-            (
-                format!("{}:{}", job.resource_did, job.package_version),
-                job.resource_did.clone(),
-            )
+            let job_key = if job.job_key.trim().is_empty() {
+                format!("{}:{}", job.resource_did, job.package_version)
+            } else {
+                job.job_key.clone()
+            };
+            (job_key, job.resource_did.clone())
         })
         .collect::<Vec<_>>();
     let job_keys = jobs
@@ -3084,10 +3098,41 @@ async fn api_mark_cdn_publication_jobs_published(
         .map(|(job_key, _)| job_key.clone())
         .collect::<Vec<_>>();
     let fetch_started = Instant::now();
-    let notification_items = discovery_notification_targets_for_jobs(&state, &job_keys)
+    let authoritative_packages = resource_packages_for_jobs(&state, &job_keys)
         .await
         .map_err(ApiError::internal)?;
+    let package_rows = authoritative_packages
+        .values()
+        .map(|(package, publication_cursor)| (package.clone(), *publication_cursor))
+        .collect::<Vec<_>>();
+    let notification_items =
+        repository::discovery_notification_targets_for_package_rows_impl(&state, &package_rows)
+            .await
+            .map_err(ApiError::internal)?;
     let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
+    for job in &request.jobs {
+        let job_key = if job.job_key.trim().is_empty() {
+            format!("{}:{}", job.resource_did, job.package_version)
+        } else {
+            job.job_key.clone()
+        };
+        let Some((package, publication_cursor)) = authoritative_packages.get(&job_key) else {
+            return Err(ApiError::bad_request("unknown_cdn_publication_job"));
+        };
+        if package.resource_did != job.resource_did
+            || package.package_version != job.package_version
+        {
+            return Err(ApiError::bad_request(
+                "cdn_publication_job_identity_mismatch",
+            ));
+        }
+        if job.publication_cursor > 0 && *publication_cursor != job.publication_cursor {
+            return Err(ApiError::bad_request("cdn_publication_job_cursor_mismatch"));
+        }
+        if !job.package_hash.trim().is_empty() && package.package_hash != job.package_hash {
+            return Err(ApiError::bad_request("cdn_publication_job_hash_mismatch"));
+        }
+    }
     let update_started = Instant::now();
     mark_cdn_jobs_published_batch(&state, &jobs)
         .await
@@ -3155,6 +3200,11 @@ async fn api_cdn_publication_jobs_packages(
                 json!({
                     "jobKey": job_key,
                     "publicationCursor": publication_cursor,
+                    "resourceDid": package.resource_did,
+                    "packageVersion": package.package_version,
+                    "packageHash": package.package_hash,
+                    "didDocumentHash": package.did_document_hash,
+                    "metadataHash": package.metadata_hash,
                     "package": package
                 })
             })
@@ -4271,13 +4321,6 @@ async fn authorized_discovery_summary_items(
     .await
 }
 
-async fn discovery_notification_targets_for_jobs(
-    state: &AppState,
-    job_keys: &[String],
-) -> Result<Vec<DiscoveryNotificationTargetItem>> {
-    repository::discovery_notification_targets_for_jobs_impl(state, job_keys).await
-}
-
 async fn advance_discovery_target_watermarks_for_items(
     state: &AppState,
     items: &[DiscoveryNotificationTargetItem],
@@ -4736,11 +4779,17 @@ fn value_u64(result: &Value, field: &str) -> u64 {
 }
 
 fn cdn_cycle_made_progress(result: &Value) -> bool {
-    value_u64(result, "attemptedCount") > 0
+    value_u64(result, "publishedCount") > 0 || value_u64(result, "failedCount") > 0
 }
 
 fn cdn_cycle_should_continue_immediately(result: &Value) -> bool {
-    cdn_cycle_made_progress(result) && value_u64(result, "readyQueueDepthAfter") > 0
+    let ready_after = value_u64(result, "readyQueueDepthAfter");
+    let active_after = value_u64(result, "activeQueueDepthAfter");
+    let attempted = value_u64(result, "attemptedCount");
+    let published = value_u64(result, "publishedCount");
+    let failed = value_u64(result, "failedCount");
+    (published > 0 || failed > 0) && (ready_after > 0 || active_after > 0)
+        || (attempted > 0 && ready_after > 0)
 }
 
 fn discovery_cycle_made_progress(result: &Value) -> bool {
@@ -4748,7 +4797,9 @@ fn discovery_cycle_made_progress(result: &Value) -> bool {
 }
 
 fn discovery_cycle_should_continue_immediately(result: &Value) -> bool {
-    discovery_cycle_made_progress(result) && value_u64(result, "readyQueueDepthAfter") > 0
+    let ready_after = value_u64(result, "readyQueueDepthAfter");
+    let pending_after = value_u64(result, "pendingQueueDepthAfter");
+    discovery_cycle_made_progress(result) && (ready_after > 0 || pending_after > 0)
 }
 
 async fn cdn_queue_depths(state: &AppState) -> Result<(usize, usize)> {
@@ -6534,6 +6585,24 @@ capability_tree_file = "../capability-tree.json"
         assert_eq!(response.0["requestedCount"], 1);
         assert_eq!(response.0["foundCount"], 1);
         assert_eq!(
+            response.0["items"][0]["jobKey"],
+            format!("{}:{}", package.resource_did, package.package_version)
+        );
+        assert_eq!(response.0["items"][0]["resourceDid"], package.resource_did);
+        assert_eq!(
+            response.0["items"][0]["packageVersion"],
+            package.package_version
+        );
+        assert_eq!(response.0["items"][0]["packageHash"], package.package_hash);
+        assert_eq!(
+            response.0["items"][0]["didDocumentHash"],
+            package.did_document_hash
+        );
+        assert_eq!(
+            response.0["items"][0]["metadataHash"],
+            package.metadata_hash
+        );
+        assert_eq!(
             response.0["items"][0]["package"]["resourceDid"],
             package.resource_did
         );
@@ -6587,9 +6656,12 @@ capability_tree_file = "../capability-tree.json"
             )]),
             State(state.clone()),
             Json(MarkCdnPublicationJobsPublishedRequest {
-                jobs: vec![CdnPublicationJobRef {
+                jobs: vec![CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", package.resource_did, package.package_version),
                     resource_did: package.resource_did.clone(),
                     package_version: package.package_version.clone(),
+                    publication_cursor: 0,
+                    package_hash: package.package_hash.clone(),
                 }],
             }),
         )
@@ -6602,6 +6674,64 @@ capability_tree_file = "../capability-tree.json"
         let targets = read_discovery_target_states(&state).await.unwrap();
         assert_eq!(targets.len(), 1);
         assert!(targets[0].pending_cursor > targets[0].delivered_cursor);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_mark_published_rejects_cursor_mismatch() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        state
+            .config
+            .security
+            .admin
+            .static_tokens
+            .push("test-admin-token".to_owned());
+        let registrar_key = generate_ed25519_keypair();
+        let discovery_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            "http://127.0.0.1:1",
+            vec!["openagenet.local".to_owned()],
+        );
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let mut package = package_from_request(&state, &request);
+        package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        let err = api_mark_cdn_publication_jobs_published(
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    state.config.security.admin.static_tokens[0]
+                ))
+                .unwrap(),
+            )]),
+            State(state),
+            Json(MarkCdnPublicationJobsPublishedRequest {
+                jobs: vec![CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", package.resource_did, package.package_version),
+                    resource_did: package.resource_did.clone(),
+                    package_version: package.package_version.clone(),
+                    publication_cursor: 9_999,
+                    package_hash: package.package_hash.clone(),
+                }],
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("cursor_mismatch"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6646,7 +6776,7 @@ capability_tree_file = "../capability-tree.json"
             .await
             .unwrap();
 
-        let notification_items = discovery_notification_targets_for_jobs(
+        let package_rows = resource_packages_for_jobs(
             &state,
             &[
                 format!("{}:{}", matching.resource_did, matching.package_version),
@@ -6654,7 +6784,13 @@ capability_tree_file = "../capability-tree.json"
             ],
         )
         .await
-        .unwrap();
+        .unwrap()
+        .into_values()
+        .collect::<Vec<_>>();
+        let notification_items =
+            repository::discovery_notification_targets_for_package_rows_impl(&state, &package_rows)
+                .await
+                .unwrap();
         repository::store_discovery_notification_items_impl(&state, &notification_items)
             .await
             .unwrap();
@@ -6664,6 +6800,53 @@ capability_tree_file = "../capability-tree.json"
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].package_version, "1");
         assert_eq!(items[0].capability_tags, vec!["openagenet.local.agent"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_notification_targets_for_package_rows_matches_authorized_domains() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        let registrar_key = generate_ed25519_keypair();
+        let discovery_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            "http://127.0.0.1:1",
+            vec!["openagenet.local".to_owned()],
+        );
+
+        let request = resource_verify_request_with_version(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+            "1",
+        );
+        let mut package = package_from_request(&state, &request);
+        package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        persist_resource_acceptance(&state, &package).await.unwrap();
+        let job_key = format!("{}:{}", package.resource_did, package.package_version);
+        let package_rows = resource_packages_for_jobs(&state, &[job_key])
+            .await
+            .unwrap()
+            .into_values()
+            .collect::<Vec<_>>();
+
+        let items =
+            repository::discovery_notification_targets_for_package_rows_impl(&state, &package_rows)
+                .await
+                .unwrap();
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].discovery_did, discovery_did());
+        assert_eq!(items[0].item.package_version, "1");
+        assert_eq!(
+            items[0].item.capability_tags,
+            vec!["openagenet.local.agent"]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -7006,20 +7189,28 @@ capability_tree_file = "../capability-tree.json"
     fn adaptive_worker_drain_only_continues_when_ready_work_remains() {
         let cdn_continue = json!({
             "attemptedCount": 8,
+            "publishedCount": 6,
+            "failedCount": 0,
+            "activeQueueDepthAfter": 1,
             "readyQueueDepthAfter": 2
         });
         let cdn_stop = json!({
             "attemptedCount": 8,
+            "publishedCount": 0,
+            "failedCount": 0,
+            "activeQueueDepthAfter": 0,
             "readyQueueDepthAfter": 0
         });
         let discovery_continue = json!({
             "notifiedCount": 1,
             "failedCount": 0,
+            "pendingQueueDepthAfter": 1,
             "readyQueueDepthAfter": 1
         });
         let discovery_stop = json!({
             "notifiedCount": 1,
             "failedCount": 0,
+            "pendingQueueDepthAfter": 0,
             "readyQueueDepthAfter": 0
         });
 

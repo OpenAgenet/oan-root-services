@@ -25,7 +25,7 @@ use oan_storage::JsonStore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -129,11 +129,30 @@ struct PublisherCycleMetrics {
 
 #[derive(Clone, Debug, Default)]
 struct CdnBatchPublishOutcome {
-    published_cursors: BTreeSet<i64>,
+    published_items: Vec<ResourceCdnPublishBatchItem>,
     published_count: usize,
     failed_count: usize,
     publish_elapsed_ms: u128,
     callback_elapsed_ms: u128,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct RootBatchPackageItem {
+    #[serde(rename = "jobKey")]
+    job_key: String,
+    #[serde(rename = "publicationCursor")]
+    publication_cursor: i64,
+    #[serde(rename = "resourceDid")]
+    resource_did: String,
+    #[serde(rename = "packageVersion")]
+    package_version: String,
+    #[serde(rename = "packageHash")]
+    package_hash: String,
+    #[serde(rename = "didDocumentHash")]
+    did_document_hash: String,
+    #[serde(rename = "metadataHash")]
+    metadata_hash: String,
+    package: ResourcePackage,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -365,11 +384,15 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
                     }
                     cycle_metrics.callback_elapsed_ms = outcome.callback_elapsed_ms;
                     failed += outcome.failed_count;
+                    let published_by_cursor = outcome
+                        .published_items
+                        .iter()
+                        .map(|item| item.publication_cursor)
+                        .collect::<BTreeSet<_>>();
                     let messages = prepared
                         .into_iter()
                         .filter_map(|(message, publication_cursor, _)| {
-                            outcome
-                                .published_cursors
+                            published_by_cursor
                                 .contains(&publication_cursor)
                                 .then_some(message)
                         })
@@ -554,27 +577,36 @@ async fn fetch_resource_packages_batch(
     if !status.is_success() {
         return Err(anyhow!("root_package_batch_failed:{status}:{value}"));
     }
-    let mut packages = std::collections::BTreeMap::new();
-    for item in value
-        .get("items")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("root_package_batch_items_missing"))?
-    {
-        let job_key = item
-            .get("jobKey")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("root_package_batch_job_key_missing"))?
-            .to_owned();
-        let publication_cursor = item
-            .get("publicationCursor")
-            .and_then(Value::as_i64)
-            .ok_or_else(|| anyhow!("root_package_batch_cursor_missing"))?;
-        let package = serde_json::from_value::<ResourcePackage>(
-            item.get("package")
-                .ok_or_else(|| anyhow!("root_package_batch_package_missing"))?
-                .clone(),
-        )?;
-        packages.insert(job_key, (publication_cursor, package));
+    let items = serde_json::from_value::<Vec<RootBatchPackageItem>>(
+        value
+            .get("items")
+            .cloned()
+            .ok_or_else(|| anyhow!("root_package_batch_items_missing"))?,
+    )?;
+    let mut packages = BTreeMap::new();
+    for item in items {
+        if item.job_key.trim().is_empty() {
+            return Err(anyhow!("root_package_batch_job_key_missing"));
+        }
+        if item.publication_cursor <= 0 {
+            return Err(anyhow!("root_package_batch_cursor_missing"));
+        }
+        if item.resource_did != item.package.resource_did {
+            return Err(anyhow!("root_package_batch_resource_did_mismatch"));
+        }
+        if item.package_version != item.package.package_version {
+            return Err(anyhow!("root_package_batch_package_version_mismatch"));
+        }
+        if item.package_hash != item.package.package_hash {
+            return Err(anyhow!("root_package_batch_package_hash_mismatch"));
+        }
+        if item.did_document_hash != item.package.did_document_hash {
+            return Err(anyhow!("root_package_batch_did_document_hash_mismatch"));
+        }
+        if item.metadata_hash != item.package.metadata_hash {
+            return Err(anyhow!("root_package_batch_metadata_hash_mismatch"));
+        }
+        packages.insert(item.job_key, (item.publication_cursor, item.package));
     }
     Ok(packages)
 }
@@ -659,7 +691,7 @@ async fn publish_packages_to_cdn(
     Ok(CdnBatchPublishOutcome {
         published_count: published_items.len(),
         failed_count,
-        published_cursors,
+        published_items,
         publish_elapsed_ms,
         callback_elapsed_ms: callback_started.elapsed().as_millis(),
     })
@@ -713,8 +745,11 @@ fn build_mark_published_jobs(items: &[ResourceCdnPublishBatchItem]) -> Vec<Value
         .iter()
         .map(|item| {
             json!({
+                "jobKey": format!("{}:{}", item.package.resource_did, item.package.package_version),
+                "publicationCursor": item.publication_cursor,
                 "resource_did": item.package.resource_did,
-                "package_version": item.package.package_version
+                "package_version": item.package.package_version,
+                "packageHash": item.package.package_hash
             })
         })
         .collect()
@@ -999,8 +1034,13 @@ mod tests {
         let jobs = build_mark_published_jobs(&request.items);
 
         assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0]["jobKey"], "did:oan:AGUS:test:1.0.0");
+        assert_eq!(jobs[0]["publicationCursor"], 42);
         assert_eq!(jobs[0]["resource_did"], "did:oan:AGUS:test");
         assert_eq!(jobs[0]["package_version"], "1.0.0");
+        assert_eq!(jobs[0]["packageHash"], "sha256:package");
+        assert_eq!(jobs[1]["jobKey"], "did:oan:AGUS:test2:2.0.0");
+        assert_eq!(jobs[1]["publicationCursor"], 43);
         assert_eq!(jobs[1]["resource_did"], "did:oan:AGUS:test2");
         assert_eq!(jobs[1]["package_version"], "2.0.0");
     }
@@ -1063,6 +1103,11 @@ mod tests {
                 "items": [{
                     "jobKey": "did:oan:AGUS:test:1.0.0",
                     "publicationCursor": 42,
+                    "resourceDid": "did:oan:AGUS:test",
+                    "packageVersion": "1.0.0",
+                    "packageHash": "sha256:package",
+                    "didDocumentHash": "sha256:document",
+                    "metadataHash": "sha256:metadata",
                     "package": sample_package()
                 }]
             }))

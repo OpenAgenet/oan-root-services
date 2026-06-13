@@ -926,51 +926,44 @@ pub(super) async fn claim_discovery_targets_impl(
         return result;
     }
     if let Some(postgres) = &state.postgres {
-        let mut tx = postgres.pool().begin().await?;
         let rows = sqlx::query(&format!(
             r#"
-            SELECT discovery_did, pending_cursor, delivered_cursor
-            FROM {ROOT_DISCOVERY_TARGET_TABLE}
-            WHERE status = 'active'
-              AND pending_cursor > delivered_cursor
-              AND next_attempt_at <= $1::timestamptz
-              AND (lease_expires_at IS NULL OR lease_expires_at <= $1::timestamptz)
-            ORDER BY pending_cursor DESC, discovery_did
-            LIMIT $2
-            FOR UPDATE SKIP LOCKED
+            WITH claimed AS (
+                SELECT discovery_did, pending_cursor, delivered_cursor
+                FROM {ROOT_DISCOVERY_TARGET_TABLE}
+                WHERE status = 'active'
+                  AND pending_cursor > delivered_cursor
+                  AND next_attempt_at <= $1::timestamptz
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= $1::timestamptz)
+                ORDER BY pending_cursor DESC, discovery_did
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            UPDATE {ROOT_DISCOVERY_TARGET_TABLE} AS targets
+            SET lease_owner = $3,
+                lease_expires_at = $4::timestamptz,
+                attempt_count = targets.attempt_count + 1,
+                last_error = NULL,
+                updated_at = $1::timestamptz
+            FROM claimed
+            WHERE targets.discovery_did = claimed.discovery_did
+            RETURNING claimed.discovery_did, claimed.pending_cursor, claimed.delivered_cursor
             "#
         ))
         .bind(&now_rfc3339)
         .bind(limit as i64)
-        .fetch_all(&mut *tx)
+        .bind(worker_id)
+        .bind(&lease_expires_at)
+        .fetch_all(postgres.pool())
         .await?;
-        let mut claimed = Vec::with_capacity(rows.len());
-        for row in rows {
-            let discovery_did = row.get::<String, _>(0);
-            let pending_cursor = row.get::<i64, _>(1);
-            let delivered_cursor = row.get::<i64, _>(2);
-            sqlx::query(&format!(
-                r#"
-                UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
-                SET lease_owner = $1, lease_expires_at = $2::timestamptz,
-                    attempt_count = attempt_count + 1, last_error = NULL, updated_at = $3::timestamptz
-                WHERE discovery_did = $4
-                "#
-            ))
-            .bind(worker_id)
-            .bind(&lease_expires_at)
-            .bind(&now_rfc3339)
-            .bind(&discovery_did)
-            .execute(&mut *tx)
-            .await?;
-            claimed.push(DiscoveryNotifyTargetLease {
-                discovery_did,
-                target_cursor: pending_cursor,
-                delivered_cursor,
-            });
-        }
-        tx.commit().await?;
-        return Ok(claimed);
+        return Ok(rows
+            .into_iter()
+            .map(|row| DiscoveryNotifyTargetLease {
+                discovery_did: row.get::<String, _>(0),
+                target_cursor: row.get::<i64, _>(1),
+                delivered_cursor: row.get::<i64, _>(2),
+            })
+            .collect());
     }
     Ok(Vec::new())
 }
@@ -1618,19 +1611,11 @@ pub(super) async fn resource_packages_for_jobs_impl(
     Ok(BTreeMap::new())
 }
 
-pub(super) async fn discovery_notification_targets_for_jobs_impl(
+pub(super) async fn discovery_notification_targets_for_package_rows_impl(
     state: &AppState,
-    job_keys: &[String],
+    packages: &[(ResourcePackage, i64)],
 ) -> Result<Vec<DiscoveryNotificationTargetItem>> {
-    let pairs = job_keys
-        .iter()
-        .filter_map(|job_key| {
-            job_key
-                .rsplit_once(':')
-                .map(|(subject_did, version)| (subject_did.to_owned(), version.to_owned()))
-        })
-        .collect::<Vec<_>>();
-    if pairs.is_empty() {
+    if packages.is_empty() {
         return Ok(Vec::new());
     }
     let authorization_state = super::current_authorization_state(state);
@@ -1642,66 +1627,20 @@ pub(super) async fn discovery_notification_targets_for_jobs_impl(
     if active_discoveries.is_empty() {
         return Ok(Vec::new());
     }
-    let mut packages = Vec::<(ResourcePackage, i64)>::new();
-    if let Some(sqlite) = &state.sqlite {
-        let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT package_json, rowid FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
-        ));
-        for (index, (subject_did, version)) in pairs.iter().enumerate() {
-            if index > 0 {
-                builder.push(" OR ");
-            }
-            builder
-                .push("(subject_did = ")
-                .push_bind(subject_did)
-                .push(" AND version = ")
-                .push_bind(version)
-                .push(")");
-        }
-        let rows = builder.build().fetch_all(sqlite.pool()).await?;
-        for row in rows {
-            packages.push((
-                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?,
-                row.get::<i64, _>(1),
-            ));
-        }
-    } else if let Some(postgres) = &state.postgres {
-        let mut builder =
-            QueryBuilder::<Postgres>::new("WITH requested(subject_did, version) AS (");
-        builder.push_values(pairs.iter(), |mut row, (subject_did, version)| {
-            row.push_bind(subject_did).push_bind(version);
-        });
-        builder.push(format!(
-            r#")
-            SELECT versions.package_json::text, versions.publication_cursor
-            FROM requested
-            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
-              ON versions.subject_did = requested.subject_did
-             AND versions.version = requested.version
-            "#
-        ));
-        let rows = builder.build().fetch_all(postgres.pool()).await?;
-        for row in rows {
-            packages.push((
-                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?,
-                row.get::<i64, _>(1),
-            ));
-        }
-    }
     let mut items = Vec::new();
     for (package, publication_cursor) in packages {
         let item = DiscoveryNotificationItem {
-            resource_did: package.resource_did,
-            package_version: package.package_version,
-            publication_cursor,
-            package_hash: package.package_hash,
-            metadata_hash: package.metadata_hash,
-            did_document_hash: package.did_document_hash,
+            resource_did: package.resource_did.clone(),
+            package_version: package.package_version.clone(),
+            publication_cursor: *publication_cursor,
+            package_hash: package.package_hash.clone(),
+            metadata_hash: package.metadata_hash.clone(),
+            did_document_hash: package.did_document_hash.clone(),
             resource_type: serde_json::to_value(&package.resource_type)
                 .ok()
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .unwrap_or_else(|| "unknown".to_owned()),
-            capability_tags: package.metadata.capability_tags,
+            capability_tags: package.metadata.capability_tags.clone(),
         };
         for (discovery_did, auth) in &active_discoveries {
             if state
