@@ -23,6 +23,7 @@ pub(super) struct CdnPublicationBatchCompletion {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PublicationProjectionRow {
+    status: String,
     resource_did: String,
     package_version: String,
     publication_cursor: i64,
@@ -31,6 +32,25 @@ struct PublicationProjectionRow {
     did_document_hash: String,
     resource_type: String,
     capability_tags: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PostgresDiscoveryNotificationItemRow<'a> {
+    discovery_did: &'a str,
+    publication_cursor: i64,
+    resource_did: &'a str,
+    package_version: &'a str,
+    package_hash: &'a str,
+    metadata_hash: &'a str,
+    did_document_hash: &'a str,
+    resource_type: &'a str,
+    capability_tags_json: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct PostgresDiscoveryTargetCursorRow<'a> {
+    discovery_did: &'a str,
+    pending_cursor: i64,
 }
 
 pub(super) fn read_bulletin_from_store_impl(state: &AppState) -> Result<Bulletin> {
@@ -638,28 +658,6 @@ pub(super) async fn persist_resource_acceptance_impl(
         .bind(&package.metadata_hash)
         .bind(operation)
         .bind(&now)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {ROOT_PACKAGE_JOB_TABLE}(job_key, subject_did, version, package_json, status, operation, created_at, updated_at)
-            VALUES ($1, $2, $3, $4::jsonb, 'accepted', $5, $6::timestamptz, $7::timestamptz)
-            ON CONFLICT(job_key)
-            DO UPDATE SET
-                package_json = excluded.package_json,
-                status = 'accepted',
-                operation = excluded.operation,
-                updated_at = excluded.updated_at
-            "#
-        ))
-        .bind(&package_job_key)
-        .bind(resource_did)
-        .bind(version)
-        .bind(&package_json)
-        .bind(operation)
-        .bind(now.clone())
-        .bind(now)
         .execute(&mut *tx)
         .await?;
 
@@ -1278,9 +1276,6 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
         let sql_started = Instant::now();
         let projections = postgres_publication_projections_for_jobs(state, &job_keys).await?;
         let fetch_sql_elapsed_ms = sql_started.elapsed().as_millis();
-        if projections.len() != job_keys.len() {
-            return Err(anyhow!("unknown_cdn_publication_job"));
-        }
         let ordered = job_keys
             .iter()
             .map(|job_key| {
@@ -1291,10 +1286,53 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
             })
             .collect::<Result<Vec<_>>>()?;
         validate_completion_refs(jobs, &ordered)?;
-        let (items, cursors) =
-            discovery_notification_targets_for_projection_rows(&ordered, discovery_nodes, tag_tree);
-        (items, cursors, fetch_sql_elapsed_ms)
+        let already_published = ordered
+            .iter()
+            .all(|row| row.status.eq_ignore_ascii_case("published"));
+        if already_published {
+            (Vec::new(), BTreeMap::new(), fetch_sql_elapsed_ms)
+        } else {
+            let (items, cursors) = discovery_notification_targets_for_projection_rows(
+                &ordered,
+                discovery_nodes,
+                tag_tree,
+            );
+            (items, cursors, fetch_sql_elapsed_ms)
+        }
     } else {
+        if let Some(sqlite) = &state.sqlite {
+            let already_published = sqlite_cdn_jobs_all_published(state, &job_keys).await?;
+            if already_published {
+                let packages = resource_packages_for_jobs_impl(state, &job_keys).await?;
+                if packages.len() != job_keys.len() {
+                    return Err(anyhow!("unknown_cdn_publication_job"));
+                }
+                let rows = job_keys
+                    .iter()
+                    .map(|job_key| {
+                        packages
+                            .get(job_key)
+                            .cloned()
+                            .ok_or_else(|| anyhow!("unknown_cdn_publication_job"))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                validate_completion_refs_against_rows(jobs, &rows)?;
+                let _ = sqlite;
+                return Ok(CdnPublicationBatchCompletion {
+                    marked_count: job_keys.len(),
+                    stored_notification_count: 0,
+                    advanced_discovery_count: 0,
+                    fetch_elapsed_ms: fetch_started.elapsed().as_millis(),
+                    fetch_sql_elapsed_ms: 0,
+                    watermark_match_elapsed_ms: 0,
+                    update_elapsed_ms: 0,
+                    watermark_elapsed_ms: 0,
+                    store_items_elapsed_ms: 0,
+                    upsert_targets_elapsed_ms: 0,
+                    delete_jobs_elapsed_ms: 0,
+                });
+            }
+        }
         let packages = resource_packages_for_jobs_impl(state, &job_keys).await?;
         if packages.len() != job_keys.len() {
             return Err(anyhow!("unknown_cdn_publication_job"));
@@ -1421,79 +1459,137 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
         let mut tx = postgres.pool().begin().await?;
         if !notification_items.is_empty() {
             let stage_started = Instant::now();
-            for chunk in notification_items.chunks(250) {
-                let mut builder = QueryBuilder::<Postgres>::new(format!(
-                    r#"
-                    INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
-                        discovery_did, publication_cursor, resource_did, package_version,
-                        package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
-                    )
-                    "#
-                ));
-                builder.push_values(chunk, |mut row, item| {
-                    row.push_bind(&item.discovery_did)
-                        .push_bind(item.item.publication_cursor)
-                        .push_bind(&item.item.resource_did)
-                        .push_bind(&item.item.package_version)
-                        .push_bind(&item.item.package_hash)
-                        .push_bind(&item.item.metadata_hash)
-                        .push_bind(&item.item.did_document_hash)
-                        .push_bind(&item.item.resource_type)
-                        .push_bind(sqlx::types::Json(item.item.capability_tags.clone()));
-                });
-                builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
-                builder.build().execute(&mut *tx).await?;
-            }
+            let rows = notification_items
+                .iter()
+                .map(|item| PostgresDiscoveryNotificationItemRow {
+                    discovery_did: &item.discovery_did,
+                    publication_cursor: item.item.publication_cursor,
+                    resource_did: &item.item.resource_did,
+                    package_version: &item.item.package_version,
+                    package_hash: &item.item.package_hash,
+                    metadata_hash: &item.item.metadata_hash,
+                    did_document_hash: &item.item.did_document_hash,
+                    resource_type: &item.item.resource_type,
+                    capability_tags_json: item.item.capability_tags.clone(),
+                })
+                .collect::<Vec<_>>();
+            let payload = serde_json::to_value(&rows)?;
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
+                    discovery_did,
+                    publication_cursor,
+                    resource_did,
+                    package_version,
+                    package_hash,
+                    metadata_hash,
+                    did_document_hash,
+                    resource_type,
+                    capability_tags_json
+                )
+                SELECT
+                    entry.discovery_did,
+                    entry.publication_cursor,
+                    entry.resource_did,
+                    entry.package_version,
+                    entry.package_hash,
+                    entry.metadata_hash,
+                    entry.did_document_hash,
+                    entry.resource_type,
+                    entry.capability_tags_json
+                FROM jsonb_to_recordset($1::jsonb) AS entry(
+                    discovery_did text,
+                    publication_cursor bigint,
+                    resource_did text,
+                    package_version text,
+                    package_hash text,
+                    metadata_hash text,
+                    did_document_hash text,
+                    resource_type text,
+                    capability_tags_json jsonb
+                )
+                ON CONFLICT(discovery_did, publication_cursor) DO NOTHING
+                "#
+            ))
+            .bind(payload)
+            .execute(&mut *tx)
+            .await?;
             store_items_elapsed_ms = stage_started.elapsed().as_millis();
         }
         stored_notification_count = notification_items.len();
         if !target_cursors.is_empty() {
             let stage_started = Instant::now();
-            let rows = target_cursors.iter().collect::<Vec<_>>();
-            for chunk in rows.chunks(250) {
-                let mut builder = QueryBuilder::<Postgres>::new(format!(
-                    r#"
-                    INSERT INTO {ROOT_DISCOVERY_TARGET_TABLE}(
-                        discovery_did, pending_cursor, delivered_cursor, status, attempt_count,
-                        lease_owner, lease_expires_at, next_attempt_at, last_error, updated_at
-                    )
-                    "#
-                ));
-                builder.push_values(chunk, |mut row, (discovery_did, publication_cursor)| {
-                    row.push_bind(*discovery_did)
-                        .push_bind(*publication_cursor)
-                        .push("0")
-                        .push("'active'")
-                        .push("0")
-                        .push("NULL")
-                        .push("NULL")
-                        .push_bind(now)
-                        .push("NULL")
-                        .push_bind(now);
-                });
-                builder.push(format!(
-                    r#"
-                    ON CONFLICT(discovery_did)
-                    DO UPDATE SET
-                        pending_cursor = GREATEST({ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor, excluded.pending_cursor),
-                        status = 'active',
-                        next_attempt_at = CASE
-                            WHEN {ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor < excluded.pending_cursor
-                            THEN excluded.next_attempt_at
-                            ELSE {ROOT_DISCOVERY_TARGET_TABLE}.next_attempt_at
-                        END,
-                        updated_at = excluded.updated_at
-                    "#
-                ));
-                builder.build().execute(&mut *tx).await?;
-            }
+            let rows = target_cursors
+                .iter()
+                .map(
+                    |(discovery_did, publication_cursor)| PostgresDiscoveryTargetCursorRow {
+                        discovery_did,
+                        pending_cursor: *publication_cursor,
+                    },
+                )
+                .collect::<Vec<_>>();
+            let payload = serde_json::to_value(&rows)?;
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {ROOT_DISCOVERY_TARGET_TABLE}(
+                    discovery_did,
+                    pending_cursor,
+                    delivered_cursor,
+                    status,
+                    attempt_count,
+                    lease_owner,
+                    lease_expires_at,
+                    next_attempt_at,
+                    last_error,
+                    updated_at
+                )
+                SELECT
+                    entry.discovery_did,
+                    entry.pending_cursor,
+                    0,
+                    'active',
+                    0,
+                    NULL,
+                    NULL,
+                    $2::timestamptz,
+                    NULL,
+                    $2::timestamptz
+                FROM jsonb_to_recordset($1::jsonb) AS entry(
+                    discovery_did text,
+                    pending_cursor bigint
+                )
+                ON CONFLICT(discovery_did)
+                DO UPDATE SET
+                    pending_cursor = GREATEST({ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor, excluded.pending_cursor),
+                    status = 'active',
+                    next_attempt_at = CASE
+                        WHEN {ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor < excluded.pending_cursor
+                        THEN excluded.next_attempt_at
+                        ELSE {ROOT_DISCOVERY_TARGET_TABLE}.next_attempt_at
+                    END,
+                    updated_at = excluded.updated_at
+                "#
+            ))
+            .bind(payload)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
             upsert_targets_elapsed_ms = stage_started.elapsed().as_millis();
         }
         let stage_started = Instant::now();
         sqlx::query(&format!(
-            "DELETE FROM {ROOT_CDN_JOB_TABLE} WHERE job_key = ANY($1)"
+            r#"
+            UPDATE {ROOT_CDN_JOB_TABLE}
+            SET status = 'published',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                next_attempt_at = $2::timestamptz,
+                last_error = NULL
+            WHERE job_key = ANY($1)
+            "#
         ))
         .bind(&job_keys)
+        .bind(now)
         .execute(&mut *tx)
         .await?;
         delete_jobs_elapsed_ms = stage_started.elapsed().as_millis();
@@ -1936,50 +2032,80 @@ async fn postgres_publication_projections_for_jobs(
     if job_keys.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let rows = sqlx::query(&format!(
-        r#"
-        SELECT job_key, publication_cursor, resource_did, package_version,
-               package_hash, metadata_hash, did_document_hash, resource_type,
-               capability_tags_json::text
-        FROM {ROOT_CDN_JOB_TABLE}
-        WHERE job_key = ANY($1)
+    let pairs = job_keys
+        .iter()
+        .filter_map(|job_key| {
+            job_key.rsplit_once(':').map(|(subject_did, version)| {
+                (job_key.clone(), subject_did.to_owned(), version.to_owned())
+            })
+        })
+        .collect::<Vec<_>>();
+    if pairs.len() != job_keys.len() {
+        return Ok(BTreeMap::new());
+    }
+    let mut builder =
+        QueryBuilder::<Postgres>::new("WITH requested(job_key, subject_did, version) AS (");
+    builder.push_values(pairs.iter(), |mut row, (job_key, subject_did, version)| {
+        row.push_bind(job_key)
+            .push_bind(subject_did)
+            .push_bind(version);
+    });
+    builder.push(format!(
+        r#")
+        SELECT requested.job_key,
+               COALESCE(jobs.status, 'published') AS status,
+               COALESCE(jobs.publication_cursor, versions.publication_cursor) AS publication_cursor,
+               COALESCE(jobs.resource_did, versions.subject_did) AS resource_did,
+               COALESCE(jobs.package_version, versions.version) AS package_version,
+               COALESCE(jobs.package_hash, versions.package_hash) AS package_hash,
+               COALESCE(jobs.metadata_hash, versions.metadata_hash) AS metadata_hash,
+               COALESCE(jobs.did_document_hash, versions.did_document_hash) AS did_document_hash,
+               COALESCE(jobs.resource_type, versions.resource_type) AS resource_type,
+               COALESCE(jobs.capability_tags_json::text, versions.capability_tags_json::text, '[]')
+        FROM requested
+        LEFT JOIN {ROOT_CDN_JOB_TABLE} AS jobs
+          ON jobs.job_key = requested.job_key
+        LEFT JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+          ON versions.subject_did = requested.subject_did
+         AND versions.version = requested.version
         "#
-    ))
-    .bind(job_keys)
-    .fetch_all(postgres.pool())
-    .await?;
+    ));
+    let rows = builder.build().fetch_all(postgres.pool()).await?;
     let mut items = BTreeMap::new();
     for row in rows {
         let job_key = row.get::<String, _>(0);
         let publication_cursor = row
-            .try_get::<Option<i64>, _>(1)?
+            .try_get::<Option<i64>, _>(2)?
             .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
         let resource_did = row
-            .try_get::<Option<String>, _>(2)?
-            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
-        let package_version = row
             .try_get::<Option<String>, _>(3)?
             .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
-        let package_hash = row
+        let package_version = row
             .try_get::<Option<String>, _>(4)?
             .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
-        let metadata_hash = row
+        let package_hash = row
             .try_get::<Option<String>, _>(5)?
             .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
-        let did_document_hash = row
+        let metadata_hash = row
             .try_get::<Option<String>, _>(6)?
             .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
-        let resource_type = row
+        let did_document_hash = row
             .try_get::<Option<String>, _>(7)?
+            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
+        let resource_type = row
+            .try_get::<Option<String>, _>(8)?
             .unwrap_or_else(|| "unknown".to_owned());
         let capability_tags = row
-            .try_get::<Option<String>, _>(8)?
+            .try_get::<Option<String>, _>(9)?
             .map(|value| serde_json::from_str::<Vec<String>>(&value))
             .transpose()?
             .unwrap_or_default();
         items.insert(
             job_key,
             PublicationProjectionRow {
+                status: row
+                    .try_get::<Option<String>, _>(1)?
+                    .unwrap_or_else(|| "unknown".to_owned()),
                 resource_did,
                 package_version,
                 publication_cursor,
@@ -2018,6 +2144,7 @@ async fn postgres_publication_projection_rows_by_cursor_range(
     rows.into_iter()
         .map(|row| {
             Ok(PublicationProjectionRow {
+                status: "published".to_owned(),
                 publication_cursor: row.get::<i64, _>(0),
                 resource_did: row.get::<String, _>(1),
                 package_version: row.get::<String, _>(2),
@@ -2029,6 +2156,32 @@ async fn postgres_publication_projection_rows_by_cursor_range(
             })
         })
         .collect()
+}
+
+async fn sqlite_cdn_jobs_all_published(state: &AppState, job_keys: &[String]) -> Result<bool> {
+    let Some(sqlite) = &state.sqlite else {
+        return Ok(false);
+    };
+    if job_keys.is_empty() {
+        return Ok(false);
+    }
+    let mut builder = QueryBuilder::<Sqlite>::new(format!(
+        r#"
+        SELECT job_key, status
+        FROM {ROOT_CDN_JOB_TABLE}
+        WHERE job_key IN (
+        "#
+    ));
+    let mut separated = builder.separated(", ");
+    for job_key in job_keys {
+        separated.push_bind(job_key);
+    }
+    separated.push_unseparated(")");
+    let rows = builder.build().fetch_all(sqlite.pool()).await?;
+    Ok(rows.len() == job_keys.len()
+        && rows
+            .into_iter()
+            .all(|row| row.get::<String, _>(1).eq_ignore_ascii_case("published")))
 }
 
 fn discovery_notification_item_from_projection(

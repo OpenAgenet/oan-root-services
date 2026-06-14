@@ -1003,11 +1003,7 @@ fn build_mark_published_jobs(items: &[ResourceCdnPublishBatchItem]) -> Vec<Value
         .iter()
         .map(|item| {
             json!({
-                "jobKey": format!("{}:{}", item.package.resource_did, item.package.package_version),
-                "publicationCursor": item.publication_cursor,
-                "resourceDid": item.package.resource_did,
-                "packageVersion": item.package.package_version,
-                "packageHash": item.package.package_hash
+                "jobKey": format!("{}:{}", item.package.resource_did, item.package.package_version)
             })
         })
         .collect()
