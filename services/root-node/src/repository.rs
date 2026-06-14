@@ -498,28 +498,6 @@ pub(super) async fn persist_resource_acceptance_impl(
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {ROOT_PACKAGE_JOB_TABLE}(job_key, subject_did, version, package_json, status, operation, created_at, updated_at)
-            VALUES (?, ?, ?, ?, 'accepted', ?, ?, ?)
-            ON CONFLICT(job_key)
-            DO UPDATE SET
-                package_json = excluded.package_json,
-                status = 'accepted',
-                operation = excluded.operation,
-                updated_at = excluded.updated_at
-            "#
-        ))
-        .bind(&package_job_key)
-        .bind(resource_did)
-        .bind(version)
-        .bind(&package_json)
-        .bind(operation)
-        .bind(now.clone())
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
         let publication_cursor = sqlx::query(&format!(
             "SELECT rowid FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = ? AND version = ?"
         ))
@@ -1443,7 +1421,15 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
         let stage_started = Instant::now();
         for chunk in job_keys.chunks(500) {
             let mut builder = QueryBuilder::<Sqlite>::new(format!(
-                "DELETE FROM {ROOT_CDN_JOB_TABLE} WHERE job_key IN ("
+                r#"
+                UPDATE {ROOT_CDN_JOB_TABLE}
+                SET status = 'published',
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    next_attempt_at = CURRENT_TIMESTAMP,
+                    last_error = NULL
+                WHERE job_key IN (
+                "#
             ));
             let mut separated = builder.separated(", ");
             for job_key in chunk {

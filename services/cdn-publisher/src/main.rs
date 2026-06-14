@@ -31,10 +31,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use tokio::{
-    task::JoinSet,
-    time::{sleep, Duration as TokioDuration},
-};
+use tokio::{task::JoinSet, time::Duration as TokioDuration};
 use url::Url;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -92,6 +89,7 @@ struct AppState {
     signing_key: SigningKey,
     client: reqwest::Client,
     runtime: Arc<Mutex<PublisherRuntime>>,
+    pending_callbacks: Arc<Mutex<PendingCallbackBatch>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -152,6 +150,7 @@ struct PublisherCycleMetrics {
 #[derive(Clone, Debug, Default)]
 struct CdnBatchPublishOutcome {
     published_cursors: BTreeSet<i64>,
+    failed_cursors: BTreeSet<i64>,
     published_count: usize,
     retry_count: usize,
     publish_elapsed_ms: u128,
@@ -166,6 +165,17 @@ struct PreparedPublishTask {
     message: async_nats::jetstream::Message,
     publication_cursor: i64,
     package: ResourcePackage,
+}
+
+struct ChunkPublishSuccess {
+    item: ResourceCdnPublishBatchItem,
+    message: async_nats::jetstream::Message,
+}
+
+#[derive(Default)]
+struct PendingCallbackBatch {
+    items: Vec<ChunkPublishSuccess>,
+    first_buffered_at: Option<std::time::Instant>,
 }
 
 struct TerminalFailureTask {
@@ -228,6 +238,58 @@ fn default_http_timeout_seconds() -> u64 {
     30
 }
 
+fn pipeline_chunk_size(batch_size: usize, max_in_flight: usize, prepared_len: usize) -> usize {
+    let upper = prepared_len.max(1);
+    let configured = batch_size.min(max_in_flight.max(1)).max(1);
+    configured.min(256).min(upper).max(1)
+}
+
+fn completion_flush_size(batch_size: usize, prepared_len: usize) -> usize {
+    batch_size.max(192).min(prepared_len.max(1))
+}
+
+fn completion_flush_max_wait_ms(fetch_timeout_ms: u64) -> u64 {
+    fetch_timeout_ms.clamp(250, 1_500)
+}
+
+fn completion_buffer_max_items(batch_size: usize, max_in_flight: usize) -> usize {
+    batch_size
+        .max(max_in_flight.max(1))
+        .saturating_mul(8)
+        .clamp(384, 6_144)
+}
+
+fn should_flush_callback_buffer(
+    buffered_count: usize,
+    flush_size: usize,
+    max_items: usize,
+    cycle_fetched: usize,
+    oldest_age_ms: Option<u128>,
+    max_wait_ms: u64,
+) -> bool {
+    if buffered_count == 0 {
+        return false;
+    }
+    if buffered_count >= max_items {
+        return true;
+    }
+    if buffered_count >= flush_size {
+        return true;
+    }
+    if cycle_fetched == 0 {
+        return true;
+    }
+    oldest_age_ms.unwrap_or(0) >= u128::from(max_wait_ms)
+}
+
+fn should_force_flush_at_cycle_tail(
+    buffered_count: usize,
+    cycle_fetched: usize,
+    fetch_limit: usize,
+) -> bool {
+    buffered_count > 0 && cycle_fetched > 0 && cycle_fetched < fetch_limit.max(1)
+}
+
 fn default_mark_published_path() -> String {
     "/root/internal/cdn-publication-jobs/mark-published".to_owned()
 }
@@ -266,6 +328,7 @@ async fn main() -> Result<()> {
             durable_consumer: config.events.durable_consumer.clone(),
             ..Default::default()
         })),
+        pending_callbacks: Arc::new(Mutex::new(PendingCallbackBatch::default())),
         root_did: key.did,
         signing_key,
         client,
@@ -453,123 +516,184 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
         failed += cycle_metrics.binding_stage.last_failure_count;
 
         if !prepared.is_empty() {
-            let publish_started = std::time::Instant::now();
-            let publish_outcome = match publish_packages_to_cdn(
-                &state,
-                prepared
-                    .iter()
-                    .map(|item| (item.publication_cursor, item.package.clone()))
-                    .collect(),
-            )
-            .await
-            {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    record_cycle(
-                        &state,
-                        fetched,
-                        acked,
-                        failed,
-                        started.elapsed().as_millis(),
-                        cycle_metrics,
-                        Some(err.to_string()),
-                    );
+            let ack_concurrency = state.config.events.max_in_flight.max(1);
+            cycle_metrics.ack_concurrency = ack_concurrency;
+            let chunk_size = pipeline_chunk_size(
+                state.config.events.batch_size,
+                state.config.events.max_in_flight,
+                prepared.len(),
+            );
+            let total_prepared = prepared.len();
+            let mut publish_success_count = 0usize;
+            let mut publish_failure_count = 0usize;
+            let mut callback_success_count = 0usize;
+            let mut ack_success_count = 0usize;
+            let mut ack_target_count = fetch_failures + binding_failure_count;
+            let mut chunk = Vec::with_capacity(chunk_size);
+            let mut chunk_error: Option<String> = None;
+            let callback_flush_size =
+                completion_flush_size(state.config.events.batch_size, total_prepared);
+            let callback_flush_max_wait_ms =
+                completion_flush_max_wait_ms(state.config.events.fetch_timeout_ms);
+            let callback_buffer_max_items = completion_buffer_max_items(
+                state.config.events.batch_size,
+                state.config.events.max_in_flight,
+            );
+
+            for item in prepared.into_iter() {
+                chunk.push(item);
+                if chunk.len() < chunk_size {
                     continue;
                 }
-            };
-            cycle_metrics.publish_elapsed_ms = publish_outcome
-                .publish_elapsed_ms
-                .max(publish_started.elapsed().as_millis());
+                let (publish_success, publish_failure, chunk_successes, publish_elapsed_ms) =
+                    match process_publish_chunk(&state, std::mem::take(&mut chunk)).await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            chunk_error = Some(err.to_string());
+                            break;
+                        }
+                    };
+                publish_success_count += publish_success;
+                publish_failure_count += publish_failure;
+                cycle_metrics.publish_elapsed_ms += publish_elapsed_ms;
+                buffer_callback_successes(&state, chunk_successes, callback_buffer_max_items);
+                if should_flush_pending_callbacks(
+                    &state,
+                    callback_flush_size,
+                    callback_buffer_max_items,
+                    fetched,
+                    callback_flush_max_wait_ms,
+                ) {
+                    let (flushed_callbacks, acked_batch, callback_elapsed_ms) =
+                        match flush_published_callback_batch(&state, ack_concurrency).await {
+                            Ok(value) => value,
+                            Err(err) => {
+                                chunk_error = Some(err.to_string());
+                                break;
+                            }
+                        };
+                    callback_success_count += flushed_callbacks;
+                    ack_target_count += flushed_callbacks;
+                    ack_success_count += acked_batch;
+                    acked += acked_batch;
+                    cycle_metrics.callback_elapsed_ms += callback_elapsed_ms;
+                }
+            }
+            if chunk_error.is_none() && !chunk.is_empty() {
+                let (publish_success, publish_failure, chunk_successes, publish_elapsed_ms) =
+                    match process_publish_chunk(&state, chunk).await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            chunk_error = Some(err.to_string());
+                            (0, 0, Vec::new(), 0)
+                        }
+                    };
+                publish_success_count += publish_success;
+                publish_failure_count += publish_failure;
+                cycle_metrics.publish_elapsed_ms += publish_elapsed_ms;
+                buffer_callback_successes(&state, chunk_successes, callback_buffer_max_items);
+            }
+            if chunk_error.is_none()
+                && should_flush_pending_callbacks(
+                    &state,
+                    callback_flush_size,
+                    callback_buffer_max_items,
+                    fetched,
+                    callback_flush_max_wait_ms,
+                )
+            {
+                let (flushed_callbacks, acked_batch, callback_elapsed_ms) =
+                    match flush_published_callback_batch(&state, ack_concurrency).await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            chunk_error = Some(err.to_string());
+                            (0, 0, 0)
+                        }
+                    };
+                callback_success_count += flushed_callbacks;
+                ack_target_count += flushed_callbacks;
+                ack_success_count += acked_batch;
+                acked += acked_batch;
+                cycle_metrics.callback_elapsed_ms += callback_elapsed_ms;
+            }
+            if chunk_error.is_none() {
+                let (buffered_count, _) = pending_callback_state(&state);
+                if should_force_flush_at_cycle_tail(buffered_count, fetched, fetch_limit) {
+                    let (flushed_callbacks, acked_batch, callback_elapsed_ms) =
+                        match flush_published_callback_batch(&state, ack_concurrency).await {
+                            Ok(value) => value,
+                            Err(err) => {
+                                chunk_error = Some(err.to_string());
+                                (0, 0, 0)
+                            }
+                        };
+                    callback_success_count += flushed_callbacks;
+                    ack_target_count += flushed_callbacks;
+                    ack_success_count += acked_batch;
+                    acked += acked_batch;
+                    cycle_metrics.callback_elapsed_ms += callback_elapsed_ms;
+                }
+            }
+            if let Some(err) = chunk_error {
+                record_cycle(
+                    &state,
+                    fetched,
+                    acked,
+                    failed,
+                    started.elapsed().as_millis(),
+                    cycle_metrics,
+                    Some(err),
+                );
+                continue;
+            }
+            failed += publish_failure_count;
+
+            if !terminal_ack_messages.is_empty() {
+                let ack_started = std::time::Instant::now();
+                let acked_batch = match ack_messages(terminal_ack_messages, ack_concurrency).await {
+                    Ok(value) => value,
+                    Err(err) => {
+                        record_cycle(
+                            &state,
+                            fetched,
+                            acked,
+                            failed,
+                            started.elapsed().as_millis(),
+                            cycle_metrics,
+                            Some(err.to_string()),
+                        );
+                        continue;
+                    }
+                };
+                acked += acked_batch;
+                ack_success_count += acked_batch;
+                cycle_metrics.ack_elapsed_ms += ack_started.elapsed().as_millis();
+                if acked_batch < fetch_failures + binding_failure_count {
+                    failed += (fetch_failures + binding_failure_count) - acked_batch;
+                }
+            }
+
             cycle_metrics.cdn_publish_stage = PublisherStageRuntime {
-                last_batch_size: prepared.len(),
+                last_batch_size: total_prepared,
                 last_concurrency: 1,
-                last_success_count: publish_outcome.published_count,
-                last_failure_count: publish_outcome.retry_count,
+                last_success_count: publish_success_count,
+                last_failure_count: publish_failure_count,
                 last_elapsed_ms: cycle_metrics.publish_elapsed_ms,
             };
-            failed += publish_outcome.retry_count;
-
-            let successful = prepared
-                .iter()
-                .filter(|item| {
-                    publish_outcome
-                        .published_cursors
-                        .contains(&item.publication_cursor)
-                })
-                .map(|item| ResourceCdnPublishBatchItem {
-                    publication_cursor: item.publication_cursor,
-                    package: item.package.clone(),
-                })
-                .collect::<Vec<_>>();
-
-            let callback_started = std::time::Instant::now();
-            let callback_success_count = if successful.is_empty() {
-                0
-            } else {
-                if let Err(err) = mark_root_jobs_published(&state, &successful).await {
-                    record_cycle(
-                        &state,
-                        fetched,
-                        acked,
-                        failed,
-                        started.elapsed().as_millis(),
-                        cycle_metrics,
-                        Some(err.to_string()),
-                    );
-                    continue;
-                }
-                successful.len()
-            };
-            cycle_metrics.callback_elapsed_ms = callback_started.elapsed().as_millis();
             cycle_metrics.root_callback_stage = PublisherStageRuntime {
-                last_batch_size: successful.len(),
+                last_batch_size: callback_success_count,
                 last_concurrency: 1,
                 last_success_count: callback_success_count,
                 last_failure_count: 0,
                 last_elapsed_ms: cycle_metrics.callback_elapsed_ms,
             };
-
-            let mut ack_messages_batch = prepared
-                .into_iter()
-                .filter_map(|item| {
-                    publish_outcome
-                        .published_cursors
-                        .contains(&item.publication_cursor)
-                        .then_some(item.message)
-                })
-                .collect::<Vec<_>>();
-            ack_messages_batch.extend(terminal_ack_messages);
-            let ack_concurrency = state.config.events.max_in_flight.max(1);
-            cycle_metrics.ack_concurrency = ack_concurrency;
-            let ack_started = std::time::Instant::now();
-            let acked_batch = match ack_messages(ack_messages_batch, ack_concurrency).await {
-                Ok(value) => value,
-                Err(err) => {
-                    record_cycle(
-                        &state,
-                        fetched,
-                        acked,
-                        failed,
-                        started.elapsed().as_millis(),
-                        cycle_metrics,
-                        Some(err.to_string()),
-                    );
-                    continue;
-                }
-            };
-            acked += acked_batch;
-            cycle_metrics.ack_elapsed_ms = ack_started.elapsed().as_millis();
-            let ack_target_count = callback_success_count + fetch_failures + binding_failure_count;
             cycle_metrics.ack_stage = PublisherStageRuntime {
                 last_batch_size: ack_target_count,
                 last_concurrency: ack_concurrency,
-                last_success_count: acked_batch,
-                last_failure_count: ack_target_count.saturating_sub(acked_batch),
+                last_success_count: ack_success_count,
+                last_failure_count: ack_target_count.saturating_sub(ack_success_count),
                 last_elapsed_ms: cycle_metrics.ack_elapsed_ms,
             };
-            if acked_batch < ack_target_count {
-                failed += ack_target_count - acked_batch;
-            }
         } else if !terminal_ack_messages.is_empty() {
             let ack_concurrency = state.config.events.max_in_flight.max(1);
             cycle_metrics.ack_concurrency = ack_concurrency;
@@ -603,6 +727,60 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
                 failed += ack_target_count - acked_batch;
             }
         }
+        if fetched == 0 {
+            let callback_flush_size = completion_flush_size(state.config.events.batch_size, 1);
+            let callback_flush_max_wait_ms =
+                completion_flush_max_wait_ms(state.config.events.fetch_timeout_ms);
+            let callback_buffer_max_items = completion_buffer_max_items(
+                state.config.events.batch_size,
+                state.config.events.max_in_flight,
+            );
+            if should_flush_pending_callbacks(
+                &state,
+                callback_flush_size,
+                callback_buffer_max_items,
+                0,
+                callback_flush_max_wait_ms,
+            ) {
+                let ack_concurrency = state.config.events.max_in_flight.max(1);
+                let (flushed_callbacks, acked_batch, callback_elapsed_ms) =
+                    match flush_published_callback_batch(&state, ack_concurrency).await {
+                        Ok(value) => value,
+                        Err(err) => {
+                            record_cycle(
+                                &state,
+                                fetched,
+                                acked,
+                                failed,
+                                started.elapsed().as_millis(),
+                                cycle_metrics,
+                                Some(err.to_string()),
+                            );
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                    };
+                acked += acked_batch;
+                cycle_metrics.callback_elapsed_ms += callback_elapsed_ms;
+                cycle_metrics.root_callback_stage = PublisherStageRuntime {
+                    last_batch_size: flushed_callbacks,
+                    last_concurrency: 1,
+                    last_success_count: flushed_callbacks,
+                    last_failure_count: 0,
+                    last_elapsed_ms: cycle_metrics.callback_elapsed_ms,
+                };
+                cycle_metrics.ack_stage = PublisherStageRuntime {
+                    last_batch_size: flushed_callbacks,
+                    last_concurrency: ack_concurrency,
+                    last_success_count: acked_batch,
+                    last_failure_count: flushed_callbacks.saturating_sub(acked_batch),
+                    last_elapsed_ms: cycle_metrics.ack_elapsed_ms,
+                };
+                if acked_batch < flushed_callbacks {
+                    failed += flushed_callbacks - acked_batch;
+                }
+            }
+        }
         record_cycle(
             &state,
             fetched,
@@ -613,12 +791,134 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
             None,
         );
         if fetched == 0 {
-            sleep(TokioDuration::from_millis(
-                state.config.events.fetch_timeout_ms.max(100),
-            ))
-            .await;
+            tokio::task::yield_now().await;
         }
     }
+}
+
+async fn process_publish_chunk(
+    state: &AppState,
+    chunk: Vec<PreparedPublishTask>,
+) -> Result<(usize, usize, Vec<ChunkPublishSuccess>, u128)> {
+    if chunk.is_empty() {
+        return Ok((0, 0, Vec::new(), 0));
+    }
+    let publish_started = std::time::Instant::now();
+    let publish_outcome = publish_packages_to_cdn(
+        state,
+        chunk
+            .iter()
+            .map(|item| (item.publication_cursor, item.package.clone()))
+            .collect(),
+    )
+    .await?;
+
+    let mut successful = Vec::new();
+    let mut unknown_publish_failures = 0usize;
+    for item in chunk {
+        if publish_outcome
+            .published_cursors
+            .contains(&item.publication_cursor)
+        {
+            successful.push(ChunkPublishSuccess {
+                item: ResourceCdnPublishBatchItem {
+                    publication_cursor: item.publication_cursor,
+                    package: item.package.clone(),
+                },
+                message: item.message,
+            });
+        } else if !publish_outcome
+            .failed_cursors
+            .contains(&item.publication_cursor)
+        {
+            unknown_publish_failures = unknown_publish_failures.saturating_add(1);
+        }
+    }
+
+    Ok((
+        publish_outcome.published_count,
+        publish_outcome.retry_count + unknown_publish_failures,
+        successful,
+        publish_outcome
+            .publish_elapsed_ms
+            .max(publish_started.elapsed().as_millis()),
+    ))
+}
+
+async fn flush_published_callback_batch(
+    state: &AppState,
+    ack_concurrency: usize,
+) -> Result<(usize, usize, u128)> {
+    let drained = take_pending_callback_batch(state);
+    if drained.is_empty() {
+        return Ok((0, 0, 0));
+    }
+    let items = drained
+        .iter()
+        .map(|item| item.item.clone())
+        .collect::<Vec<_>>();
+    let messages = drained
+        .into_iter()
+        .map(|item| item.message)
+        .collect::<Vec<_>>();
+    let callback_started = std::time::Instant::now();
+    mark_root_jobs_published(state, &items).await?;
+    let callback_elapsed_ms = callback_started.elapsed().as_millis();
+    let acked_batch = ack_messages(messages, ack_concurrency).await?;
+    Ok((items.len(), acked_batch, callback_elapsed_ms))
+}
+
+fn buffer_callback_successes(
+    state: &AppState,
+    successes: Vec<ChunkPublishSuccess>,
+    _max_items: usize,
+) {
+    if successes.is_empty() {
+        return;
+    }
+    if let Ok(mut pending) = state.pending_callbacks.lock() {
+        if pending.first_buffered_at.is_none() {
+            pending.first_buffered_at = Some(std::time::Instant::now());
+        }
+        pending.items.extend(successes);
+    }
+}
+
+fn pending_callback_state(state: &AppState) -> (usize, Option<u128>) {
+    state.pending_callbacks.lock().map_or((0, None), |pending| {
+        (
+            pending.items.len(),
+            pending
+                .first_buffered_at
+                .map(|started| started.elapsed().as_millis()),
+        )
+    })
+}
+
+fn should_flush_pending_callbacks(
+    state: &AppState,
+    flush_size: usize,
+    max_items: usize,
+    cycle_fetched: usize,
+    max_wait_ms: u64,
+) -> bool {
+    let (buffered_count, oldest_age_ms) = pending_callback_state(state);
+    should_flush_callback_buffer(
+        buffered_count,
+        flush_size,
+        max_items,
+        cycle_fetched,
+        oldest_age_ms,
+        max_wait_ms,
+    )
+}
+
+fn take_pending_callback_batch(state: &AppState) -> Vec<ChunkPublishSuccess> {
+    if let Ok(mut pending) = state.pending_callbacks.lock() {
+        pending.first_buffered_at = None;
+        return std::mem::take(&mut pending.items);
+    }
+    Vec::new()
 }
 
 async fn ack_messages(
@@ -934,7 +1234,8 @@ async fn publish_packages_to_cdn(
     if !status.is_success() {
         return Err(anyhow!("cdn_publish_failed:{status}:{value}"));
     }
-    let published_cursors = extract_published_cursors(&value)?;
+    let published_cursors = extract_publish_cursors(&value, "items")?;
+    let failed_cursors = extract_publish_cursors(&value, "failed").unwrap_or_default();
     let retry_count = value
         .get("failedCount")
         .and_then(Value::as_u64)
@@ -950,15 +1251,16 @@ async fn publish_packages_to_cdn(
     Ok(CdnBatchPublishOutcome {
         published_count: published_cursors.len(),
         retry_count,
+        failed_cursors,
         published_cursors,
         publish_elapsed_ms,
     })
 }
 
-fn extract_published_cursors(value: &Value) -> Result<BTreeSet<i64>> {
+fn extract_publish_cursors(value: &Value, field: &str) -> Result<BTreeSet<i64>> {
     let mut cursors = BTreeSet::new();
     let items = value
-        .get("items")
+        .get(field)
         .and_then(Value::as_array)
         .ok_or_else(|| anyhow!("cdn_publish_items_missing"))?;
     for item in items {
@@ -1155,6 +1457,7 @@ mod tests {
             signing_key,
             client: reqwest::Client::new(),
             runtime: Arc::new(Mutex::new(PublisherRuntime::default())),
+            pending_callbacks: Arc::new(Mutex::new(PendingCallbackBatch::default())),
         }
     }
 
@@ -1298,6 +1601,8 @@ mod tests {
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0]["jobKey"], "did:oan:AGUS:test:1.0.0");
         assert_eq!(jobs[1]["jobKey"], "did:oan:AGUS:test2:2.0.0");
+        assert_eq!(jobs[0].as_object().map(|value| value.len()), Some(1));
+        assert_eq!(jobs[1].as_object().map(|value| value.len()), Some(1));
     }
 
     #[test]
@@ -1534,11 +1839,85 @@ mod tests {
             ]
         });
 
-        let cursors = extract_published_cursors(&value).unwrap();
+        let cursors = extract_publish_cursors(&value, "items").unwrap();
 
         assert_eq!(cursors.len(), 2);
         assert!(cursors.contains(&42));
         assert!(cursors.contains(&43));
+    }
+
+    #[test]
+    fn completion_flush_size_prefers_coarser_root_callback_batches() {
+        assert_eq!(completion_flush_size(10, 8), 8);
+        assert_eq!(completion_flush_size(10, 200), 192);
+        assert_eq!(completion_flush_size(128, 200), 192);
+    }
+
+    #[test]
+    fn pipeline_chunk_size_can_use_larger_batches_under_load() {
+        assert_eq!(pipeline_chunk_size(200, 200, 200), 200);
+        assert_eq!(pipeline_chunk_size(512, 512, 512), 256);
+        assert_eq!(pipeline_chunk_size(64, 200, 80), 64);
+    }
+
+    #[test]
+    fn cycle_tail_flushes_when_fetch_returns_partial_batch() {
+        assert!(should_force_flush_at_cycle_tail(12, 80, 200));
+        assert!(!should_force_flush_at_cycle_tail(0, 80, 200));
+        assert!(!should_force_flush_at_cycle_tail(12, 200, 200));
+        assert!(!should_force_flush_at_cycle_tail(12, 0, 200));
+    }
+
+    #[test]
+    fn callback_flush_policy_waits_for_size_or_idle_or_timeout() {
+        assert!(!should_flush_callback_buffer(0, 128, 512, 12, None, 500));
+        assert!(!should_flush_callback_buffer(
+            64,
+            128,
+            512,
+            12,
+            Some(100),
+            500
+        ));
+        assert!(should_flush_callback_buffer(
+            128,
+            128,
+            512,
+            12,
+            Some(100),
+            500
+        ));
+        assert!(should_flush_callback_buffer(
+            64,
+            128,
+            512,
+            0,
+            Some(100),
+            500
+        ));
+        assert!(should_flush_callback_buffer(
+            64,
+            128,
+            512,
+            12,
+            Some(800),
+            500
+        ));
+        assert!(should_flush_callback_buffer(
+            512,
+            128,
+            512,
+            12,
+            Some(100),
+            500
+        ));
+    }
+
+    #[test]
+    fn completion_buffer_max_items_has_reasonable_bounds() {
+        assert_eq!(completion_buffer_max_items(10, 8), 384);
+        assert_eq!(completion_buffer_max_items(128, 16), 1024);
+        assert_eq!(completion_buffer_max_items(1024, 512), 6144);
     }
 
     #[test]
