@@ -75,8 +75,7 @@ const ROOT_SUBJECT_LATEST_TABLE: &str = "root_subject_latest";
 const ROOT_SUBJECT_VERSION_TABLE: &str = "root_subject_versions";
 const ROOT_PACKAGE_JOB_TABLE: &str = "root_verified_package_jobs";
 const ROOT_DEBUG_EXPORT_INTERVAL_MS: u64 = 2_000;
-const ROOT_STATUS_CACHE_TTL_MS: u64 = 100;
-const ROOT_WORKER_MAX_IMMEDIATE_DRAIN_CYCLES: usize = 8;
+const ROOT_STATUS_CACHE_TTL_MS: u64 = 500;
 
 #[derive(Clone, Debug, Deserialize)]
 struct Config {
@@ -484,8 +483,13 @@ struct WorkerRuntimeState {
     discovery_timer_trigger_count: u64,
     discovery_noop_cycle_count: u64,
     mark_published_last_fetch_elapsed_ms: u128,
+    mark_published_last_fetch_sql_elapsed_ms: u128,
+    mark_published_last_watermark_match_elapsed_ms: u128,
     mark_published_last_update_elapsed_ms: u128,
     mark_published_last_watermark_elapsed_ms: u128,
+    mark_published_last_store_items_elapsed_ms: u128,
+    mark_published_last_upsert_targets_elapsed_ms: u128,
+    mark_published_last_delete_jobs_elapsed_ms: u128,
     mark_published_last_total_elapsed_ms: u128,
     mark_published_last_job_count: usize,
     mark_published_total_call_count: u64,
@@ -915,20 +919,22 @@ struct PrivateKeyJwk {
 
 #[derive(Clone, Debug, Deserialize)]
 struct CdnPublicationJobRef {
-    resource_did: String,
-    package_version: String,
+    #[serde(rename = "jobKey")]
+    job_key: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct CdnPublicationJobCompletionRef {
     #[serde(rename = "jobKey", default)]
     job_key: String,
-    resource_did: String,
-    package_version: String,
     #[serde(rename = "publicationCursor", default)]
-    publication_cursor: i64,
+    publication_cursor: Option<i64>,
+    #[serde(rename = "resourceDid", default)]
+    resource_did: Option<String>,
+    #[serde(rename = "packageVersion", default)]
+    package_version: Option<String>,
     #[serde(rename = "packageHash", default)]
-    package_hash: String,
+    package_hash: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -1267,8 +1273,8 @@ fn spawn_trust_indexer_watcher(state: AppState) {
 
 async fn root_cdn_outbox_relay_loop(state: AppState) {
     let interval_ms = state.config.security.workers.cdn_interval_ms.max(100);
-    let mut immediate_drain_cycles = 0usize;
     loop {
+        let _ = consume_pending_worker_signal_trigger(&state, true);
         let cycle = match run_cdn_outbox_relay_cycle(&state).await {
             Ok(result) => Some(result),
             Err(err) => {
@@ -1282,19 +1288,12 @@ async fn root_cdn_outbox_relay_loop(state: AppState) {
             .map(cdn_cycle_should_continue_immediately)
             .unwrap_or(false);
         if should_continue_immediately {
-            immediate_drain_cycles = immediate_drain_cycles.saturating_add(1);
-            if immediate_drain_cycles < ROOT_WORKER_MAX_IMMEDIATE_DRAIN_CYCLES {
-                continue;
-            }
-            immediate_drain_cycles = 0;
             tokio::task::yield_now().await;
             continue;
         }
         if made_progress {
-            immediate_drain_cycles = 0;
             continue;
         }
-        immediate_drain_cycles = 0;
         record_worker_noop_cycle(&state, true);
         tokio::select! {
             _ = state.cdn_worker_notify.notified() => {
@@ -1312,8 +1311,8 @@ async fn root_cdn_outbox_relay_loop(state: AppState) {
 
 async fn root_discovery_worker_loop(state: AppState) {
     let interval_ms = state.config.security.workers.discovery_interval_ms.max(100);
-    let mut immediate_drain_cycles = 0usize;
     loop {
+        let _ = consume_pending_worker_signal_trigger(&state, false);
         let cycle = match run_discovery_notify_cycle(&state).await {
             Ok(result) => Some(result),
             Err(err) => {
@@ -1330,19 +1329,12 @@ async fn root_discovery_worker_loop(state: AppState) {
             .map(discovery_cycle_should_continue_immediately)
             .unwrap_or(false);
         if should_continue_immediately {
-            immediate_drain_cycles = immediate_drain_cycles.saturating_add(1);
-            if immediate_drain_cycles < ROOT_WORKER_MAX_IMMEDIATE_DRAIN_CYCLES {
-                continue;
-            }
-            immediate_drain_cycles = 0;
             tokio::task::yield_now().await;
             continue;
         }
         if made_progress {
-            immediate_drain_cycles = 0;
             continue;
         }
-        immediate_drain_cycles = 0;
         record_worker_noop_cycle(&state, false);
         tokio::select! {
             _ = state.discovery_worker_notify.notified() => {
@@ -1845,6 +1837,9 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 version TEXT NOT NULL,
                 did_document_hash TEXT NOT NULL,
                 metadata_hash TEXT NOT NULL,
+                package_hash TEXT NOT NULL DEFAULT '',
+                resource_type TEXT NOT NULL DEFAULT 'unknown',
+                capability_tags_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                 package_json JSONB NOT NULL,
                 archive_path TEXT NOT NULL,
                 accepted_at TIMESTAMPTZ NOT NULL,
@@ -1886,10 +1881,17 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
             );
             CREATE INDEX IF NOT EXISTS idx_root_subject_versions_subject_version
             ON {ROOT_SUBJECT_VERSION_TABLE}(subject_did, accepted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_root_subject_versions_cursor
+            ON {ROOT_SUBJECT_VERSION_TABLE}(publication_cursor);
+            CREATE INDEX IF NOT EXISTS idx_root_subject_versions_notification_projection
+            ON {ROOT_SUBJECT_VERSION_TABLE}(publication_cursor, subject_did, version);
             CREATE INDEX IF NOT EXISTS idx_root_bulletin_events_sequence
             ON {ROOT_BULLETIN_EVENT_TABLE}(sequence);
             CREATE INDEX IF NOT EXISTS idx_root_discovery_target_schedule
             ON {ROOT_DISCOVERY_TARGET_TABLE}(status, pending_cursor, delivered_cursor, next_attempt_at);
+            CREATE INDEX IF NOT EXISTS idx_root_discovery_target_active_ready
+            ON {ROOT_DISCOVERY_TARGET_TABLE}(next_attempt_at, lease_expires_at, pending_cursor DESC, discovery_did)
+            WHERE status = 'active' AND pending_cursor > delivered_cursor;
             CREATE INDEX IF NOT EXISTS idx_root_discovery_items_target_cursor
             ON {ROOT_DISCOVERY_ITEM_TABLE}(discovery_did, publication_cursor);
             "#
@@ -1898,6 +1900,38 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
     postgres.ensure_leased_job_table(ROOT_CDN_JOB_TABLE).await?;
     postgres
         .ensure_leased_job_table(ROOT_CDN_OUTBOX_TABLE)
+        .await?;
+    postgres
+        .execute_batch(&format!(
+            r#"
+            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+                ADD COLUMN IF NOT EXISTS package_hash TEXT NOT NULL DEFAULT '';
+            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+                ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT 'unknown';
+            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+                ADD COLUMN IF NOT EXISTS capability_tags_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS publication_cursor BIGINT;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS resource_did TEXT;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS package_version TEXT;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS package_hash TEXT;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS metadata_hash TEXT;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS did_document_hash TEXT;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS resource_type TEXT;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS capability_tags_json JSONB;
+            CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_job_projection
+            ON {ROOT_CDN_JOB_TABLE}(job_key, publication_cursor);
+            CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_ready_projection
+            ON {ROOT_CDN_JOB_TABLE}(status, next_attempt_at, lease_expires_at, publication_cursor, job_key);
+            "#
+        ))
         .await?;
     Ok(())
 }
@@ -2451,7 +2485,15 @@ fn record_discovery_worker_runtime(
     stage_metrics: DiscoveryWorkerStageMetrics,
 ) {
     if let Ok(mut runtime) = state.worker_runtime.lock() {
-        let trigger_type = runtime.discovery_last_trigger_type.clone();
+        let trigger_type = runtime.discovery_last_trigger_type.clone().or_else(|| {
+            if runtime.discovery_event_trigger_count > runtime.discovery_timer_trigger_count {
+                Some("event".to_owned())
+            } else if runtime.discovery_timer_trigger_count > 0 {
+                Some("timer".to_owned())
+            } else {
+                None
+            }
+        });
         runtime.discovery_last_elapsed_ms = elapsed_ms;
         runtime.discovery_last_success_count = success_count;
         runtime.discovery_last_failed_count = failed_count;
@@ -2500,7 +2542,15 @@ fn record_cdn_worker_runtime(
     stage_metrics: CdnWorkerStageMetrics,
 ) {
     if let Ok(mut runtime) = state.worker_runtime.lock() {
-        let trigger_type = runtime.cdn_last_trigger_type.clone();
+        let trigger_type = runtime.cdn_last_trigger_type.clone().or_else(|| {
+            if runtime.cdn_event_trigger_count > runtime.cdn_timer_trigger_count {
+                Some("event".to_owned())
+            } else if runtime.cdn_timer_trigger_count > 0 {
+                Some("timer".to_owned())
+            } else {
+                None
+            }
+        });
         runtime.cdn_last_elapsed_ms = elapsed_ms;
         runtime.cdn_last_success_count = success_count;
         runtime.cdn_last_failed_count = failed_count;
@@ -2564,6 +2614,33 @@ fn signal_worker_event(state: &AppState, cdn_worker: bool) {
     } else {
         state.discovery_worker_notify.notify_one();
     }
+}
+
+fn consume_pending_worker_signal_trigger(state: &AppState, cdn_worker: bool) -> bool {
+    let had_pending_signal = if let Ok(mut wake_state) = state.worker_wake_state.lock() {
+        if cdn_worker {
+            if wake_state.cdn_pending_event_signal_count > 0 {
+                wake_state.cdn_pending_event_signal_count -= 1;
+                true
+            } else {
+                false
+            }
+        } else if wake_state.discovery_pending_event_signal_count > 0 {
+            wake_state.discovery_pending_event_signal_count -= 1;
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if had_pending_signal {
+        record_worker_trigger(state, cdn_worker, WorkerTriggerType::Event);
+        if let Some(delay_ms) = take_worker_event_delay_ms(state, cdn_worker) {
+            record_worker_event_delay(state, cdn_worker, delay_ms);
+        }
+    }
+    had_pending_signal
 }
 
 fn take_worker_event_delay_ms(state: &AppState, cdn_worker: bool) -> Option<u128> {
@@ -2655,15 +2732,25 @@ fn record_mark_published_runtime(
     state: &AppState,
     job_count: usize,
     fetch_elapsed_ms: u128,
+    fetch_sql_elapsed_ms: u128,
+    watermark_match_elapsed_ms: u128,
     update_elapsed_ms: u128,
     watermark_elapsed_ms: u128,
+    store_items_elapsed_ms: u128,
+    upsert_targets_elapsed_ms: u128,
+    delete_jobs_elapsed_ms: u128,
     total_elapsed_ms: u128,
 ) {
     if let Ok(mut runtime) = state.worker_runtime.lock() {
         runtime.mark_published_last_job_count = job_count;
         runtime.mark_published_last_fetch_elapsed_ms = fetch_elapsed_ms;
+        runtime.mark_published_last_fetch_sql_elapsed_ms = fetch_sql_elapsed_ms;
+        runtime.mark_published_last_watermark_match_elapsed_ms = watermark_match_elapsed_ms;
         runtime.mark_published_last_update_elapsed_ms = update_elapsed_ms;
         runtime.mark_published_last_watermark_elapsed_ms = watermark_elapsed_ms;
+        runtime.mark_published_last_store_items_elapsed_ms = store_items_elapsed_ms;
+        runtime.mark_published_last_upsert_targets_elapsed_ms = upsert_targets_elapsed_ms;
+        runtime.mark_published_last_delete_jobs_elapsed_ms = delete_jobs_elapsed_ms;
         runtime.mark_published_last_total_elapsed_ms = total_elapsed_ms;
         runtime.mark_published_total_call_count =
             runtime.mark_published_total_call_count.saturating_add(1);
@@ -3081,94 +3168,62 @@ async fn api_mark_cdn_publication_jobs_published(
     if request.jobs.is_empty() {
         return Err(ApiError::bad_request("empty_jobs"));
     }
-    let jobs = request
+    let job_keys = request
         .jobs
         .iter()
-        .map(|job| {
-            let job_key = if job.job_key.trim().is_empty() {
-                format!("{}:{}", job.resource_did, job.package_version)
-            } else {
-                job.job_key.clone()
-            };
-            (job_key, job.resource_did.clone())
-        })
+        .map(|job| job.job_key.trim().to_owned())
         .collect::<Vec<_>>();
-    let job_keys = jobs
-        .iter()
-        .map(|(job_key, _)| job_key.clone())
-        .collect::<Vec<_>>();
-    let fetch_started = Instant::now();
-    let authoritative_packages = resource_packages_for_jobs(&state, &job_keys)
-        .await
-        .map_err(ApiError::internal)?;
-    let package_rows = authoritative_packages
-        .values()
-        .map(|(package, publication_cursor)| (package.clone(), *publication_cursor))
-        .collect::<Vec<_>>();
-    let notification_items =
-        repository::discovery_notification_targets_for_package_rows_impl(&state, &package_rows)
-            .await
-            .map_err(ApiError::internal)?;
-    let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
-    for job in &request.jobs {
-        let job_key = if job.job_key.trim().is_empty() {
-            format!("{}:{}", job.resource_did, job.package_version)
-        } else {
-            job.job_key.clone()
-        };
-        let Some((package, publication_cursor)) = authoritative_packages.get(&job_key) else {
-            return Err(ApiError::bad_request("unknown_cdn_publication_job"));
-        };
-        if package.resource_did != job.resource_did
-            || package.package_version != job.package_version
-        {
-            return Err(ApiError::bad_request(
-                "cdn_publication_job_identity_mismatch",
-            ));
-        }
-        if job.publication_cursor > 0 && *publication_cursor != job.publication_cursor {
-            return Err(ApiError::bad_request("cdn_publication_job_cursor_mismatch"));
-        }
-        if !job.package_hash.trim().is_empty() && package.package_hash != job.package_hash {
-            return Err(ApiError::bad_request("cdn_publication_job_hash_mismatch"));
-        }
+    if job_keys.iter().any(|job_key| job_key.is_empty()) {
+        return Err(ApiError::bad_request("empty_job_key"));
     }
-    let update_started = Instant::now();
-    mark_cdn_jobs_published_batch(&state, &jobs)
-        .await
-        .map_err(ApiError::internal)?;
-    let update_elapsed_ms = update_started.elapsed().as_millis();
-    let watermark_started = Instant::now();
-    let stored_notification_count =
-        repository::store_discovery_notification_items_impl(&state, &notification_items)
-            .await
-            .map_err(ApiError::internal)?;
-    let advanced_discovery_count =
-        advance_discovery_target_watermarks_for_items(&state, &notification_items)
-            .await
-            .map_err(ApiError::internal)?;
-    let watermark_elapsed_ms = watermark_started.elapsed().as_millis();
+    let authorization_state = current_authorization_state(&state);
+    let completion = repository::complete_cdn_publication_jobs_impl(
+        &state,
+        &request.jobs,
+        &authorization_state.discovery_nodes,
+        &state.tag_tree,
+    )
+    .await
+    .map_err(|err| {
+        let message = err.to_string();
+        if message.contains("unknown_cdn_publication_job") {
+            ApiError::bad_request(message)
+        } else {
+            ApiError::internal(err)
+        }
+    })?;
+    invalidate_status_counts_cache(&state);
     let total_elapsed_ms = started.elapsed().as_millis();
     record_mark_published_runtime(
         &state,
-        jobs.len(),
-        fetch_elapsed_ms,
-        update_elapsed_ms,
-        watermark_elapsed_ms,
+        completion.marked_count,
+        completion.fetch_elapsed_ms,
+        completion.fetch_sql_elapsed_ms,
+        completion.watermark_match_elapsed_ms,
+        completion.update_elapsed_ms,
+        completion.watermark_elapsed_ms,
+        completion.store_items_elapsed_ms,
+        completion.upsert_targets_elapsed_ms,
+        completion.delete_jobs_elapsed_ms,
         total_elapsed_ms,
     );
-    if advanced_discovery_count > 0 {
+    if completion.advanced_discovery_count > 0 {
         signal_worker_event(&state, false);
     }
     Ok(Json(json!({
         "status": "ok",
-        "markedCount": jobs.len(),
-        "storedNotificationCount": stored_notification_count,
-        "advancedDiscoveryCount": advanced_discovery_count,
+        "markedCount": completion.marked_count,
+        "storedNotificationCount": completion.stored_notification_count,
+        "advancedDiscoveryCount": completion.advanced_discovery_count,
         "timing": {
-            "fetchElapsedMs": fetch_elapsed_ms,
-            "updateElapsedMs": update_elapsed_ms,
-            "watermarkElapsedMs": watermark_elapsed_ms,
+            "fetchElapsedMs": completion.fetch_elapsed_ms,
+            "fetchSqlElapsedMs": completion.fetch_sql_elapsed_ms,
+            "watermarkMatchElapsedMs": completion.watermark_match_elapsed_ms,
+            "updateElapsedMs": completion.update_elapsed_ms,
+            "watermarkElapsedMs": completion.watermark_elapsed_ms,
+            "storeItemsElapsedMs": completion.store_items_elapsed_ms,
+            "upsertTargetsElapsedMs": completion.upsert_targets_elapsed_ms,
+            "deleteJobsElapsedMs": completion.delete_jobs_elapsed_ms,
             "totalElapsedMs": total_elapsed_ms
         }
     })))
@@ -3186,17 +3241,18 @@ async fn api_cdn_publication_jobs_packages(
     let job_keys = request
         .jobs
         .iter()
-        .map(|job| format!("{}:{}", job.resource_did, job.package_version))
+        .map(|job| job.job_key.trim().to_owned())
         .collect::<Vec<_>>();
+    if job_keys.iter().any(|job_key| job_key.is_empty()) {
+        return Err(ApiError::bad_request("empty_job_key"));
+    }
     let packages = resource_packages_for_jobs(&state, &job_keys)
         .await
         .map_err(ApiError::internal)?;
-    let items = request
-        .jobs
+    let items = job_keys
         .iter()
-        .filter_map(|job| {
-            let job_key = format!("{}:{}", job.resource_did, job.package_version);
-            packages.get(&job_key).map(|(package, publication_cursor)| {
+        .filter_map(|job_key| {
+            packages.get(job_key).map(|(package, publication_cursor)| {
                 json!({
                     "jobKey": job_key,
                     "publicationCursor": publication_cursor,
@@ -4088,16 +4144,6 @@ fn read_latest_versions(state: &AppState) -> Result<BTreeMap<String, Value>> {
     repository::read_latest_versions_impl(state)
 }
 
-async fn mark_file_cdn_queue_published(state: &AppState, did: &str) -> Result<()> {
-    let mut queue: Vec<ResourcePackage> = state
-        .data
-        .read("queues/cdn-publish.json")
-        .unwrap_or_default();
-    queue.retain(|item| item.resource_did != did);
-    state.data.write("queues/cdn-publish.json", &queue)?;
-    Ok(())
-}
-
 async fn read_cdn_queue(state: &AppState) -> Result<Vec<ResourcePackage>> {
     repository::read_cdn_queue_impl(state).await
 }
@@ -4253,12 +4299,6 @@ async fn resource_packages_for_jobs(
     repository::resource_packages_for_jobs_impl(state, job_keys).await
 }
 
-async fn mark_cdn_jobs_published_batch(state: &AppState, jobs: &[(String, String)]) -> Result<()> {
-    repository::mark_cdn_jobs_published_batch_impl(state, jobs).await?;
-    invalidate_status_counts_cache(state);
-    Ok(())
-}
-
 async fn claim_cdn_outbox_events(
     state: &AppState,
     worker_id: &str,
@@ -4319,23 +4359,6 @@ async fn authorized_discovery_summary_items(
         target_cursor,
     )
     .await
-}
-
-async fn advance_discovery_target_watermarks_for_items(
-    state: &AppState,
-    items: &[DiscoveryNotificationTargetItem],
-) -> Result<usize> {
-    if items.is_empty() {
-        return Ok(0);
-    }
-    let mut target_cursors = BTreeMap::<String, i64>::new();
-    for item in items {
-        target_cursors
-            .entry(item.discovery_did.clone())
-            .and_modify(|cursor| *cursor = (*cursor).max(item.item.publication_cursor))
-            .or_insert(item.item.publication_cursor);
-    }
-    repository::advance_discovery_target_cursors_impl(state, target_cursors).await
 }
 
 async fn run_cdn_outbox_relay_cycle(state: &AppState) -> Result<Value> {
@@ -4788,7 +4811,10 @@ fn cdn_cycle_should_continue_immediately(result: &Value) -> bool {
     let attempted = value_u64(result, "attemptedCount");
     let published = value_u64(result, "publishedCount");
     let failed = value_u64(result, "failedCount");
-    (published > 0 || failed > 0) && (ready_after > 0 || active_after > 0)
+    let marked_retry = value_u64(result, "markedRetryCount");
+    let marked_published = value_u64(result, "markedPublishedCount");
+    let backlog_remains = ready_after > 0 || active_after > 0;
+    ((published > 0 || failed > 0 || marked_published > 0 || marked_retry > 0) && backlog_remains)
         || (attempted > 0 && ready_after > 0)
 }
 
@@ -4799,7 +4825,11 @@ fn discovery_cycle_made_progress(result: &Value) -> bool {
 fn discovery_cycle_should_continue_immediately(result: &Value) -> bool {
     let ready_after = value_u64(result, "readyQueueDepthAfter");
     let pending_after = value_u64(result, "pendingQueueDepthAfter");
-    discovery_cycle_made_progress(result) && (ready_after > 0 || pending_after > 0)
+    let claimed_targets = value_u64(result, "claimedTargetCount");
+    let success = value_u64(result, "successCount");
+    let failures = value_u64(result, "failedCount");
+    let backlog_remains = ready_after > 0 || pending_after > 0;
+    (backlog_remains && (success > 0 || failures > 0)) || (claimed_targets > 0 && ready_after > 0)
 }
 
 async fn cdn_queue_depths(state: &AppState) -> Result<(usize, usize)> {
@@ -6302,6 +6332,53 @@ mod tests {
         assert_eq!(runtime.last_error, None);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn cdn_worker_event_wakes_progress_without_waiting_for_timer() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.config.events.enabled = true;
+        state.config.security.workers.cdn_interval_ms = 60_000;
+        state.event_publisher = EventPublisher::Succeed;
+        spawn_cdn_outbox_relay(state.clone());
+
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let package = package_from_request(&state, &request);
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        let success = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let counts = root_status_counts_from_database(&state)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let runtime = state.worker_runtime.lock().unwrap().clone();
+                let event_runtime = state.event_runtime.lock().unwrap().clone();
+                if counts.cdn_outbox_ready_count == 0
+                    && counts.cdn_outbox_active_count == 0
+                    && event_runtime.publish_success_count == 1
+                    && runtime.cdn_event_trigger_count > 0
+                    && runtime.cdn_last_progress_success_count > 0
+                {
+                    return runtime;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("cdn worker should progress from event wakeup before timer");
+
+        assert_eq!(success.cdn_timer_trigger_count, 0);
+        assert!(success.cdn_event_trigger_count > 0);
+    }
+
     #[test]
     fn event_stream_is_enabled_by_default() {
         let events = EventStreamConfig::default();
@@ -6525,17 +6602,31 @@ capability_tree_file = "../capability-tree.json"
 
         let before = api_status(State(state.clone())).await.unwrap();
         assert_eq!(before.0["cdnQueueCount"], 2);
-        let jobs = vec![
-            (
-                format!("{}:{}", resource_did(), "1"),
-                resource_did().to_owned(),
-            ),
-            (
-                format!("{}:{}", resource_did(), "2"),
-                resource_did().to_owned(),
-            ),
-        ];
-        mark_cdn_jobs_published_batch(&state, &jobs).await.unwrap();
+        let auth = current_authorization_state(&state);
+        repository::complete_cdn_publication_jobs_impl(
+            &state,
+            &[
+                CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", resource_did(), "1"),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
+                },
+                CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", resource_did(), "2"),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
+                },
+            ],
+            &auth.discovery_nodes,
+            &state.tag_tree,
+        )
+        .await
+        .unwrap();
+        invalidate_status_counts_cache(&state);
 
         let after = api_status(State(state)).await.unwrap();
         assert_eq!(after.0["cdnQueueCount"], 0);
@@ -6573,8 +6664,7 @@ capability_tree_file = "../capability-tree.json"
             State(state),
             Json(CdnPublicationJobsPackageRequest {
                 jobs: vec![CdnPublicationJobRef {
-                    resource_did: package.resource_did.clone(),
-                    package_version: package.package_version.clone(),
+                    job_key: format!("{}:{}", package.resource_did, package.package_version),
                 }],
             }),
         )
@@ -6658,10 +6748,10 @@ capability_tree_file = "../capability-tree.json"
             Json(MarkCdnPublicationJobsPublishedRequest {
                 jobs: vec![CdnPublicationJobCompletionRef {
                     job_key: format!("{}:{}", package.resource_did, package.package_version),
-                    resource_did: package.resource_did.clone(),
-                    package_version: package.package_version.clone(),
-                    publication_cursor: 0,
-                    package_hash: package.package_hash.clone(),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
                 }],
             }),
         )
@@ -6677,7 +6767,146 @@ capability_tree_file = "../capability-tree.json"
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn api_mark_published_rejects_cursor_mismatch() {
+    async fn api_mark_published_accepts_minimal_job_key_only_payload() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        state
+            .config
+            .security
+            .admin
+            .static_tokens
+            .push("test-admin-token".to_owned());
+        let registrar_key = generate_ed25519_keypair();
+        let discovery_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            "http://127.0.0.1:1",
+            vec!["openagenet.local".to_owned()],
+        );
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let mut package = package_from_request(&state, &request);
+        package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        let response = api_mark_cdn_publication_jobs_published(
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    state.config.security.admin.static_tokens[0]
+                ))
+                .unwrap(),
+            )]),
+            State(state.clone()),
+            Json(MarkCdnPublicationJobsPublishedRequest {
+                jobs: vec![CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", package.resource_did, package.package_version),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(response.0["markedCount"], 1);
+        assert_eq!(response.0["advancedDiscoveryCount"], 1);
+        assert!(response.0["timing"]["fetchElapsedMs"].as_u64().is_some());
+        assert!(response.0["timing"]["fetchSqlElapsedMs"].as_u64().is_some());
+        assert!(response.0["timing"]["watermarkMatchElapsedMs"]
+            .as_u64()
+            .is_some());
+        assert!(response.0["timing"]["storeItemsElapsedMs"]
+            .as_u64()
+            .is_some());
+        assert!(response.0["timing"]["upsertTargetsElapsedMs"]
+            .as_u64()
+            .is_some());
+        assert!(response.0["timing"]["deleteJobsElapsedMs"]
+            .as_u64()
+            .is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_mark_published_accepts_and_validates_enriched_completion_payload() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        state
+            .config
+            .security
+            .admin
+            .static_tokens
+            .push("test-admin-token".to_owned());
+        let registrar_key = generate_ed25519_keypair();
+        let discovery_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            "http://127.0.0.1:1",
+            vec!["openagenet.local".to_owned()],
+        );
+        let mut package = package_from_request(
+            &state,
+            &resource_verify_request(
+                &state,
+                &registrar_key,
+                &resource_key,
+                PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+            ),
+        );
+        package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        persist_resource_acceptance(&state, &package).await.unwrap();
+        let job_key = format!("{}:{}", package.resource_did, package.package_version);
+        let cursors = publication_cursors_for_jobs(&state, std::slice::from_ref(&job_key))
+            .await
+            .unwrap();
+        let publication_cursor = *cursors.get(&job_key).unwrap();
+
+        let response = api_mark_cdn_publication_jobs_published(
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    state.config.security.admin.static_tokens[0]
+                ))
+                .unwrap(),
+            )]),
+            State(state.clone()),
+            Json(MarkCdnPublicationJobsPublishedRequest {
+                jobs: vec![CdnPublicationJobCompletionRef {
+                    job_key,
+                    publication_cursor: Some(publication_cursor),
+                    resource_did: Some(package.resource_did.clone()),
+                    package_version: Some(package.package_version.clone()),
+                    package_hash: Some(package.package_hash.clone()),
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(response.0["status"], "ok");
+        assert_eq!(response.0["markedCount"], 1);
+        assert_eq!(response.0["advancedDiscoveryCount"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_mark_published_rejects_unknown_job() {
         let dir = tempdir().unwrap();
         let mut state = app_state_with_sqlite(dir.path()).await;
         state.tag_tree = openagenet_test_tag_tree();
@@ -6719,11 +6948,11 @@ capability_tree_file = "../capability-tree.json"
             State(state),
             Json(MarkCdnPublicationJobsPublishedRequest {
                 jobs: vec![CdnPublicationJobCompletionRef {
-                    job_key: format!("{}:{}", package.resource_did, package.package_version),
-                    resource_did: package.resource_did.clone(),
-                    package_version: package.package_version.clone(),
-                    publication_cursor: 9_999,
-                    package_hash: package.package_hash.clone(),
+                    job_key: "did:oan:AGUS:missing:9.9.9".to_owned(),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
                 }],
             }),
         )
@@ -6731,7 +6960,7 @@ capability_tree_file = "../capability-tree.json"
         .unwrap_err();
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("cursor_mismatch"));
+        assert!(err.message.contains("unknown_cdn_publication_job"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -6787,13 +7016,37 @@ capability_tree_file = "../capability-tree.json"
         .unwrap()
         .into_values()
         .collect::<Vec<_>>();
-        let notification_items =
-            repository::discovery_notification_targets_for_package_rows_impl(&state, &package_rows)
-                .await
-                .unwrap();
-        repository::store_discovery_notification_items_impl(&state, &notification_items)
-            .await
-            .unwrap();
+        let auth = current_authorization_state(&state);
+        let notification_items = repository::discovery_notification_targets_for_authorized_rows(
+            &package_rows,
+            &auth.discovery_nodes,
+            &state.tag_tree,
+        );
+        let target_cursors = repository::discovery_target_cursors_from_items(&notification_items);
+        let completion = repository::complete_cdn_publication_jobs_impl(
+            &state,
+            &[
+                CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", matching.resource_did, matching.package_version),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
+                },
+                CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", unassigned.resource_did, unassigned.package_version),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
+                },
+            ],
+            &auth.discovery_nodes,
+            &state.tag_tree,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completion.advanced_discovery_count, target_cursors.len());
         let items = authorized_discovery_summary_items(&state, discovery_did(), 0, i64::MAX)
             .await
             .unwrap();
@@ -6835,10 +7088,12 @@ capability_tree_file = "../capability-tree.json"
             .into_values()
             .collect::<Vec<_>>();
 
-        let items =
-            repository::discovery_notification_targets_for_package_rows_impl(&state, &package_rows)
-                .await
-                .unwrap();
+        let auth = current_authorization_state(&state);
+        let items = repository::discovery_notification_targets_for_authorized_rows(
+            &package_rows,
+            &auth.discovery_nodes,
+            &state.tag_tree,
+        );
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].discovery_did, discovery_did());
@@ -7168,6 +7423,94 @@ capability_tree_file = "../capability-tree.json"
         assert_eq!(status.0["discoveryPendingQueueCount"], 0);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_worker_event_wakes_progress_without_waiting_for_timer() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        state.config.security.workers.discovery_interval_ms = 60_000;
+        state
+            .config
+            .security
+            .admin
+            .static_tokens
+            .push("test-admin-token".to_owned());
+
+        async fn sync_handler(Json(_payload): Json<Value>) -> Json<Value> {
+            Json(json!({"status": "synced", "syncedResourceCount": 1, "toCursor": 1}))
+        }
+        let app = Router::new().route("/discovery/resources/sync-authorized", post(sync_handler));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        spawn_root_background_workers(state.clone());
+
+        let registrar_key = generate_ed25519_keypair();
+        let discovery_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            &format!("http://{addr}"),
+            vec!["openagenet.local".to_owned()],
+        );
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let mut package = package_from_request(&state, &request);
+        package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        let _response = api_mark_cdn_publication_jobs_published(
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str(&format!(
+                    "Bearer {}",
+                    state.config.security.admin.static_tokens[0]
+                ))
+                .unwrap(),
+            )]),
+            State(state.clone()),
+            Json(MarkCdnPublicationJobsPublishedRequest {
+                jobs: vec![CdnPublicationJobCompletionRef {
+                    job_key: format!("{}:{}", package.resource_did, package.package_version),
+                    publication_cursor: None,
+                    resource_did: None,
+                    package_version: None,
+                    package_hash: None,
+                }],
+            }),
+        )
+        .await
+        .unwrap();
+
+        let success = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let status = api_status(State(state.clone())).await.unwrap();
+                let runtime = state.worker_runtime.lock().unwrap().clone();
+                if status.0["discoveryPendingQueueCount"] == 0
+                    && runtime.discovery_event_trigger_count > 0
+                    && runtime.discovery_last_progress_success_count > 0
+                {
+                    return runtime;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("discovery worker should progress from event wakeup before timer");
+
+        assert_eq!(success.discovery_timer_trigger_count, 0);
+        assert!(success.discovery_event_trigger_count > 0);
+    }
+
     #[test]
     fn worker_event_signal_count_is_not_lost_when_signaled_multiple_times() {
         let dir = tempdir().unwrap();
@@ -7191,23 +7534,48 @@ capability_tree_file = "../capability-tree.json"
             "attemptedCount": 8,
             "publishedCount": 6,
             "failedCount": 0,
+            "markedPublishedCount": 6,
+            "markedRetryCount": 0,
             "activeQueueDepthAfter": 1,
             "readyQueueDepthAfter": 2
+        });
+        let cdn_retry_continue = json!({
+            "attemptedCount": 8,
+            "publishedCount": 0,
+            "failedCount": 2,
+            "markedPublishedCount": 0,
+            "markedRetryCount": 2,
+            "activeQueueDepthAfter": 0,
+            "readyQueueDepthAfter": 3
         });
         let cdn_stop = json!({
             "attemptedCount": 8,
             "publishedCount": 0,
             "failedCount": 0,
+            "markedPublishedCount": 0,
+            "markedRetryCount": 0,
             "activeQueueDepthAfter": 0,
             "readyQueueDepthAfter": 0
         });
         let discovery_continue = json!({
+            "claimedTargetCount": 1,
+            "successCount": 1,
             "notifiedCount": 1,
             "failedCount": 0,
             "pendingQueueDepthAfter": 1,
             "readyQueueDepthAfter": 1
         });
+        let discovery_retry_continue = json!({
+            "claimedTargetCount": 2,
+            "successCount": 0,
+            "notifiedCount": 0,
+            "failedCount": 1,
+            "pendingQueueDepthAfter": 2,
+            "readyQueueDepthAfter": 1
+        });
         let discovery_stop = json!({
+            "claimedTargetCount": 1,
+            "successCount": 1,
             "notifiedCount": 1,
             "failedCount": 0,
             "pendingQueueDepthAfter": 0,
@@ -7216,10 +7584,14 @@ capability_tree_file = "../capability-tree.json"
 
         assert!(cdn_cycle_made_progress(&cdn_continue));
         assert!(cdn_cycle_should_continue_immediately(&cdn_continue));
+        assert!(cdn_cycle_should_continue_immediately(&cdn_retry_continue));
         assert!(!cdn_cycle_should_continue_immediately(&cdn_stop));
         assert!(discovery_cycle_made_progress(&discovery_continue));
         assert!(discovery_cycle_should_continue_immediately(
             &discovery_continue
+        ));
+        assert!(discovery_cycle_should_continue_immediately(
+            &discovery_retry_continue
         ));
         assert!(!discovery_cycle_should_continue_immediately(
             &discovery_stop

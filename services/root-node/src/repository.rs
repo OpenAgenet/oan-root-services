@@ -6,6 +6,33 @@
 use super::*;
 use sqlx::Postgres;
 
+#[derive(Clone, Debug, Default)]
+pub(super) struct CdnPublicationBatchCompletion {
+    pub marked_count: usize,
+    pub stored_notification_count: usize,
+    pub advanced_discovery_count: usize,
+    pub fetch_elapsed_ms: u128,
+    pub fetch_sql_elapsed_ms: u128,
+    pub watermark_match_elapsed_ms: u128,
+    pub update_elapsed_ms: u128,
+    pub watermark_elapsed_ms: u128,
+    pub store_items_elapsed_ms: u128,
+    pub upsert_targets_elapsed_ms: u128,
+    pub delete_jobs_elapsed_ms: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PublicationProjectionRow {
+    resource_did: String,
+    package_version: String,
+    publication_cursor: i64,
+    package_hash: String,
+    metadata_hash: String,
+    did_document_hash: String,
+    resource_type: String,
+    capability_tags: Vec<String>,
+}
+
 pub(super) fn read_bulletin_from_store_impl(state: &AppState) -> Result<Bulletin> {
     if let Some(sqlite) = &state.sqlite {
         return block_on_sqlite(async {
@@ -543,6 +570,10 @@ pub(super) async fn persist_resource_acceptance_impl(
     }
     if let Some(postgres) = &state.postgres {
         let package_json = serde_json::to_string(package)?;
+        let resource_type = serde_json::to_value(&package.resource_type)
+            .ok()
+            .and_then(|value| value.as_str().map(ToOwned::to_owned))
+            .unwrap_or_else(|| "unknown".to_owned());
         let archive_path = format!(
             "resources/{}/{}",
             did_to_file_name(resource_did).trim_end_matches(".json"),
@@ -557,13 +588,17 @@ pub(super) async fn persist_resource_acceptance_impl(
         let publication_cursor = sqlx::query(&format!(
             r#"
             INSERT INTO {ROOT_SUBJECT_VERSION_TABLE}(
-                subject_did, version, did_document_hash, metadata_hash, package_json, archive_path, accepted_at
+                subject_did, version, did_document_hash, metadata_hash, package_hash, resource_type,
+                capability_tags_json, package_json, archive_path, accepted_at
             )
-            VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7::timestamptz)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10::timestamptz)
             ON CONFLICT(subject_did, version)
             DO UPDATE SET
                 did_document_hash = excluded.did_document_hash,
                 metadata_hash = excluded.metadata_hash,
+                package_hash = excluded.package_hash,
+                resource_type = excluded.resource_type,
+                capability_tags_json = excluded.capability_tags_json,
                 package_json = excluded.package_json,
                 archive_path = excluded.archive_path,
                 accepted_at = excluded.accepted_at
@@ -574,6 +609,9 @@ pub(super) async fn persist_resource_acceptance_impl(
         .bind(version)
         .bind(&package.did_document_hash)
         .bind(&package.metadata_hash)
+        .bind(&package.package_hash)
+        .bind(&resource_type)
+        .bind(sqlx::types::Json(package.metadata.capability_tags.clone()))
         .bind(&package_json)
         .bind(&archive_path)
         .bind(&now)
@@ -627,8 +665,12 @@ pub(super) async fn persist_resource_acceptance_impl(
 
         sqlx::query(&format!(
             r#"
-            INSERT INTO {ROOT_CDN_JOB_TABLE}(job_key, payload_json, status, attempt_count, lease_owner, lease_expires_at, next_attempt_at, last_error)
-            VALUES ($1, $2, 'ready', 0, NULL, NULL, $3::timestamptz, NULL)
+            INSERT INTO {ROOT_CDN_JOB_TABLE}(
+                job_key, payload_json, status, attempt_count, lease_owner, lease_expires_at,
+                next_attempt_at, last_error, publication_cursor, resource_did, package_version,
+                package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
+            )
+            VALUES ($1, $2, 'ready', 0, NULL, NULL, $3::timestamptz, NULL, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
             ON CONFLICT(job_key)
             DO UPDATE SET
                 payload_json = excluded.payload_json,
@@ -637,6 +679,14 @@ pub(super) async fn persist_resource_acceptance_impl(
                 lease_owner = NULL,
                 lease_expires_at = NULL,
                 next_attempt_at = excluded.next_attempt_at,
+                publication_cursor = excluded.publication_cursor,
+                resource_did = excluded.resource_did,
+                package_version = excluded.package_version,
+                package_hash = excluded.package_hash,
+                metadata_hash = excluded.metadata_hash,
+                did_document_hash = excluded.did_document_hash,
+                resource_type = excluded.resource_type,
+                capability_tags_json = excluded.capability_tags_json,
                 last_error = NULL,
                 updated_at = CURRENT_TIMESTAMP
             "#
@@ -644,6 +694,14 @@ pub(super) async fn persist_resource_acceptance_impl(
         .bind(&package_job_key)
         .bind(&package_json)
         .bind(&next_attempt_at)
+        .bind(publication_cursor)
+        .bind(resource_did)
+        .bind(version)
+        .bind(&package.package_hash)
+        .bind(&package.metadata_hash)
+        .bind(&package.did_document_hash)
+        .bind(&resource_type)
+        .bind(sqlx::types::Json(package.metadata.capability_tags.clone()))
         .execute(&mut *tx)
         .await?;
 
@@ -1101,33 +1159,12 @@ pub(super) async fn advance_discovery_target_watermarks_batch_impl(
         return Ok(0);
     }
     let authorization_state = super::current_authorization_state(state);
-    let mut target_cursors = BTreeMap::<String, i64>::new();
-    for (discovery_did, auth) in authorization_state.discovery_nodes {
-        if auth.status != "active" {
-            continue;
-        }
-        let Some(publication_cursor) = packages
-            .iter()
-            .filter(|(package, _)| {
-                state.tag_tree.matches_authorized_domains(
-                    &package.metadata.capability_tags,
-                    &auth.authorized_domains,
-                )
-            })
-            .map(|(_, publication_cursor)| *publication_cursor)
-            .max()
-        else {
-            continue;
-        };
-        target_cursors.insert(discovery_did, publication_cursor);
-    }
-    advance_discovery_target_cursors_impl(state, target_cursors).await
-}
-
-pub(super) async fn advance_discovery_target_cursors_impl(
-    state: &AppState,
-    target_cursors: BTreeMap<String, i64>,
-) -> Result<usize> {
+    let items = discovery_notification_targets_for_authorized_rows(
+        packages,
+        &authorization_state.discovery_nodes,
+        &state.tag_tree,
+    );
+    let target_cursors = discovery_target_cursors_from_items(&items);
     let advanced = target_cursors.len();
     if advanced == 0 {
         return Ok(0);
@@ -1143,7 +1180,7 @@ pub(super) async fn advance_discovery_target_cursors_impl(
                 INSERT INTO {ROOT_DISCOVERY_TARGET_TABLE}(
                     discovery_did, pending_cursor, delivered_cursor, status, attempt_count,
                     lease_owner, lease_expires_at, next_attempt_at, last_error, updated_at
-                ) 
+                )
                 "#
             ));
             builder.push_values(chunk, |mut row, (discovery_did, publication_cursor)| {
@@ -1186,7 +1223,7 @@ pub(super) async fn advance_discovery_target_cursors_impl(
                 INSERT INTO {ROOT_DISCOVERY_TARGET_TABLE}(
                     discovery_did, pending_cursor, delivered_cursor, status, attempt_count,
                     lease_owner, lease_expires_at, next_attempt_at, last_error, updated_at
-                ) 
+                )
                 "#
             ));
             builder.push_values(chunk, |mut row, (discovery_did, publication_cursor)| {
@@ -1223,44 +1260,322 @@ pub(super) async fn advance_discovery_target_cursors_impl(
     Ok(0)
 }
 
-pub(super) async fn mark_cdn_jobs_published_batch_impl(
+pub(super) async fn complete_cdn_publication_jobs_impl(
     state: &AppState,
-    jobs: &[(String, String)],
-) -> Result<()> {
+    jobs: &[CdnPublicationJobCompletionRef],
+    discovery_nodes: &BTreeMap<String, DiscoveryAuthorizationState>,
+    tag_tree: &CapabilityTagTree,
+) -> Result<CdnPublicationBatchCompletion> {
     if jobs.is_empty() {
-        return Ok(());
+        return Ok(CdnPublicationBatchCompletion::default());
     }
+    let job_keys = jobs
+        .iter()
+        .map(|job| job.job_key.clone())
+        .collect::<Vec<_>>();
+    let fetch_started = Instant::now();
+    let (notification_items, target_cursors, fetch_sql_elapsed_ms) = if state.postgres.is_some() {
+        let sql_started = Instant::now();
+        let projections = postgres_publication_projections_for_jobs(state, &job_keys).await?;
+        let fetch_sql_elapsed_ms = sql_started.elapsed().as_millis();
+        if projections.len() != job_keys.len() {
+            return Err(anyhow!("unknown_cdn_publication_job"));
+        }
+        let ordered = job_keys
+            .iter()
+            .map(|job_key| {
+                projections
+                    .get(job_key)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown_cdn_publication_job"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        validate_completion_refs(jobs, &ordered)?;
+        let (items, cursors) =
+            discovery_notification_targets_for_projection_rows(&ordered, discovery_nodes, tag_tree);
+        (items, cursors, fetch_sql_elapsed_ms)
+    } else {
+        let packages = resource_packages_for_jobs_impl(state, &job_keys).await?;
+        if packages.len() != job_keys.len() {
+            return Err(anyhow!("unknown_cdn_publication_job"));
+        }
+        let rows = job_keys
+            .iter()
+            .map(|job_key| {
+                packages
+                    .get(job_key)
+                    .cloned()
+                    .ok_or_else(|| anyhow!("unknown_cdn_publication_job"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        validate_completion_refs_against_rows(jobs, &rows)?;
+        let items =
+            discovery_notification_targets_for_authorized_rows(&rows, discovery_nodes, tag_tree);
+        let cursors = discovery_target_cursors_from_items(&items);
+        (items, cursors, 0)
+    };
+    let fetch_elapsed_ms = fetch_started.elapsed().as_millis();
+
+    let watermark_started = Instant::now();
+    let watermark_match_elapsed_ms = watermark_started.elapsed().as_millis();
+    let watermark_elapsed_ms = watermark_started.elapsed().as_millis();
+
+    let update_started = Instant::now();
+    let stored_notification_count;
+    let advanced_discovery_count = target_cursors.len();
+    let mut store_items_elapsed_ms = 0;
+    let mut upsert_targets_elapsed_ms = 0;
+    let mut delete_jobs_elapsed_ms = 0;
     if let Some(sqlite) = &state.sqlite {
+        let now_text = Utc::now().to_rfc3339();
         let mut tx = sqlite.pool().begin().await?;
-        for chunk in jobs.chunks(500) {
+        if !notification_items.is_empty() {
+            let stage_started = Instant::now();
+            for chunk in notification_items.chunks(250) {
+                let mut builder = QueryBuilder::<Sqlite>::new(format!(
+                    r#"
+                    INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
+                        discovery_did, publication_cursor, resource_did, package_version,
+                        package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
+                    )
+                    "#
+                ));
+                builder.push_values(chunk, |mut row, item| {
+                    row.push_bind(&item.discovery_did)
+                        .push_bind(item.item.publication_cursor)
+                        .push_bind(&item.item.resource_did)
+                        .push_bind(&item.item.package_version)
+                        .push_bind(&item.item.package_hash)
+                        .push_bind(&item.item.metadata_hash)
+                        .push_bind(&item.item.did_document_hash)
+                        .push_bind(&item.item.resource_type)
+                        .push_bind(
+                            serde_json::to_string(&item.item.capability_tags)
+                                .unwrap_or_else(|_| "[]".to_owned()),
+                        );
+                });
+                builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
+                builder.build().execute(&mut *tx).await?;
+            }
+            store_items_elapsed_ms = stage_started.elapsed().as_millis();
+        }
+        stored_notification_count = notification_items.len();
+        if !target_cursors.is_empty() {
+            let stage_started = Instant::now();
+            let rows = target_cursors.iter().collect::<Vec<_>>();
+            for chunk in rows.chunks(250) {
+                let mut builder = QueryBuilder::<Sqlite>::new(format!(
+                    r#"
+                    INSERT INTO {ROOT_DISCOVERY_TARGET_TABLE}(
+                        discovery_did, pending_cursor, delivered_cursor, status, attempt_count,
+                        lease_owner, lease_expires_at, next_attempt_at, last_error, updated_at
+                    )
+                    "#
+                ));
+                builder.push_values(chunk, |mut row, (discovery_did, publication_cursor)| {
+                    row.push_bind(*discovery_did)
+                        .push_bind(*publication_cursor)
+                        .push("0")
+                        .push("'active'")
+                        .push("0")
+                        .push("NULL")
+                        .push("NULL")
+                        .push_bind(&now_text)
+                        .push("NULL")
+                        .push_bind(&now_text);
+                });
+                builder.push(format!(
+                    r#"
+                    ON CONFLICT(discovery_did)
+                    DO UPDATE SET
+                        pending_cursor = MAX({ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor, excluded.pending_cursor),
+                        status = 'active',
+                        next_attempt_at = CASE
+                            WHEN {ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor < excluded.pending_cursor
+                            THEN excluded.next_attempt_at
+                            ELSE {ROOT_DISCOVERY_TARGET_TABLE}.next_attempt_at
+                        END,
+                        updated_at = excluded.updated_at
+                    "#
+                ));
+                builder.build().execute(&mut *tx).await?;
+            }
+            upsert_targets_elapsed_ms = stage_started.elapsed().as_millis();
+        }
+        let stage_started = Instant::now();
+        for chunk in job_keys.chunks(500) {
             let mut builder = QueryBuilder::<Sqlite>::new(format!(
                 "DELETE FROM {ROOT_CDN_JOB_TABLE} WHERE job_key IN ("
             ));
             let mut separated = builder.separated(", ");
-            for (job_key, _) in chunk {
+            for job_key in chunk {
                 separated.push_bind(job_key);
             }
             separated.push_unseparated(")");
             builder.build().execute(&mut *tx).await?;
         }
+        delete_jobs_elapsed_ms = stage_started.elapsed().as_millis();
         tx.commit().await?;
-        return Ok(());
-    }
-    if let Some(postgres) = &state.postgres {
-        let job_keys = jobs
-            .iter()
-            .map(|(job_key, _)| job_key.clone())
-            .collect::<Vec<_>>();
+    } else if let Some(postgres) = &state.postgres {
+        let now = Utc::now();
+        let mut tx = postgres.pool().begin().await?;
+        if !notification_items.is_empty() {
+            let stage_started = Instant::now();
+            for chunk in notification_items.chunks(250) {
+                let mut builder = QueryBuilder::<Postgres>::new(format!(
+                    r#"
+                    INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
+                        discovery_did, publication_cursor, resource_did, package_version,
+                        package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
+                    )
+                    "#
+                ));
+                builder.push_values(chunk, |mut row, item| {
+                    row.push_bind(&item.discovery_did)
+                        .push_bind(item.item.publication_cursor)
+                        .push_bind(&item.item.resource_did)
+                        .push_bind(&item.item.package_version)
+                        .push_bind(&item.item.package_hash)
+                        .push_bind(&item.item.metadata_hash)
+                        .push_bind(&item.item.did_document_hash)
+                        .push_bind(&item.item.resource_type)
+                        .push_bind(sqlx::types::Json(item.item.capability_tags.clone()));
+                });
+                builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
+                builder.build().execute(&mut *tx).await?;
+            }
+            store_items_elapsed_ms = stage_started.elapsed().as_millis();
+        }
+        stored_notification_count = notification_items.len();
+        if !target_cursors.is_empty() {
+            let stage_started = Instant::now();
+            let rows = target_cursors.iter().collect::<Vec<_>>();
+            for chunk in rows.chunks(250) {
+                let mut builder = QueryBuilder::<Postgres>::new(format!(
+                    r#"
+                    INSERT INTO {ROOT_DISCOVERY_TARGET_TABLE}(
+                        discovery_did, pending_cursor, delivered_cursor, status, attempt_count,
+                        lease_owner, lease_expires_at, next_attempt_at, last_error, updated_at
+                    )
+                    "#
+                ));
+                builder.push_values(chunk, |mut row, (discovery_did, publication_cursor)| {
+                    row.push_bind(*discovery_did)
+                        .push_bind(*publication_cursor)
+                        .push("0")
+                        .push("'active'")
+                        .push("0")
+                        .push("NULL")
+                        .push("NULL")
+                        .push_bind(now)
+                        .push("NULL")
+                        .push_bind(now);
+                });
+                builder.push(format!(
+                    r#"
+                    ON CONFLICT(discovery_did)
+                    DO UPDATE SET
+                        pending_cursor = GREATEST({ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor, excluded.pending_cursor),
+                        status = 'active',
+                        next_attempt_at = CASE
+                            WHEN {ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor < excluded.pending_cursor
+                            THEN excluded.next_attempt_at
+                            ELSE {ROOT_DISCOVERY_TARGET_TABLE}.next_attempt_at
+                        END,
+                        updated_at = excluded.updated_at
+                    "#
+                ));
+                builder.build().execute(&mut *tx).await?;
+            }
+            upsert_targets_elapsed_ms = stage_started.elapsed().as_millis();
+        }
+        let stage_started = Instant::now();
         sqlx::query(&format!(
             "DELETE FROM {ROOT_CDN_JOB_TABLE} WHERE job_key = ANY($1)"
         ))
-        .bind(job_keys)
-        .execute(postgres.pool())
+        .bind(&job_keys)
+        .execute(&mut *tx)
         .await?;
-        return Ok(());
+        delete_jobs_elapsed_ms = stage_started.elapsed().as_millis();
+        tx.commit().await?;
+    } else {
+        stored_notification_count = 0;
     }
-    for (_, did) in jobs {
-        super::mark_file_cdn_queue_published(state, did).await?;
+    let update_elapsed_ms = update_started.elapsed().as_millis();
+
+    Ok(CdnPublicationBatchCompletion {
+        marked_count: job_keys.len(),
+        stored_notification_count,
+        advanced_discovery_count,
+        fetch_elapsed_ms,
+        fetch_sql_elapsed_ms,
+        watermark_match_elapsed_ms,
+        update_elapsed_ms,
+        watermark_elapsed_ms,
+        store_items_elapsed_ms,
+        upsert_targets_elapsed_ms,
+        delete_jobs_elapsed_ms,
+    })
+}
+
+fn validate_completion_refs(
+    jobs: &[CdnPublicationJobCompletionRef],
+    rows: &[PublicationProjectionRow],
+) -> Result<()> {
+    for (job, row) in jobs.iter().zip(rows.iter()) {
+        validate_completion_ref(
+            job,
+            &row.resource_did,
+            &row.package_version,
+            row.publication_cursor,
+            &row.package_hash,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_completion_refs_against_rows(
+    jobs: &[CdnPublicationJobCompletionRef],
+    rows: &[(ResourcePackage, i64)],
+) -> Result<()> {
+    for (job, (package, publication_cursor)) in jobs.iter().zip(rows.iter()) {
+        validate_completion_ref(
+            job,
+            &package.resource_did,
+            &package.package_version,
+            *publication_cursor,
+            &package.package_hash,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_completion_ref(
+    job: &CdnPublicationJobCompletionRef,
+    resource_did: &str,
+    package_version: &str,
+    publication_cursor: i64,
+    package_hash: &str,
+) -> Result<()> {
+    if let Some(cursor) = job.publication_cursor {
+        if cursor != publication_cursor {
+            return Err(anyhow!("cdn_publication_cursor_mismatch"));
+        }
+    }
+    if let Some(value) = job.resource_did.as_deref() {
+        if value != resource_did {
+            return Err(anyhow!("cdn_publication_resource_did_mismatch"));
+        }
+    }
+    if let Some(value) = job.package_version.as_deref() {
+        if value != package_version {
+            return Err(anyhow!("cdn_publication_package_version_mismatch"));
+        }
+    }
+    if let Some(value) = job.package_hash.as_deref() {
+        if value != package_hash {
+            return Err(anyhow!("cdn_publication_package_hash_mismatch"));
+        }
     }
     Ok(())
 }
@@ -1611,21 +1926,140 @@ pub(super) async fn resource_packages_for_jobs_impl(
     Ok(BTreeMap::new())
 }
 
-pub(super) async fn discovery_notification_targets_for_package_rows_impl(
+async fn postgres_publication_projections_for_jobs(
     state: &AppState,
-    packages: &[(ResourcePackage, i64)],
-) -> Result<Vec<DiscoveryNotificationTargetItem>> {
-    if packages.is_empty() {
-        return Ok(Vec::new());
+    job_keys: &[String],
+) -> Result<BTreeMap<String, PublicationProjectionRow>> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(BTreeMap::new());
+    };
+    if job_keys.is_empty() {
+        return Ok(BTreeMap::new());
     }
-    let authorization_state = super::current_authorization_state(state);
-    let active_discoveries = authorization_state
-        .discovery_nodes
-        .into_iter()
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT job_key, publication_cursor, resource_did, package_version,
+               package_hash, metadata_hash, did_document_hash, resource_type,
+               capability_tags_json::text
+        FROM {ROOT_CDN_JOB_TABLE}
+        WHERE job_key = ANY($1)
+        "#
+    ))
+    .bind(job_keys)
+    .fetch_all(postgres.pool())
+    .await?;
+    let mut items = BTreeMap::new();
+    for row in rows {
+        let job_key = row.get::<String, _>(0);
+        let publication_cursor = row
+            .try_get::<Option<i64>, _>(1)?
+            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
+        let resource_did = row
+            .try_get::<Option<String>, _>(2)?
+            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
+        let package_version = row
+            .try_get::<Option<String>, _>(3)?
+            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
+        let package_hash = row
+            .try_get::<Option<String>, _>(4)?
+            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
+        let metadata_hash = row
+            .try_get::<Option<String>, _>(5)?
+            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
+        let did_document_hash = row
+            .try_get::<Option<String>, _>(6)?
+            .ok_or_else(|| anyhow!("missing_publication_projection:{job_key}"))?;
+        let resource_type = row
+            .try_get::<Option<String>, _>(7)?
+            .unwrap_or_else(|| "unknown".to_owned());
+        let capability_tags = row
+            .try_get::<Option<String>, _>(8)?
+            .map(|value| serde_json::from_str::<Vec<String>>(&value))
+            .transpose()?
+            .unwrap_or_default();
+        items.insert(
+            job_key,
+            PublicationProjectionRow {
+                resource_did,
+                package_version,
+                publication_cursor,
+                package_hash,
+                metadata_hash,
+                did_document_hash,
+                resource_type,
+                capability_tags,
+            },
+        );
+    }
+    Ok(items)
+}
+
+async fn postgres_publication_projection_rows_by_cursor_range(
+    state: &AppState,
+    delivered_cursor: i64,
+    target_cursor: i64,
+) -> Result<Vec<PublicationProjectionRow>> {
+    let Some(postgres) = &state.postgres else {
+        return Ok(Vec::new());
+    };
+    let rows = sqlx::query(&format!(
+        r#"
+        SELECT publication_cursor, subject_did, version, package_hash, metadata_hash,
+               did_document_hash, resource_type, capability_tags_json::text
+        FROM {ROOT_SUBJECT_VERSION_TABLE}
+        WHERE publication_cursor > $1 AND publication_cursor <= $2
+        ORDER BY publication_cursor
+        "#
+    ))
+    .bind(delivered_cursor)
+    .bind(target_cursor)
+    .fetch_all(postgres.pool())
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(PublicationProjectionRow {
+                publication_cursor: row.get::<i64, _>(0),
+                resource_did: row.get::<String, _>(1),
+                package_version: row.get::<String, _>(2),
+                package_hash: row.get::<String, _>(3),
+                metadata_hash: row.get::<String, _>(4),
+                did_document_hash: row.get::<String, _>(5),
+                resource_type: row.get::<String, _>(6),
+                capability_tags: serde_json::from_str::<Vec<String>>(&row.get::<String, _>(7))?,
+            })
+        })
+        .collect()
+}
+
+fn discovery_notification_item_from_projection(
+    row: PublicationProjectionRow,
+) -> DiscoveryNotificationItem {
+    DiscoveryNotificationItem {
+        publication_cursor: row.publication_cursor,
+        resource_did: row.resource_did,
+        package_version: row.package_version,
+        package_hash: row.package_hash,
+        metadata_hash: row.metadata_hash,
+        did_document_hash: row.did_document_hash,
+        resource_type: row.resource_type,
+        capability_tags: row.capability_tags,
+    }
+}
+
+pub(super) fn discovery_notification_targets_for_authorized_rows(
+    packages: &[(ResourcePackage, i64)],
+    discovery_nodes: &BTreeMap<String, DiscoveryAuthorizationState>,
+    tag_tree: &CapabilityTagTree,
+) -> Vec<DiscoveryNotificationTargetItem> {
+    if packages.is_empty() {
+        return Vec::new();
+    }
+    let active_discoveries = discovery_nodes
+        .iter()
         .filter(|(_, auth)| auth.status == "active")
         .collect::<Vec<_>>();
     if active_discoveries.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
     let mut items = Vec::new();
     for (package, publication_cursor) in packages {
@@ -1643,18 +2077,65 @@ pub(super) async fn discovery_notification_targets_for_package_rows_impl(
             capability_tags: package.metadata.capability_tags.clone(),
         };
         for (discovery_did, auth) in &active_discoveries {
-            if state
-                .tag_tree
-                .matches_authorized_domains(&item.capability_tags, &auth.authorized_domains)
+            if tag_tree.matches_authorized_domains(&item.capability_tags, &auth.authorized_domains)
             {
                 items.push(DiscoveryNotificationTargetItem {
-                    discovery_did: discovery_did.clone(),
+                    discovery_did: (*discovery_did).clone(),
                     item: item.clone(),
                 });
             }
         }
     }
-    Ok(items)
+    items
+}
+
+pub(super) fn discovery_target_cursors_from_items(
+    items: &[DiscoveryNotificationTargetItem],
+) -> BTreeMap<String, i64> {
+    let mut target_cursors = BTreeMap::<String, i64>::new();
+    for item in items {
+        target_cursors
+            .entry(item.discovery_did.clone())
+            .and_modify(|cursor| *cursor = (*cursor).max(item.item.publication_cursor))
+            .or_insert(item.item.publication_cursor);
+    }
+    target_cursors
+}
+
+fn discovery_notification_targets_for_projection_rows(
+    rows: &[PublicationProjectionRow],
+    discovery_nodes: &BTreeMap<String, DiscoveryAuthorizationState>,
+    tag_tree: &CapabilityTagTree,
+) -> (Vec<DiscoveryNotificationTargetItem>, BTreeMap<String, i64>) {
+    if rows.is_empty() {
+        return (Vec::new(), BTreeMap::new());
+    }
+    let active_discoveries = discovery_nodes
+        .iter()
+        .filter(|(_, auth)| auth.status == "active")
+        .collect::<Vec<_>>();
+    if active_discoveries.is_empty() {
+        return (Vec::new(), BTreeMap::new());
+    }
+    let mut items = Vec::new();
+    let mut target_cursors = BTreeMap::<String, i64>::new();
+    for row in rows {
+        let item = discovery_notification_item_from_projection(row.clone());
+        for (discovery_did, auth) in &active_discoveries {
+            if tag_tree.matches_authorized_domains(&item.capability_tags, &auth.authorized_domains)
+            {
+                items.push(DiscoveryNotificationTargetItem {
+                    discovery_did: (*discovery_did).clone(),
+                    item: item.clone(),
+                });
+                target_cursors
+                    .entry((*discovery_did).clone())
+                    .and_modify(|cursor| *cursor = (*cursor).max(item.publication_cursor))
+                    .or_insert(item.publication_cursor);
+            }
+        }
+    }
+    (items, target_cursors)
 }
 
 pub(super) async fn authorized_discovery_summary_items_impl(
@@ -1717,26 +2198,19 @@ pub(super) async fn authorized_discovery_summary_items_impl(
             }
         }
         return Ok(items_by_cursor.into_values().collect());
-    } else if let Some(postgres) = &state.postgres {
-        let rows = sqlx::query(&format!(
-            r#"
-            SELECT publication_cursor, package_json::text
-            FROM {ROOT_SUBJECT_VERSION_TABLE}
-            WHERE publication_cursor > $1 AND publication_cursor <= $2
-            ORDER BY publication_cursor
-            "#
-        ))
-        .bind(delivered_cursor)
-        .bind(target_cursor)
-        .fetch_all(postgres.pool())
+    } else if state.postgres.is_some() {
+        let rows = postgres_publication_projection_rows_by_cursor_range(
+            state,
+            delivered_cursor,
+            target_cursor,
+        )
         .await?;
         for row in rows {
-            let publication_cursor = row.get::<i64, _>(0);
+            let publication_cursor = row.publication_cursor;
             if items_by_cursor.contains_key(&publication_cursor) {
                 continue;
             }
-            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
-            let item = discovery_notification_item_from_package(publication_cursor, package)?;
+            let item = discovery_notification_item_from_projection(row);
             if state.tag_tree.matches_authorized_domains(
                 &item.capability_tags,
                 &discovery_auth.authorized_domains,
@@ -1837,73 +2311,4 @@ fn discovery_notification_item_from_package(
             .unwrap_or_else(|| "unknown".to_owned()),
         capability_tags: package.metadata.capability_tags,
     })
-}
-
-pub(super) async fn store_discovery_notification_items_impl(
-    state: &AppState,
-    items: &[DiscoveryNotificationTargetItem],
-) -> Result<usize> {
-    if items.is_empty() {
-        return Ok(0);
-    }
-    if let Some(sqlite) = &state.sqlite {
-        let mut tx = sqlite.pool().begin().await?;
-        for chunk in items.chunks(250) {
-            let mut builder = QueryBuilder::<Sqlite>::new(format!(
-                r#"
-                INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
-                    discovery_did, publication_cursor, resource_did, package_version,
-                    package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
-                )
-                "#
-            ));
-            builder.push_values(chunk, |mut row, item| {
-                row.push_bind(&item.discovery_did)
-                    .push_bind(item.item.publication_cursor)
-                    .push_bind(&item.item.resource_did)
-                    .push_bind(&item.item.package_version)
-                    .push_bind(&item.item.package_hash)
-                    .push_bind(&item.item.metadata_hash)
-                    .push_bind(&item.item.did_document_hash)
-                    .push_bind(&item.item.resource_type)
-                    .push_bind(
-                        serde_json::to_string(&item.item.capability_tags)
-                            .unwrap_or_else(|_| "[]".to_owned()),
-                    );
-            });
-            builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
-            builder.build().execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        return Ok(items.len());
-    }
-    if let Some(postgres) = &state.postgres {
-        let mut tx = postgres.pool().begin().await?;
-        for chunk in items.chunks(250) {
-            let mut builder = QueryBuilder::<Postgres>::new(format!(
-                r#"
-                INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
-                    discovery_did, publication_cursor, resource_did, package_version,
-                    package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
-                )
-                "#
-            ));
-            builder.push_values(chunk, |mut row, item| {
-                row.push_bind(&item.discovery_did)
-                    .push_bind(item.item.publication_cursor)
-                    .push_bind(&item.item.resource_did)
-                    .push_bind(&item.item.package_version)
-                    .push_bind(&item.item.package_hash)
-                    .push_bind(&item.item.metadata_hash)
-                    .push_bind(&item.item.did_document_hash)
-                    .push_bind(&item.item.resource_type)
-                    .push_bind(sqlx::types::Json(item.item.capability_tags.clone()));
-            });
-            builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
-            builder.build().execute(&mut *tx).await?;
-        }
-        tx.commit().await?;
-        return Ok(items.len());
-    }
-    Ok(0)
 }

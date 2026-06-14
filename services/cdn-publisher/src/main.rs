@@ -95,6 +95,15 @@ struct AppState {
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
+struct PublisherStageRuntime {
+    last_batch_size: usize,
+    last_concurrency: usize,
+    last_success_count: usize,
+    last_failure_count: usize,
+    last_elapsed_ms: u128,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
 struct PublisherRuntime {
     stream: String,
     subject: String,
@@ -112,6 +121,12 @@ struct PublisherRuntime {
     last_ack_elapsed_ms: u128,
     last_effective_batch_size: usize,
     last_ack_concurrency: usize,
+    fetch_stage: PublisherStageRuntime,
+    root_fetch_stage: PublisherStageRuntime,
+    binding_stage: PublisherStageRuntime,
+    cdn_publish_stage: PublisherStageRuntime,
+    root_callback_stage: PublisherStageRuntime,
+    ack_stage: PublisherStageRuntime,
     last_error: Option<String>,
     updated_at: Option<chrono::DateTime<Utc>>,
 }
@@ -119,21 +134,50 @@ struct PublisherRuntime {
 #[derive(Clone, Debug, Default)]
 struct PublisherCycleMetrics {
     fetch_elapsed_ms: u128,
-    prepare_elapsed_ms: u128,
+    root_fetch_elapsed_ms: u128,
+    binding_elapsed_ms: u128,
     publish_elapsed_ms: u128,
     callback_elapsed_ms: u128,
     ack_elapsed_ms: u128,
     effective_batch_size: usize,
     ack_concurrency: usize,
+    fetch_stage: PublisherStageRuntime,
+    root_fetch_stage: PublisherStageRuntime,
+    binding_stage: PublisherStageRuntime,
+    cdn_publish_stage: PublisherStageRuntime,
+    root_callback_stage: PublisherStageRuntime,
+    ack_stage: PublisherStageRuntime,
 }
 
 #[derive(Clone, Debug, Default)]
 struct CdnBatchPublishOutcome {
-    published_items: Vec<ResourceCdnPublishBatchItem>,
+    published_cursors: BTreeSet<i64>,
     published_count: usize,
-    failed_count: usize,
+    retry_count: usize,
     publish_elapsed_ms: u128,
-    callback_elapsed_ms: u128,
+}
+
+struct FetchedEventTask {
+    message: async_nats::jetstream::Message,
+    event: CdnPublishRequestedEvent,
+}
+
+struct PreparedPublishTask {
+    message: async_nats::jetstream::Message,
+    publication_cursor: i64,
+    package: ResourcePackage,
+}
+
+struct TerminalFailureTask {
+    message: async_nats::jetstream::Message,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PreparedBatchClassification {
+    prepared: Vec<(String, i64, ResourcePackage)>,
+    root_fetch_failures: usize,
+    binding_failures: usize,
+    terminal_job_keys: BTreeSet<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -354,64 +398,209 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
         }
         cycle_metrics.fetch_elapsed_ms = fetch_started.elapsed().as_millis();
         cycle_metrics.effective_batch_size = batch.len();
-        let mut prepared = Vec::new();
-        if !batch.is_empty() {
-            let prepare_started = std::time::Instant::now();
-            match prepare_publish_batch(&state, batch).await {
-                Ok(items) => {
-                    cycle_metrics.prepare_elapsed_ms = prepare_started.elapsed().as_millis();
-                    prepared = items;
+        cycle_metrics.fetch_stage = PublisherStageRuntime {
+            last_batch_size: batch.len(),
+            last_concurrency: 1,
+            last_success_count: batch.iter().filter(|(_, event)| event.is_ok()).count(),
+            last_failure_count: batch.iter().filter(|(_, event)| event.is_err()).count(),
+            last_elapsed_ms: cycle_metrics.fetch_elapsed_ms,
+        };
+
+        let (decoded, decode_failures) = decode_fetched_batch(batch);
+        let fetch_failures = decode_failures.len();
+        failed += fetch_failures;
+        let mut terminal_ack_messages = decode_failures
+            .into_iter()
+            .map(|item| item.message)
+            .collect::<Vec<_>>();
+
+        let (prepared, terminal_prepared_failures, root_fetch_metrics, binding_metrics) =
+            if decoded.is_empty() {
+                (
+                    Vec::new(),
+                    Vec::new(),
+                    PublisherStageRuntime::default(),
+                    PublisherStageRuntime::default(),
+                )
+            } else {
+                match prepare_publish_batch(&state, decoded).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        record_cycle(
+                            &state,
+                            fetched,
+                            acked,
+                            failed,
+                            started.elapsed().as_millis(),
+                            cycle_metrics,
+                            Some(err.to_string()),
+                        );
+                        continue;
+                    }
                 }
-                Err(err) => {
-                    cycle_metrics.prepare_elapsed_ms = prepare_started.elapsed().as_millis();
-                    failed += fetched.saturating_sub(acked);
-                    eprintln!("cdn-publisher failed to prepare batch: {err}");
-                }
-            }
-        }
+            };
+        terminal_ack_messages.extend(
+            terminal_prepared_failures
+                .into_iter()
+                .map(|item| item.message),
+        );
+        cycle_metrics.root_fetch_elapsed_ms = root_fetch_metrics.last_elapsed_ms;
+        cycle_metrics.binding_elapsed_ms = binding_metrics.last_elapsed_ms;
+        cycle_metrics.root_fetch_stage = root_fetch_metrics;
+        let binding_failure_count = binding_metrics.last_failure_count;
+        cycle_metrics.binding_stage = binding_metrics;
+        failed += cycle_metrics.root_fetch_stage.last_failure_count;
+        failed += cycle_metrics.binding_stage.last_failure_count;
+
         if !prepared.is_empty() {
-            let items = prepared
-                .iter()
-                .map(|(_, publication_cursor, package)| (*publication_cursor, package.clone()))
-                .collect::<Vec<_>>();
             let publish_started = std::time::Instant::now();
-            match publish_packages_to_cdn(&state, items).await {
-                Ok(outcome) => {
-                    if outcome.publish_elapsed_ms > 0 {
-                        cycle_metrics.publish_elapsed_ms = outcome.publish_elapsed_ms;
-                    } else {
-                        cycle_metrics.publish_elapsed_ms = publish_started.elapsed().as_millis();
-                    }
-                    cycle_metrics.callback_elapsed_ms = outcome.callback_elapsed_ms;
-                    failed += outcome.failed_count;
-                    let published_by_cursor = outcome
-                        .published_items
-                        .iter()
-                        .map(|item| item.publication_cursor)
-                        .collect::<BTreeSet<_>>();
-                    let messages = prepared
-                        .into_iter()
-                        .filter_map(|(message, publication_cursor, _)| {
-                            published_by_cursor
-                                .contains(&publication_cursor)
-                                .then_some(message)
-                        })
-                        .collect::<Vec<_>>();
-                    let ack_concurrency = state.config.events.max_in_flight.max(1);
-                    cycle_metrics.ack_concurrency = ack_concurrency;
-                    let ack_started = std::time::Instant::now();
-                    let acked_batch = ack_messages(messages, ack_concurrency).await?;
-                    acked += acked_batch;
-                    cycle_metrics.ack_elapsed_ms = ack_started.elapsed().as_millis();
-                    if acked_batch < outcome.published_count {
-                        failed += outcome.published_count - acked_batch;
-                    }
-                }
+            let publish_outcome = match publish_packages_to_cdn(
+                &state,
+                prepared
+                    .iter()
+                    .map(|item| (item.publication_cursor, item.package.clone()))
+                    .collect(),
+            )
+            .await
+            {
+                Ok(outcome) => outcome,
                 Err(err) => {
-                    cycle_metrics.publish_elapsed_ms = publish_started.elapsed().as_millis();
-                    failed += prepared.len();
-                    eprintln!("cdn-publisher batch failed: {err}");
+                    record_cycle(
+                        &state,
+                        fetched,
+                        acked,
+                        failed,
+                        started.elapsed().as_millis(),
+                        cycle_metrics,
+                        Some(err.to_string()),
+                    );
+                    continue;
                 }
+            };
+            cycle_metrics.publish_elapsed_ms = publish_outcome
+                .publish_elapsed_ms
+                .max(publish_started.elapsed().as_millis());
+            cycle_metrics.cdn_publish_stage = PublisherStageRuntime {
+                last_batch_size: prepared.len(),
+                last_concurrency: 1,
+                last_success_count: publish_outcome.published_count,
+                last_failure_count: publish_outcome.retry_count,
+                last_elapsed_ms: cycle_metrics.publish_elapsed_ms,
+            };
+            failed += publish_outcome.retry_count;
+
+            let successful = prepared
+                .iter()
+                .filter(|item| {
+                    publish_outcome
+                        .published_cursors
+                        .contains(&item.publication_cursor)
+                })
+                .map(|item| ResourceCdnPublishBatchItem {
+                    publication_cursor: item.publication_cursor,
+                    package: item.package.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            let callback_started = std::time::Instant::now();
+            let callback_success_count = if successful.is_empty() {
+                0
+            } else {
+                if let Err(err) = mark_root_jobs_published(&state, &successful).await {
+                    record_cycle(
+                        &state,
+                        fetched,
+                        acked,
+                        failed,
+                        started.elapsed().as_millis(),
+                        cycle_metrics,
+                        Some(err.to_string()),
+                    );
+                    continue;
+                }
+                successful.len()
+            };
+            cycle_metrics.callback_elapsed_ms = callback_started.elapsed().as_millis();
+            cycle_metrics.root_callback_stage = PublisherStageRuntime {
+                last_batch_size: successful.len(),
+                last_concurrency: 1,
+                last_success_count: callback_success_count,
+                last_failure_count: 0,
+                last_elapsed_ms: cycle_metrics.callback_elapsed_ms,
+            };
+
+            let mut ack_messages_batch = prepared
+                .into_iter()
+                .filter_map(|item| {
+                    publish_outcome
+                        .published_cursors
+                        .contains(&item.publication_cursor)
+                        .then_some(item.message)
+                })
+                .collect::<Vec<_>>();
+            ack_messages_batch.extend(terminal_ack_messages);
+            let ack_concurrency = state.config.events.max_in_flight.max(1);
+            cycle_metrics.ack_concurrency = ack_concurrency;
+            let ack_started = std::time::Instant::now();
+            let acked_batch = match ack_messages(ack_messages_batch, ack_concurrency).await {
+                Ok(value) => value,
+                Err(err) => {
+                    record_cycle(
+                        &state,
+                        fetched,
+                        acked,
+                        failed,
+                        started.elapsed().as_millis(),
+                        cycle_metrics,
+                        Some(err.to_string()),
+                    );
+                    continue;
+                }
+            };
+            acked += acked_batch;
+            cycle_metrics.ack_elapsed_ms = ack_started.elapsed().as_millis();
+            let ack_target_count = callback_success_count + fetch_failures + binding_failure_count;
+            cycle_metrics.ack_stage = PublisherStageRuntime {
+                last_batch_size: ack_target_count,
+                last_concurrency: ack_concurrency,
+                last_success_count: acked_batch,
+                last_failure_count: ack_target_count.saturating_sub(acked_batch),
+                last_elapsed_ms: cycle_metrics.ack_elapsed_ms,
+            };
+            if acked_batch < ack_target_count {
+                failed += ack_target_count - acked_batch;
+            }
+        } else if !terminal_ack_messages.is_empty() {
+            let ack_concurrency = state.config.events.max_in_flight.max(1);
+            cycle_metrics.ack_concurrency = ack_concurrency;
+            let ack_started = std::time::Instant::now();
+            let acked_batch = match ack_messages(terminal_ack_messages, ack_concurrency).await {
+                Ok(value) => value,
+                Err(err) => {
+                    record_cycle(
+                        &state,
+                        fetched,
+                        acked,
+                        failed,
+                        started.elapsed().as_millis(),
+                        cycle_metrics,
+                        Some(err.to_string()),
+                    );
+                    continue;
+                }
+            };
+            acked += acked_batch;
+            cycle_metrics.ack_elapsed_ms = ack_started.elapsed().as_millis();
+            let ack_target_count = fetch_failures + binding_failure_count;
+            cycle_metrics.ack_stage = PublisherStageRuntime {
+                last_batch_size: ack_target_count,
+                last_concurrency: ack_concurrency,
+                last_success_count: acked_batch,
+                last_failure_count: ack_target_count.saturating_sub(acked_batch),
+                last_elapsed_ms: cycle_metrics.ack_elapsed_ms,
+            };
+            if acked_batch < ack_target_count {
+                failed += ack_target_count - acked_batch;
             }
         }
         record_cycle(
@@ -463,6 +652,26 @@ async fn ack_messages(
     Ok(acked)
 }
 
+fn decode_fetched_batch(
+    batch: Vec<(
+        async_nats::jetstream::Message,
+        Result<CdnPublishRequestedEvent>,
+    )>,
+) -> (Vec<FetchedEventTask>, Vec<TerminalFailureTask>) {
+    let mut decoded = Vec::new();
+    let mut failures = Vec::new();
+    for (message, event) in batch {
+        match event {
+            Ok(event) => decoded.push(FetchedEventTask { message, event }),
+            Err(err) => {
+                eprintln!("cdn-publisher failed to decode task: {err}");
+                failures.push(TerminalFailureTask { message });
+            }
+        }
+    }
+    (decoded, failures)
+}
+
 fn decode_event_payload(payload: &[u8]) -> Result<CdnPublishRequestedEvent> {
     let event: CdnPublishRequestedEvent = serde_json::from_slice(payload)?;
     event.validate().map_err(|err| anyhow!(err))?;
@@ -471,53 +680,91 @@ fn decode_event_payload(payload: &[u8]) -> Result<CdnPublishRequestedEvent> {
 
 async fn prepare_publish_batch(
     state: &AppState,
-    batch: Vec<(
-        async_nats::jetstream::Message,
-        Result<CdnPublishRequestedEvent>,
-    )>,
-) -> Result<Vec<(async_nats::jetstream::Message, i64, ResourcePackage)>> {
-    let mut decoded = Vec::new();
-    for (message, event) in batch {
-        match event {
-            Ok(event) => decoded.push((message, event)),
-            Err(err) => {
-                eprintln!("cdn-publisher failed to decode task: {err}");
-            }
-        }
-    }
+    decoded: Vec<FetchedEventTask>,
+) -> Result<(
+    Vec<PreparedPublishTask>,
+    Vec<TerminalFailureTask>,
+    PublisherStageRuntime,
+    PublisherStageRuntime,
+)> {
     if decoded.is_empty() {
-        return Ok(Vec::new());
+        return Ok((
+            Vec::new(),
+            Vec::new(),
+            PublisherStageRuntime::default(),
+            PublisherStageRuntime::default(),
+        ));
     }
+    let input_batch_size = decoded.len();
+    let root_fetch_started = std::time::Instant::now();
+    let event_refs = decoded.iter().map(|item| &item.event).collect::<Vec<_>>();
+    let packages = fetch_resource_packages_batch(state, event_refs.as_slice()).await?;
+    let root_fetch_elapsed_ms = root_fetch_started.elapsed().as_millis();
+
+    let binding_started = std::time::Instant::now();
     let events = decoded
         .iter()
-        .map(|(_, event)| event.clone())
+        .map(|item| item.event.clone())
         .collect::<Vec<_>>();
-    let mut packages = prepare_packages_for_events(state, &events).await?;
+    let classification = classify_prepared_packages(&events, &packages);
+    let mut classified_by_job = classification
+        .prepared
+        .into_iter()
+        .map(|(job_key, publication_cursor, package)| (job_key, (publication_cursor, package)))
+        .collect::<BTreeMap<_, _>>();
     let mut prepared = Vec::new();
-    for (message, event) in decoded {
-        let job_key = format!("{}:{}", event.resource_did, event.package_version);
-        let Some((publication_cursor, package)) = packages.remove(&job_key) else {
-            return Err(anyhow!("root_package_missing:{job_key}"));
-        };
-        prepared.push((message, publication_cursor, package));
+    let mut terminal_failures = Vec::new();
+    for item in decoded {
+        if let Some((publication_cursor, package)) = classified_by_job.remove(&item.event.job_key) {
+            prepared.push(PreparedPublishTask {
+                message: item.message,
+                publication_cursor,
+                package,
+            });
+        } else if classification
+            .terminal_job_keys
+            .contains(&item.event.job_key)
+        {
+            eprintln!(
+                "cdn-publisher dropped terminal invalid task for job: {}",
+                item.event.job_key
+            );
+            terminal_failures.push(TerminalFailureTask {
+                message: item.message,
+            });
+        } else if !packages.contains_key(&item.event.job_key) {
+            eprintln!(
+                "cdn-publisher will retry missing root package for job: {}",
+                item.event.job_key
+            );
+        } else {
+            eprintln!(
+                "cdn-publisher will retry unresolved task for {}",
+                item.event.job_key
+            );
+        }
     }
-    Ok(prepared)
-}
-
-async fn prepare_packages_for_events(
-    state: &AppState,
-    events: &[CdnPublishRequestedEvent],
-) -> Result<std::collections::BTreeMap<String, (i64, ResourcePackage)>> {
-    let event_refs = events.iter().collect::<Vec<_>>();
-    let packages = fetch_resource_packages_batch(state, event_refs.as_slice()).await?;
-    for event in events {
-        let job_key = format!("{}:{}", event.resource_did, event.package_version);
-        let Some((_, package)) = packages.get(&job_key) else {
-            return Err(anyhow!("root_package_missing:{job_key}"));
-        };
-        validate_package_matches_event(package, event)?;
-    }
-    Ok(packages)
+    let binding_elapsed_ms = binding_started.elapsed().as_millis();
+    Ok((
+        prepared,
+        terminal_failures,
+        PublisherStageRuntime {
+            last_batch_size: input_batch_size,
+            last_concurrency: 1,
+            last_success_count: input_batch_size.saturating_sub(classification.root_fetch_failures),
+            last_failure_count: classification.root_fetch_failures,
+            last_elapsed_ms: root_fetch_elapsed_ms,
+        },
+        PublisherStageRuntime {
+            last_batch_size: input_batch_size.saturating_sub(classification.root_fetch_failures),
+            last_concurrency: 1,
+            last_success_count: input_batch_size.saturating_sub(
+                classification.root_fetch_failures + classification.binding_failures,
+            ),
+            last_failure_count: classification.binding_failures,
+            last_elapsed_ms: binding_elapsed_ms,
+        },
+    ))
 }
 
 fn validate_package_matches_event(
@@ -542,6 +789,29 @@ fn validate_package_matches_event(
     Ok(())
 }
 
+fn classify_prepared_packages(
+    events: &[CdnPublishRequestedEvent],
+    packages: &BTreeMap<String, (i64, ResourcePackage)>,
+) -> PreparedBatchClassification {
+    let mut classification = PreparedBatchClassification::default();
+    for event in events {
+        let job_key = event.job_key.clone();
+        let Some((publication_cursor, package)) = packages.get(&job_key).cloned() else {
+            classification.root_fetch_failures += 1;
+            continue;
+        };
+        if validate_package_matches_event(&package, event).is_err() {
+            classification.binding_failures += 1;
+            classification.terminal_job_keys.insert(job_key);
+            continue;
+        }
+        classification
+            .prepared
+            .push((job_key, publication_cursor, package));
+    }
+    classification
+}
+
 async fn fetch_resource_packages_batch(
     state: &AppState,
     events: &[&CdnPublishRequestedEvent],
@@ -560,8 +830,7 @@ async fn fetch_resource_packages_batch(
         .iter()
         .map(|event| {
             json!({
-                "resource_did": event.resource_did,
-                "package_version": event.package_version
+                "jobKey": event.job_key
             })
         })
         .collect::<Vec<_>>();
@@ -666,34 +935,23 @@ async fn publish_packages_to_cdn(
         return Err(anyhow!("cdn_publish_failed:{status}:{value}"));
     }
     let published_cursors = extract_published_cursors(&value)?;
-    let failed_count = value
+    let retry_count = value
         .get("failedCount")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
-    if published_cursors.len() + failed_count != request.items.len() {
+    if published_cursors.len() + retry_count != request.items.len() {
         return Err(anyhow!(
             "cdn_publish_response_count_mismatch:accepted={} failed={} requested={}",
             published_cursors.len(),
-            failed_count,
+            retry_count,
             request.items.len()
         ));
     }
-    let published_items = request
-        .items
-        .iter()
-        .filter(|item| published_cursors.contains(&item.publication_cursor))
-        .cloned()
-        .collect::<Vec<_>>();
-    let callback_started = std::time::Instant::now();
-    if !published_items.is_empty() {
-        mark_root_jobs_published(state, &published_items).await?;
-    }
     Ok(CdnBatchPublishOutcome {
-        published_count: published_items.len(),
-        failed_count,
-        published_items,
+        published_count: published_cursors.len(),
+        retry_count,
+        published_cursors,
         publish_elapsed_ms,
-        callback_elapsed_ms: callback_started.elapsed().as_millis(),
     })
 }
 
@@ -747,8 +1005,8 @@ fn build_mark_published_jobs(items: &[ResourceCdnPublishBatchItem]) -> Vec<Value
             json!({
                 "jobKey": format!("{}:{}", item.package.resource_did, item.package.package_version),
                 "publicationCursor": item.publication_cursor,
-                "resource_did": item.package.resource_did,
-                "package_version": item.package.package_version,
+                "resourceDid": item.package.resource_did,
+                "packageVersion": item.package.package_version,
                 "packageHash": item.package.package_hash
             })
         })
@@ -835,12 +1093,20 @@ fn record_cycle(
         runtime.total_failed_count = runtime.total_failed_count.saturating_add(failed as u64);
         runtime.last_elapsed_ms = elapsed_ms;
         runtime.last_fetch_elapsed_ms = metrics.fetch_elapsed_ms;
-        runtime.last_prepare_elapsed_ms = metrics.prepare_elapsed_ms;
+        runtime.last_prepare_elapsed_ms = metrics
+            .root_fetch_elapsed_ms
+            .saturating_add(metrics.binding_elapsed_ms);
         runtime.last_publish_elapsed_ms = metrics.publish_elapsed_ms;
         runtime.last_callback_elapsed_ms = metrics.callback_elapsed_ms;
         runtime.last_ack_elapsed_ms = metrics.ack_elapsed_ms;
         runtime.last_effective_batch_size = metrics.effective_batch_size;
         runtime.last_ack_concurrency = metrics.ack_concurrency;
+        runtime.fetch_stage = metrics.fetch_stage;
+        runtime.root_fetch_stage = metrics.root_fetch_stage;
+        runtime.binding_stage = metrics.binding_stage;
+        runtime.cdn_publish_stage = metrics.cdn_publish_stage;
+        runtime.root_callback_stage = metrics.root_callback_stage;
+        runtime.ack_stage = metrics.ack_stage;
         if error.is_some() {
             runtime.last_error = error;
         }
@@ -1035,14 +1301,7 @@ mod tests {
 
         assert_eq!(jobs.len(), 2);
         assert_eq!(jobs[0]["jobKey"], "did:oan:AGUS:test:1.0.0");
-        assert_eq!(jobs[0]["publicationCursor"], 42);
-        assert_eq!(jobs[0]["resource_did"], "did:oan:AGUS:test");
-        assert_eq!(jobs[0]["package_version"], "1.0.0");
-        assert_eq!(jobs[0]["packageHash"], "sha256:package");
         assert_eq!(jobs[1]["jobKey"], "did:oan:AGUS:test2:2.0.0");
-        assert_eq!(jobs[1]["publicationCursor"], 43);
-        assert_eq!(jobs[1]["resource_did"], "did:oan:AGUS:test2");
-        assert_eq!(jobs[1]["package_version"], "2.0.0");
     }
 
     #[test]
@@ -1127,11 +1386,46 @@ mod tests {
         state.config.root.endpoint = format!("http://{addr}");
         state.config.root.admin_token = Some("test-admin".to_owned());
         let event = sample_event();
-        let packages = prepare_packages_for_events(&state, &[event]).await.unwrap();
+        let packages = fetch_resource_packages_batch(&state, &[&event])
+            .await
+            .unwrap();
+        let classified = classify_prepared_packages(&[event], &packages);
 
-        let (cursor, package) = packages.get("did:oan:AGUS:test:1.0.0").unwrap();
-        assert_eq!(*cursor, 42);
-        assert_eq!(package.resource_did, "did:oan:AGUS:test");
+        assert_eq!(classified.root_fetch_failures, 0);
+        assert_eq!(classified.binding_failures, 0);
+        assert!(classified.terminal_job_keys.is_empty());
+        assert_eq!(classified.prepared.len(), 1);
+        assert_eq!(classified.prepared[0].1, 42);
+        assert_eq!(classified.prepared[0].2.resource_did, "did:oan:AGUS:test");
+    }
+
+    #[test]
+    fn classify_prepared_packages_splits_valid_missing_and_terminal_invalid_items() {
+        let valid_event = sample_event();
+        let mut invalid_event = sample_event();
+        invalid_event.job_key = "did:oan:AGUS:invalid:1.0.0".to_owned();
+        invalid_event.resource_did = "did:oan:AGUS:invalid".to_owned();
+        invalid_event.package_hash = "sha256:expected".to_owned();
+        let mut invalid_package = sample_package();
+        invalid_package.resource_did = invalid_event.resource_did.clone();
+        invalid_package.metadata.resource_did = invalid_event.resource_did.clone();
+        invalid_package.package_hash = "sha256:actual".to_owned();
+        invalid_package.metadata.package_hash = invalid_package.package_hash.clone();
+
+        let mut packages = BTreeMap::new();
+        packages.insert(valid_event.job_key.clone(), (42, sample_package()));
+        packages.insert(invalid_event.job_key.clone(), (43, invalid_package));
+
+        let classified =
+            classify_prepared_packages(&[valid_event.clone(), invalid_event.clone()], &packages);
+
+        assert_eq!(classified.prepared.len(), 1);
+        assert_eq!(classified.prepared[0].0, valid_event.job_key);
+        assert_eq!(classified.root_fetch_failures, 0);
+        assert_eq!(classified.binding_failures, 1);
+        assert!(classified
+            .terminal_job_keys
+            .contains(&invalid_event.job_key));
     }
 
     #[tokio::test]
@@ -1157,12 +1451,55 @@ mod tests {
             12,
             PublisherCycleMetrics {
                 fetch_elapsed_ms: 2,
-                prepare_elapsed_ms: 3,
+                root_fetch_elapsed_ms: 3,
+                binding_elapsed_ms: 4,
                 publish_elapsed_ms: 4,
                 callback_elapsed_ms: 5,
                 ack_elapsed_ms: 1,
                 effective_batch_size: 3,
                 ack_concurrency: 2,
+                fetch_stage: PublisherStageRuntime {
+                    last_batch_size: 3,
+                    last_concurrency: 1,
+                    last_success_count: 2,
+                    last_failure_count: 1,
+                    last_elapsed_ms: 2,
+                },
+                root_fetch_stage: PublisherStageRuntime {
+                    last_batch_size: 2,
+                    last_concurrency: 1,
+                    last_success_count: 2,
+                    last_failure_count: 0,
+                    last_elapsed_ms: 3,
+                },
+                binding_stage: PublisherStageRuntime {
+                    last_batch_size: 2,
+                    last_concurrency: 1,
+                    last_success_count: 1,
+                    last_failure_count: 1,
+                    last_elapsed_ms: 4,
+                },
+                cdn_publish_stage: PublisherStageRuntime {
+                    last_batch_size: 1,
+                    last_concurrency: 1,
+                    last_success_count: 1,
+                    last_failure_count: 0,
+                    last_elapsed_ms: 4,
+                },
+                root_callback_stage: PublisherStageRuntime {
+                    last_batch_size: 1,
+                    last_concurrency: 1,
+                    last_success_count: 1,
+                    last_failure_count: 0,
+                    last_elapsed_ms: 5,
+                },
+                ack_stage: PublisherStageRuntime {
+                    last_batch_size: 1,
+                    last_concurrency: 2,
+                    last_success_count: 1,
+                    last_failure_count: 0,
+                    last_elapsed_ms: 1,
+                },
             },
             Some("err".to_owned()),
         );
@@ -1171,12 +1508,18 @@ mod tests {
         assert_eq!(runtime.total_acked_count, 2);
         assert_eq!(runtime.total_failed_count, 1);
         assert_eq!(runtime.last_fetch_elapsed_ms, 2);
-        assert_eq!(runtime.last_prepare_elapsed_ms, 3);
+        assert_eq!(runtime.last_prepare_elapsed_ms, 7);
         assert_eq!(runtime.last_publish_elapsed_ms, 4);
         assert_eq!(runtime.last_callback_elapsed_ms, 5);
         assert_eq!(runtime.last_ack_elapsed_ms, 1);
         assert_eq!(runtime.last_effective_batch_size, 3);
         assert_eq!(runtime.last_ack_concurrency, 2);
+        assert_eq!(runtime.fetch_stage.last_failure_count, 1);
+        assert_eq!(runtime.root_fetch_stage.last_success_count, 2);
+        assert_eq!(runtime.binding_stage.last_failure_count, 1);
+        assert_eq!(runtime.cdn_publish_stage.last_success_count, 1);
+        assert_eq!(runtime.root_callback_stage.last_batch_size, 1);
+        assert_eq!(runtime.ack_stage.last_concurrency, 2);
         assert_eq!(runtime.last_error.as_deref(), Some("err"));
     }
 
