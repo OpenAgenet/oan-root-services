@@ -1503,6 +1503,7 @@ mod tests {
                 resource_description: None,
                 agent_description: None,
                 capability_tags: vec![],
+                authorized_domains: vec!["*".to_owned()],
                 protocol_bindings: vec![],
                 implementation_links: vec![],
                 credential_requirements: vec![],
@@ -1549,6 +1550,7 @@ mod tests {
                 }),
                 agent_description: None,
                 capability_tags: vec!["legal.contract.review".to_owned()],
+                authorized_domains: vec!["legal".to_owned()],
                 protocol_bindings: vec![],
                 implementation_links: vec![],
                 credential_requirements: vec![],
@@ -1577,6 +1579,7 @@ mod tests {
                 name: "Contract Review Skill".to_owned(),
                 description: "Review contracts".to_owned(),
                 capability_tags: vec!["legal.contract.review".to_owned()],
+                authorized_domains: vec!["legal".to_owned()],
                 protocol_bindings: vec![],
                 services: vec![ServiceEndpoint {
                     id: format!("{resource_did}#download"),
@@ -1644,6 +1647,7 @@ mod tests {
             package_hash: package.package_hash.clone(),
             hash_algorithm: package.hash_algorithm.clone(),
             lifecycle_state: package.metadata.lifecycle_state.clone(),
+            authorized_domains: package.metadata.authorized_domains.clone(),
             bulletin_ref: None,
         };
         package.root_proof.package_claims = Some(serde_json::to_value(claims).unwrap());

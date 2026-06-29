@@ -214,8 +214,8 @@ struct TrustIndexerConfig {
 impl Default for TrustIndexerConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            endpoint: None,
+            enabled: true,
+            endpoint: Some("http://127.0.0.1:8088".to_owned()),
             fail_mode: default_trust_indexer_fail_mode(),
             timeout_ms: default_trust_indexer_timeout_ms(),
             poll_interval_ms: default_trust_indexer_poll_interval_ms(),
@@ -754,7 +754,7 @@ struct InfrastructureAuthorizationCredentialSubject {
     subject_type: u8,
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
-    #[serde(rename = "authorizedDomains", default)]
+    #[serde(rename = "authorizedDomains", alias = "authorized_domains", default)]
     authorized_domains: Vec<String>,
     #[serde(rename = "didDocumentFile")]
     did_document_file: String,
@@ -864,6 +864,8 @@ struct NodeAuthorizationState {
         skip_serializing_if = "Option::is_none"
     )]
     did_document_snapshot: Option<DidDocument>,
+    #[serde(rename = "authorizedDomains", alias = "authorized_domains", default)]
+    authorized_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -876,6 +878,7 @@ struct DiscoveryAuthorizationState {
         skip_serializing_if = "Option::is_none"
     )]
     did_document_snapshot: Option<DidDocument>,
+    #[serde(alias = "authorizedDomains", default)]
     authorized_domains: Vec<String>,
     tag_tree_version: u64,
 }
@@ -1006,6 +1009,8 @@ struct DiscoveryNotificationItem {
     resource_type: String,
     #[serde(rename = "capabilityTags")]
     capability_tags: Vec<String>,
+    #[serde(rename = "authorizedDomains", default)]
+    authorized_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -1027,8 +1032,7 @@ async fn main() -> Result<()> {
         crypto_suite,
         &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
     )?;
-    let authorization_state =
-        load_authorization_state(&config.paths.authorization_state_file).unwrap_or_default();
+    let authorization_state = load_authorization_state(&config.paths.authorization_state_file)?;
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
         Some(url) if !url.is_empty() => {
             let database = DatabaseConfig::parse(url)?;
@@ -1629,7 +1633,10 @@ fn validate_governance_subject_binding(
     if chain_hash != did_document_stable_hash {
         return Err("governance_subject_metadata_hash_mismatch".to_owned());
     }
-    if subject_type == GovernanceSubjectType::Discovery {
+    if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) {
         let mut payload_domains = payload.authorized_domains.clone();
         let mut chain_domains = subject.authorized_domains.clone();
         payload_domains.sort();
@@ -1837,11 +1844,21 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 did_document_hash TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 capability_tags_json TEXT NOT NULL,
+                authorized_domains_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
             "#
         ))
         .await?;
+    sqlite
+        .execute_batch(&format!(
+            r#"
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN authorized_domains_json TEXT NOT NULL DEFAULT '[]';
+            "#
+        ))
+        .await
+        .ok();
     sqlite.ensure_leased_job_table(ROOT_CDN_JOB_TABLE).await?;
     sqlite
         .ensure_leased_job_table(ROOT_CDN_OUTBOX_TABLE)
@@ -1918,6 +1935,7 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 did_document_hash TEXT NOT NULL,
                 resource_type TEXT NOT NULL,
                 capability_tags_json JSONB NOT NULL,
+                authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
             CREATE INDEX IF NOT EXISTS idx_root_subject_versions_subject_version
@@ -1955,6 +1973,8 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 ADD COLUMN IF NOT EXISTS resource_type TEXT NOT NULL DEFAULT 'unknown';
             ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
                 ADD COLUMN IF NOT EXISTS capability_tags_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+                ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb;
             ALTER TABLE {ROOT_CDN_JOB_TABLE}
                 ADD COLUMN IF NOT EXISTS publication_cursor BIGINT;
             ALTER TABLE {ROOT_CDN_JOB_TABLE}
@@ -1971,6 +1991,10 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 ADD COLUMN IF NOT EXISTS resource_type TEXT;
             ALTER TABLE {ROOT_CDN_JOB_TABLE}
                 ADD COLUMN IF NOT EXISTS capability_tags_json JSONB;
+            ALTER TABLE {ROOT_CDN_JOB_TABLE}
+                ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB;
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb;
             CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_job_projection
             ON {ROOT_CDN_JOB_TABLE}(job_key, publication_cursor);
             CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_ready_projection
@@ -2044,9 +2068,16 @@ async fn verify_resource_and_publish(
     )
     .await
     .map_err(ApiError::forbidden)?;
+    let registrar_entry = load_authorized_registrar_entry(&state, &request.registrar_did)
+        .map_err(ApiError::forbidden)?;
 
     let mut metadata = build_resource_metadata(&request.submission)
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    validate_resource_authorized_domains(
+        &metadata.authorized_domains,
+        &registrar_entry.authorized_domains,
+    )
+    .map_err(ApiError::bad_request)?;
     let root_suite = state.signing_key.crypto_suite();
     let did_document_hash =
         hash_json_with_suite(root_suite.clone(), &request.submission.did_document)
@@ -2091,6 +2122,7 @@ async fn verify_resource_and_publish(
         package_hash: request.submission.package_hash.clone(),
         hash_algorithm: request.submission.hash_algorithm.clone(),
         lifecycle_state: metadata.lifecycle_state.clone(),
+        authorized_domains: metadata.authorized_domains.clone(),
         bulletin_ref: metadata
             .protocol_bindings
             .iter()
@@ -2182,6 +2214,12 @@ async fn authorize_registrar(
         }),
     )
     .map_err(ApiError::internal)?;
+    let authorized_domains = request
+        .did_document
+        .oan_metadata
+        .as_ref()
+        .map(|metadata| metadata.authorized_domains.clone())
+        .unwrap_or_default();
     update_authorization_state(
         &state,
         &request.target_did,
@@ -2190,6 +2228,7 @@ async fn authorize_registrar(
             updated_at: Utc::now(),
             did_document_hash,
             did_document_snapshot: Some(request.did_document),
+            authorized_domains,
         },
         &request.target_role,
         None,
@@ -2299,6 +2338,11 @@ async fn issue_infrastructure_authorization_vc(
                     updated_at: Utc::now(),
                     did_document_hash: did_document_hash.clone(),
                     did_document_snapshot: Some(request.payload.did_document.clone()),
+                    authorized_domains: if subject_type == GovernanceSubjectType::Registrar {
+                        request.payload.authorized_domains.clone()
+                    } else {
+                        Vec::new()
+                    },
                 },
                 subject_type.label(),
                 None,
@@ -3021,7 +3065,15 @@ async fn api_registrars(State(state): State<AppState>) -> ApiResult<Value> {
     let items: Vec<Value> = authorization_state
         .registrars
         .into_iter()
-        .map(|(did, entry)| json!({ "did": did, "status": entry.status, "didDocumentHash": entry.did_document_hash, "updatedAt": entry.updated_at }))
+        .map(|(did, entry)| {
+            json!({
+                "did": did,
+                "status": entry.status,
+                "didDocumentHash": entry.did_document_hash,
+                "authorizedDomains": entry.authorized_domains,
+                "updatedAt": entry.updated_at
+            })
+        })
         .collect();
     let items = if items.is_empty() {
         let bulletin = read_bulletin(&state).map_err(ApiError::internal)?;
@@ -3130,7 +3182,7 @@ async fn api_discovery_detail(
                 )
         })
         .map(|event| event.core.payload.clone())
-        .unwrap_or_else(|| json!({"authorizedDomains": ["*"]}));
+        .unwrap_or_else(|| json!({"authorizedDomains": []}));
     Ok(Json(json!({
         "did": did,
         "status": latest_node_status(&bulletin, &did),
@@ -3427,6 +3479,69 @@ fn load_authorized_registrar_document(state: &AppState, did: &str) -> Result<Did
         .ok_or_else(|| anyhow!("authorized_registrar_document_missing"))
 }
 
+fn validate_authorized_domain_list(domains: &[String]) -> std::result::Result<(), String> {
+    if domains.iter().any(|domain| domain == "*") {
+        return if domains.len() == 1 {
+            Ok(())
+        } else {
+            Err("invalid_authorized_domains".to_owned())
+        };
+    }
+    for domain in domains {
+        if domain.trim().is_empty()
+            || domain != domain.trim()
+            || domain.contains("..")
+            || domain.starts_with('.')
+            || domain.ends_with('.')
+        {
+            return Err("invalid_authorized_domains".to_owned());
+        }
+    }
+    if domains.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err("invalid_authorized_domains".to_owned());
+    }
+    Ok(())
+}
+
+fn authorized_domain_covers(granted: &str, requested: &str) -> bool {
+    granted == requested
+        || requested
+            .strip_prefix(granted)
+            .is_some_and(|suffix| suffix.starts_with('.'))
+}
+
+fn authorized_domains_cover(granted: &[String], requested: &[String]) -> bool {
+    if requested.is_empty() {
+        return true;
+    }
+    if granted.iter().any(|domain| domain == "*") {
+        return true;
+    }
+    if granted.is_empty() {
+        return false;
+    }
+    requested.iter().all(|requested_domain| {
+        granted
+            .iter()
+            .any(|granted_domain| authorized_domain_covers(granted_domain, requested_domain))
+    })
+}
+
+fn validate_resource_authorized_domains(
+    resource_domains: &[String],
+    registrar_domains: &[String],
+) -> std::result::Result<(), String> {
+    if resource_domains.is_empty() {
+        return Err("resource_domains_required".to_owned());
+    }
+    validate_authorized_domain_list(resource_domains)?;
+    validate_authorized_domain_list(registrar_domains)?;
+    if !authorized_domains_cover(registrar_domains, resource_domains) {
+        return Err("unauthorized_domains".to_owned());
+    }
+    Ok(())
+}
+
 fn governance_subject_type_for_role(
     role: &str,
 ) -> std::result::Result<GovernanceSubjectType, String> {
@@ -3486,10 +3601,17 @@ async fn validate_authorization_vc_issue_request(
         Utc::now(),
     )
     .map_err(|err| err.to_string())?;
-    if subject_type == GovernanceSubjectType::Discovery
-        && request.payload.authorized_domains.is_empty()
+    if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) && request.payload.authorized_domains.is_empty()
     {
-        return Err("discovery_authorized_domains_required".to_owned());
+        return Err("infrastructure_authorized_domains_required".to_owned());
+    }
+    if subject_type == GovernanceSubjectType::VcIssuer
+        && !request.payload.authorized_domains.is_empty()
+    {
+        return Err("vc_issuer_authorized_domains_forbidden".to_owned());
     }
     if let Some(claimed_hash) =
         did_document_chain_governance_stable_hash(&request.payload.did_document)
@@ -3610,19 +3732,11 @@ fn validate_infrastructure_did_document_profile(
             return Err("did_document_endpoint_mismatch".to_owned());
         }
     }
-    if subject_type == GovernanceSubjectType::Discovery {
-        let metadata_domains = metadata
-            .extra
-            .get("authorizedDomains")
-            .and_then(Value::as_array)
-            .map(|domains| {
-                domains
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+    if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) {
+        let metadata_domains = metadata.authorized_domains.clone();
         let mut request_domains = payload.authorized_domains.clone();
         let mut metadata_domains_sorted = metadata_domains;
         request_domains.sort();
@@ -3850,6 +3964,18 @@ fn build_resource_metadata(
             .map(|value| value.capability_tags.clone())
             .unwrap_or_default()
     };
+    let authorized_domains = if let Some(domains) = metadata_value["authorizedDomains"].as_array() {
+        let domains = domains
+            .iter()
+            .filter_map(|value| value.as_str().map(ToOwned::to_owned))
+            .collect::<Vec<_>>();
+        if domains != oan_metadata.authorized_domains {
+            return Err(anyhow!("authorized_domains_mismatch"));
+        }
+        domains
+    } else {
+        oan_metadata.authorized_domains.clone()
+    };
     let lifecycle_state = metadata_value["lifecycleState"]
         .as_str()
         .unwrap_or_else(|| oan_metadata.lifecycle_state.as_deref().unwrap_or("active"))
@@ -3867,6 +3993,7 @@ fn build_resource_metadata(
         name,
         description: description_text,
         capability_tags,
+        authorized_domains,
         protocol_bindings: oan_metadata
             .protocol_bindings
             .iter()
@@ -5151,8 +5278,6 @@ mod tests {
             server_type: None,
             port: None,
         }];
-        let mut extra = BTreeMap::new();
-        extra.insert("authorizedDomains".to_owned(), json!(authorized_domains));
         document.oan_metadata = Some(OanMetadata {
             subject_type: ResourceType::InfrastructureNode,
             resource_type: ResourceType::InfrastructureNode,
@@ -5165,6 +5290,7 @@ mod tests {
             resource_description: None,
             agent_description: None,
             capability_tags: Vec::new(),
+            authorized_domains,
             protocol_bindings: Vec::new(),
             implementation_links: Vec::new(),
             credential_requirements: Vec::new(),
@@ -5172,7 +5298,7 @@ mod tests {
             service_policy: None,
             network_scope: None,
             lifecycle_state: Some("active".to_owned()),
-            extra,
+            extra: BTreeMap::new(),
         });
         document
     }
@@ -5224,6 +5350,7 @@ mod tests {
                 }),
                 agent_description: None,
                 capability_tags: vec!["legal.contract.review".to_owned()],
+                authorized_domains: vec!["legal".to_owned()],
                 protocol_bindings: vec![ProtocolBinding {
                     id: format!("{did}#binding-https"),
                     protocol: "https".to_owned(),
@@ -5258,6 +5385,8 @@ mod tests {
                 &did_document_with_key(root_did(), &root_key),
             )
             .unwrap();
+        let mut security = SecurityConfig::default();
+        security.trust_indexer.enabled = false;
         AppState {
             data: JsonStore::new(dir),
             config: Config {
@@ -5268,7 +5397,7 @@ mod tests {
                 cors: CorsConfig::default(),
                 debug: DebugConfig::default(),
                 events: EventStreamConfig::default(),
-                security: SecurityConfig::default(),
+                security,
                 paths: PathConfig {
                     data_dir: dir.to_path_buf(),
                     keys_dir: dir.join("keys"),
@@ -5459,12 +5588,13 @@ mod tests {
         active: bool,
         metadata_hash: String,
     ) {
+        let authorized_domains = vec!["*".to_owned()];
         let endpoint = mock_trust_indexer(
             active,
             GovernanceSubjectType::Registrar,
             registrar_did().to_owned(),
             metadata_hash,
-            Vec::new(),
+            authorized_domains,
         )
         .await;
         enable_trust_indexer(state, endpoint);
@@ -5477,12 +5607,18 @@ mod tests {
     ) -> InfrastructureAuthorizationVcIssueRequest {
         let subject_type = governance_subject_type_for_role(role).unwrap();
         let endpoint = "http://127.0.0.1:8101";
+        let authorized_domains = match subject_type {
+            GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery => {
+                vec!["*".to_owned()]
+            }
+            GovernanceSubjectType::VcIssuer => Vec::new(),
+        };
         let did_document = infrastructure_document_with_key(
             registrar_did(),
             subject_key,
             subject_type,
             endpoint,
-            Vec::new(),
+            authorized_domains.clone(),
         );
         let did_document_stable_hash =
             stable_did_document_hash_for_root(state, &did_document).unwrap();
@@ -5491,7 +5627,7 @@ mod tests {
             role: role.to_owned(),
             did_document,
             did_document_stable_hash,
-            authorized_domains: Vec::new(),
+            authorized_domains,
             endpoint: Some(endpoint.to_owned()),
         };
         let subject_signing_key = OanSigningKey::Ed25519 {
@@ -5529,7 +5665,37 @@ mod tests {
     }
 
     fn authorize_registrar(state: &AppState, key: &ed25519_dalek::SigningKey) {
-        let did_document = did_document_with_key(registrar_did(), key);
+        authorize_registrar_with_domains(state, key, vec!["*".to_owned()]);
+    }
+
+    fn authorize_registrar_with_domains(
+        state: &AppState,
+        key: &ed25519_dalek::SigningKey,
+        authorized_domains: Vec<String>,
+    ) {
+        let mut did_document = did_document_with_key(registrar_did(), key);
+        did_document.oan_metadata = Some(OanMetadata {
+            subject_type: ResourceType::InfrastructureNode,
+            resource_type: ResourceType::InfrastructureNode,
+            node_role: Some("registrar".to_owned()),
+            identity_type: Some("registrar-node".to_owned()),
+            controller_did: None,
+            publisher_did: None,
+            issuer_did: None,
+            ttl: None,
+            resource_description: None,
+            agent_description: None,
+            capability_tags: Vec::new(),
+            authorized_domains: authorized_domains.clone(),
+            protocol_bindings: Vec::new(),
+            implementation_links: Vec::new(),
+            credential_requirements: Vec::new(),
+            package_info: None,
+            service_policy: None,
+            network_scope: None,
+            lifecycle_state: Some("active".to_owned()),
+            extra: Default::default(),
+        });
         let did_document_hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &did_document).unwrap();
         let entry = NodeAuthorizationState {
@@ -5537,6 +5703,7 @@ mod tests {
             did_document_hash,
             did_document_snapshot: Some(did_document),
             updated_at: Utc::now(),
+            authorized_domains,
         };
         update_authorization_state(state, registrar_did(), entry, "registrar", None).unwrap();
     }
@@ -5836,6 +6003,107 @@ mod tests {
         let queue = read_cdn_queue(&state).await.unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].resource_did, resource_did());
+    }
+
+    #[tokio::test]
+    async fn verify_resource_and_publish_rejects_resource_domains_outside_registrar_scope() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar_with_domains(&state, &registrar_key, vec!["finance".to_owned()]);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+
+        let err = verify_resource_and_publish(State(state), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "unauthorized_domains");
+    }
+
+    #[test]
+    fn validate_resource_authorized_domains_enforces_shape_and_coverage() {
+        assert!(validate_resource_authorized_domains(
+            &["legal.contract".to_owned()],
+            &["legal".to_owned()]
+        )
+        .is_ok());
+        assert!(
+            validate_resource_authorized_domains(&["legal".to_owned()], &["*".to_owned()]).is_ok()
+        );
+        assert_eq!(
+            validate_resource_authorized_domains(&[], &["*".to_owned()]).unwrap_err(),
+            "resource_domains_required"
+        );
+        assert_eq!(
+            validate_resource_authorized_domains(
+                &["legal".to_owned()],
+                &["*".to_owned(), "finance".to_owned()]
+            )
+            .unwrap_err(),
+            "invalid_authorized_domains"
+        );
+        assert_eq!(
+            validate_resource_authorized_domains(
+                &["legal".to_owned(), "finance".to_owned()],
+                &["*".to_owned()]
+            )
+            .unwrap_err(),
+            "invalid_authorized_domains"
+        );
+        assert_eq!(
+            validate_resource_authorized_domains(&["legal".to_owned()], &["finance".to_owned()])
+                .unwrap_err(),
+            "unauthorized_domains"
+        );
+    }
+
+    #[test]
+    fn authorization_state_reads_legacy_snake_case_domain_fields() {
+        let json = json!({
+            "registrars": {
+                "did:oan:REG:legacy": {
+                    "status": "active",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "did_document_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "authorized_domains": ["legal"]
+                }
+            },
+            "discovery_nodes": {
+                "did:oan:DIS:legacy": {
+                    "status": "active",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                    "did_document_hash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "authorizedDomains": ["legal"],
+                    "tag_tree_version": 1
+                }
+            },
+            "vc_issuers": {}
+        });
+
+        let state: AuthorizationState = serde_json::from_value(json).unwrap();
+
+        assert_eq!(
+            state
+                .registrars
+                .get("did:oan:REG:legacy")
+                .unwrap()
+                .authorized_domains,
+            vec!["legal".to_owned()]
+        );
+        assert_eq!(
+            state
+                .discovery_nodes
+                .get("did:oan:DIS:legacy")
+                .unwrap()
+                .authorized_domains,
+            vec!["legal".to_owned()]
+        );
     }
 
     #[tokio::test]
@@ -6539,6 +6807,17 @@ mod tests {
     }
 
     #[test]
+    fn trust_indexer_is_enabled_by_default() {
+        let trust_indexer = TrustIndexerConfig::default();
+        assert!(trust_indexer.enabled);
+        assert_eq!(
+            trust_indexer.endpoint.as_deref(),
+            Some("http://127.0.0.1:8088")
+        );
+        assert_eq!(trust_indexer.fail_mode, "closed");
+    }
+
+    #[test]
     fn load_config_rejects_disabled_root_cdn_events() {
         let dir = tempdir().unwrap();
         let config_path = dir.path().join("root.toml");
@@ -6875,7 +7154,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
         let request = resource_verify_request(
             &state,
@@ -6885,6 +7164,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package = package_from_request(&state, &request);
         package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package).await.unwrap();
 
         let response = api_mark_cdn_publication_jobs_published(
@@ -6937,7 +7217,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
         let request = resource_verify_request(
             &state,
@@ -6947,6 +7227,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package = package_from_request(&state, &request);
         package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package).await.unwrap();
 
         let response = api_mark_cdn_publication_jobs_published(
@@ -7010,7 +7291,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
         let request = resource_verify_request(
             &state,
@@ -7020,6 +7301,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package = package_from_request(&state, &request);
         package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package).await.unwrap();
         let payload = Json(MarkCdnPublicationJobsPublishedRequest {
             jobs: vec![CdnPublicationJobCompletionRef {
@@ -7080,7 +7362,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
         let mut package = package_from_request(
             &state,
@@ -7092,6 +7374,7 @@ capability_tree_file = "../capability-tree.json"
             ),
         );
         package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package).await.unwrap();
         let job_key = format!("{}:{}", package.resource_did, package.package_version);
         let cursors = publication_cursors_for_jobs(&state, std::slice::from_ref(&job_key))
@@ -7146,7 +7429,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
         let request = resource_verify_request(
             &state,
@@ -7156,6 +7439,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package = package_from_request(&state, &request);
         package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package).await.unwrap();
 
         let err = api_mark_cdn_publication_jobs_published(
@@ -7198,7 +7482,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
 
         let matching_request = resource_verify_request_with_version(
@@ -7210,6 +7494,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut matching = package_from_request(&state, &matching_request);
         matching.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        matching.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &matching)
             .await
             .unwrap();
@@ -7223,6 +7508,8 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut unassigned = package_from_request(&state, &unassigned_request);
         unassigned.metadata.capability_tags = vec!["unassigned.openagenet.local.agent".to_owned()];
+        unassigned.metadata.authorized_domains =
+            vec!["sports_and_fitness.sports_technology".to_owned()];
         persist_resource_acceptance(&state, &unassigned)
             .await
             .unwrap();
@@ -7290,7 +7577,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
 
         let request = resource_verify_request_with_version(
@@ -7302,6 +7589,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package = package_from_request(&state, &request);
         package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package).await.unwrap();
         let job_key = format!("{}:{}", package.resource_did, package.package_version);
         let package_rows = resource_packages_for_jobs(&state, &[job_key])
@@ -7327,6 +7615,44 @@ capability_tree_file = "../capability-tree.json"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_notification_targets_ignore_matching_tags_without_domain_coverage() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        let registrar_key = generate_ed25519_keypair();
+        let discovery_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            "http://127.0.0.1:1",
+            vec!["technology.software_engineering".to_owned()],
+        );
+
+        let request = resource_verify_request_with_version(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+            "1",
+        );
+        let mut package = package_from_request(&state, &request);
+        package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains =
+            vec!["sports_and_fitness.sports_technology".to_owned()];
+
+        let auth = current_authorization_state(&state);
+        let items = repository::discovery_notification_targets_for_authorized_rows(
+            &[(package, 1)],
+            &auth.discovery_nodes,
+            &state.tag_tree,
+        );
+
+        assert!(items.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn authorized_discovery_summary_reads_versions_when_notification_store_is_empty() {
         let dir = tempdir().unwrap();
         let mut state = app_state_with_sqlite(dir.path()).await;
@@ -7338,7 +7664,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             "http://127.0.0.1:1",
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
 
         let resource_key_a = generate_ed25519_keypair();
@@ -7351,6 +7677,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package_a = package_from_request(&state, &request_a);
         package_a.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package_a.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package_a)
             .await
             .unwrap();
@@ -7365,6 +7692,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package_b = package_from_request(&state, &request_b);
         package_b.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package_b.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         package_b.resource_did = "did:oan:AGSG:derivedsummarysecondresource".to_owned();
         package_b.did_document.id = package_b.resource_did.clone();
         if let Some(method) = package_b.did_document.verification_method.get_mut(0) {
@@ -7751,7 +8079,7 @@ capability_tree_file = "../capability-tree.json"
             &state,
             &discovery_key,
             &format!("http://{addr}"),
-            vec!["openagenet.local".to_owned()],
+            vec!["technology.software_engineering".to_owned()],
         );
         let request = resource_verify_request(
             &state,
@@ -7761,6 +8089,7 @@ capability_tree_file = "../capability-tree.json"
         );
         let mut package = package_from_request(&state, &request);
         package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+        package.metadata.authorized_domains = vec!["technology.software_engineering".to_owned()];
         persist_resource_acceptance(&state, &package).await.unwrap();
 
         let _response = api_mark_cdn_publication_jobs_published(

@@ -58,6 +58,11 @@ the publication stream.
 
 ## Local Run
 
+Root consumes the local `oan-trust-indexer` by default. Start the indexer first
+or use the official ops topology harness that starts it alongside Root. Root
+does not hold governance keys and does not submit chain transactions while
+reading indexer state.
+
 ```powershell
 cargo run -p root-node
 ```

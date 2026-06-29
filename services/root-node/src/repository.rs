@@ -32,6 +32,7 @@ struct PublicationProjectionRow {
     did_document_hash: String,
     resource_type: String,
     capability_tags: Vec<String>,
+    authorized_domains: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -45,6 +46,7 @@ struct PostgresDiscoveryNotificationItemRow<'a> {
     did_document_hash: &'a str,
     resource_type: &'a str,
     capability_tags_json: Vec<String>,
+    authorized_domains_json: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -587,9 +589,9 @@ pub(super) async fn persist_resource_acceptance_impl(
             r#"
             INSERT INTO {ROOT_SUBJECT_VERSION_TABLE}(
                 subject_did, version, did_document_hash, metadata_hash, package_hash, resource_type,
-                capability_tags_json, package_json, archive_path, accepted_at
+                capability_tags_json, authorized_domains_json, package_json, archive_path, accepted_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9, $10::timestamptz)
+            VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10, $11::timestamptz)
             ON CONFLICT(subject_did, version)
             DO UPDATE SET
                 did_document_hash = excluded.did_document_hash,
@@ -597,6 +599,7 @@ pub(super) async fn persist_resource_acceptance_impl(
                 package_hash = excluded.package_hash,
                 resource_type = excluded.resource_type,
                 capability_tags_json = excluded.capability_tags_json,
+                authorized_domains_json = excluded.authorized_domains_json,
                 package_json = excluded.package_json,
                 archive_path = excluded.archive_path,
                 accepted_at = excluded.accepted_at
@@ -610,6 +613,7 @@ pub(super) async fn persist_resource_acceptance_impl(
         .bind(&package.package_hash)
         .bind(&resource_type)
         .bind(sqlx::types::Json(package.metadata.capability_tags.clone()))
+        .bind(sqlx::types::Json(package.metadata.authorized_domains.clone()))
         .bind(&package_json)
         .bind(&archive_path)
         .bind(&now)
@@ -644,9 +648,10 @@ pub(super) async fn persist_resource_acceptance_impl(
             INSERT INTO {ROOT_CDN_JOB_TABLE}(
                 job_key, payload_json, status, attempt_count, lease_owner, lease_expires_at,
                 next_attempt_at, last_error, publication_cursor, resource_did, package_version,
-                package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
+                package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json,
+                authorized_domains_json
             )
-            VALUES ($1, $2, 'ready', 0, NULL, NULL, $3::timestamptz, NULL, $4, $5, $6, $7, $8, $9, $10, $11::jsonb)
+            VALUES ($1, $2, 'ready', 0, NULL, NULL, $3::timestamptz, NULL, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12::jsonb)
             ON CONFLICT(job_key)
             DO UPDATE SET
                 payload_json = excluded.payload_json,
@@ -663,6 +668,7 @@ pub(super) async fn persist_resource_acceptance_impl(
                 did_document_hash = excluded.did_document_hash,
                 resource_type = excluded.resource_type,
                 capability_tags_json = excluded.capability_tags_json,
+                authorized_domains_json = excluded.authorized_domains_json,
                 last_error = NULL,
                 updated_at = CURRENT_TIMESTAMP
             "#
@@ -678,6 +684,7 @@ pub(super) async fn persist_resource_acceptance_impl(
         .bind(&package.did_document_hash)
         .bind(&resource_type)
         .bind(sqlx::types::Json(package.metadata.capability_tags.clone()))
+        .bind(sqlx::types::Json(package.metadata.authorized_domains.clone()))
         .execute(&mut *tx)
         .await?;
 
@@ -1352,7 +1359,8 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     r#"
                     INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
                         discovery_did, publication_cursor, resource_did, package_version,
-                        package_hash, metadata_hash, did_document_hash, resource_type, capability_tags_json
+                        package_hash, metadata_hash, did_document_hash, resource_type,
+                        capability_tags_json, authorized_domains_json
                     )
                     "#
                 ));
@@ -1367,6 +1375,10 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                         .push_bind(&item.item.resource_type)
                         .push_bind(
                             serde_json::to_string(&item.item.capability_tags)
+                                .unwrap_or_else(|_| "[]".to_owned()),
+                        )
+                        .push_bind(
+                            serde_json::to_string(&item.item.authorized_domains)
                                 .unwrap_or_else(|_| "[]".to_owned()),
                         );
                 });
@@ -1457,6 +1469,7 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     did_document_hash: &item.item.did_document_hash,
                     resource_type: &item.item.resource_type,
                     capability_tags_json: item.item.capability_tags.clone(),
+                    authorized_domains_json: item.item.authorized_domains.clone(),
                 })
                 .collect::<Vec<_>>();
             let payload = serde_json::to_value(&rows)?;
@@ -1471,7 +1484,8 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     metadata_hash,
                     did_document_hash,
                     resource_type,
-                    capability_tags_json
+                    capability_tags_json,
+                    authorized_domains_json
                 )
                 SELECT
                     entry.discovery_did,
@@ -1482,7 +1496,8 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     entry.metadata_hash,
                     entry.did_document_hash,
                     entry.resource_type,
-                    entry.capability_tags_json
+                    entry.capability_tags_json,
+                    entry.authorized_domains_json
                 FROM jsonb_to_recordset($1::jsonb) AS entry(
                     discovery_did text,
                     publication_cursor bigint,
@@ -1492,7 +1507,8 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     metadata_hash text,
                     did_document_hash text,
                     resource_type text,
-                    capability_tags_json jsonb
+                    capability_tags_json jsonb,
+                    authorized_domains_json jsonb
                 )
                 ON CONFLICT(discovery_did, publication_cursor) DO NOTHING
                 "#
@@ -2047,7 +2063,8 @@ async fn postgres_publication_projections_for_jobs(
                COALESCE(jobs.metadata_hash, versions.metadata_hash) AS metadata_hash,
                COALESCE(jobs.did_document_hash, versions.did_document_hash) AS did_document_hash,
                COALESCE(jobs.resource_type, versions.resource_type) AS resource_type,
-               COALESCE(jobs.capability_tags_json::text, versions.capability_tags_json::text, '[]')
+               COALESCE(jobs.capability_tags_json::text, versions.capability_tags_json::text, '[]'),
+               COALESCE(jobs.authorized_domains_json::text, versions.authorized_domains_json::text, '[]')
         FROM requested
         LEFT JOIN {ROOT_CDN_JOB_TABLE} AS jobs
           ON jobs.job_key = requested.job_key
@@ -2086,6 +2103,11 @@ async fn postgres_publication_projections_for_jobs(
             .map(|value| serde_json::from_str::<Vec<String>>(&value))
             .transpose()?
             .unwrap_or_default();
+        let authorized_domains = row
+            .try_get::<Option<String>, _>(10)?
+            .map(|value| serde_json::from_str::<Vec<String>>(&value))
+            .transpose()?
+            .unwrap_or_default();
         items.insert(
             job_key,
             PublicationProjectionRow {
@@ -2100,6 +2122,7 @@ async fn postgres_publication_projections_for_jobs(
                 did_document_hash,
                 resource_type,
                 capability_tags,
+                authorized_domains,
             },
         );
     }
@@ -2117,7 +2140,8 @@ async fn postgres_publication_projection_rows_by_cursor_range(
     let rows = sqlx::query(&format!(
         r#"
         SELECT publication_cursor, subject_did, version, package_hash, metadata_hash,
-               did_document_hash, resource_type, capability_tags_json::text
+               did_document_hash, resource_type, capability_tags_json::text,
+               authorized_domains_json::text
         FROM {ROOT_SUBJECT_VERSION_TABLE}
         WHERE publication_cursor > $1 AND publication_cursor <= $2
         ORDER BY publication_cursor
@@ -2139,6 +2163,7 @@ async fn postgres_publication_projection_rows_by_cursor_range(
                 did_document_hash: row.get::<String, _>(5),
                 resource_type: row.get::<String, _>(6),
                 capability_tags: serde_json::from_str::<Vec<String>>(&row.get::<String, _>(7))?,
+                authorized_domains: serde_json::from_str::<Vec<String>>(&row.get::<String, _>(8))?,
             })
         })
         .collect()
@@ -2182,13 +2207,35 @@ fn discovery_notification_item_from_projection(
         did_document_hash: row.did_document_hash,
         resource_type: row.resource_type,
         capability_tags: row.capability_tags,
+        authorized_domains: row.authorized_domains,
     }
+}
+
+fn authorized_domains_match(resource_domains: &[String], discovery_domains: &[String]) -> bool {
+    if discovery_domains.iter().any(|domain| domain == "*") {
+        return true;
+    }
+    if resource_domains.is_empty() || discovery_domains.is_empty() {
+        return false;
+    }
+    resource_domains.iter().all(|resource_domain| {
+        discovery_domains
+            .iter()
+            .any(|discovery_domain| domain_covers(discovery_domain, resource_domain))
+    })
+}
+
+fn domain_covers(granted_domain: &str, resource_domain: &str) -> bool {
+    granted_domain == resource_domain
+        || resource_domain
+            .strip_prefix(granted_domain)
+            .is_some_and(|suffix| suffix.starts_with('.'))
 }
 
 pub(super) fn discovery_notification_targets_for_authorized_rows(
     packages: &[(ResourcePackage, i64)],
     discovery_nodes: &BTreeMap<String, DiscoveryAuthorizationState>,
-    tag_tree: &CapabilityTagTree,
+    _tag_tree: &CapabilityTagTree,
 ) -> Vec<DiscoveryNotificationTargetItem> {
     if packages.is_empty() {
         return Vec::new();
@@ -2214,10 +2261,10 @@ pub(super) fn discovery_notification_targets_for_authorized_rows(
                 .and_then(|value| value.as_str().map(ToOwned::to_owned))
                 .unwrap_or_else(|| "unknown".to_owned()),
             capability_tags: package.metadata.capability_tags.clone(),
+            authorized_domains: package.metadata.authorized_domains.clone(),
         };
         for (discovery_did, auth) in &active_discoveries {
-            if tag_tree.matches_authorized_domains(&item.capability_tags, &auth.authorized_domains)
-            {
+            if authorized_domains_match(&item.authorized_domains, &auth.authorized_domains) {
                 items.push(DiscoveryNotificationTargetItem {
                     discovery_did: (*discovery_did).clone(),
                     item: item.clone(),
@@ -2244,7 +2291,7 @@ pub(super) fn discovery_target_cursors_from_items(
 fn discovery_notification_targets_for_projection_rows(
     rows: &[PublicationProjectionRow],
     discovery_nodes: &BTreeMap<String, DiscoveryAuthorizationState>,
-    tag_tree: &CapabilityTagTree,
+    _tag_tree: &CapabilityTagTree,
 ) -> (Vec<DiscoveryNotificationTargetItem>, BTreeMap<String, i64>) {
     if rows.is_empty() {
         return (Vec::new(), BTreeMap::new());
@@ -2261,8 +2308,7 @@ fn discovery_notification_targets_for_projection_rows(
     for row in rows {
         let item = discovery_notification_item_from_projection(row.clone());
         for (discovery_did, auth) in &active_discoveries {
-            if tag_tree.matches_authorized_domains(&item.capability_tags, &auth.authorized_domains)
-            {
+            if authorized_domains_match(&item.authorized_domains, &auth.authorized_domains) {
                 items.push(DiscoveryNotificationTargetItem {
                     discovery_did: (*discovery_did).clone(),
                     item: item.clone(),
@@ -2329,8 +2375,8 @@ pub(super) async fn authorized_discovery_summary_items_impl(
             }
             let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
             let item = discovery_notification_item_from_package(publication_cursor, package)?;
-            if state.tag_tree.matches_authorized_domains(
-                &item.capability_tags,
+            if authorized_domains_match(
+                &item.authorized_domains,
                 &discovery_auth.authorized_domains,
             ) {
                 items_by_cursor.insert(publication_cursor, item);
@@ -2350,8 +2396,8 @@ pub(super) async fn authorized_discovery_summary_items_impl(
                 continue;
             }
             let item = discovery_notification_item_from_projection(row);
-            if state.tag_tree.matches_authorized_domains(
-                &item.capability_tags,
+            if authorized_domains_match(
+                &item.authorized_domains,
                 &discovery_auth.authorized_domains,
             ) {
                 items_by_cursor.insert(publication_cursor, item);
@@ -2372,7 +2418,8 @@ async fn load_authorized_discovery_summary_items_from_store(
         let db_rows = sqlx::query(&format!(
             r#"
             SELECT publication_cursor, resource_did, package_version, package_hash,
-                   metadata_hash, did_document_hash, resource_type, capability_tags_json
+                   metadata_hash, did_document_hash, resource_type, capability_tags_json,
+                   authorized_domains_json
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
             WHERE discovery_did = ? AND publication_cursor > ? AND publication_cursor <= ?
             ORDER BY publication_cursor
@@ -2395,6 +2442,9 @@ async fn load_authorized_discovery_summary_items_from_store(
                     did_document_hash: row.get::<String, _>(5),
                     resource_type: row.get::<String, _>(6),
                     capability_tags: serde_json::from_str::<Vec<String>>(&row.get::<String, _>(7))?,
+                    authorized_domains: serde_json::from_str::<Vec<String>>(
+                        &row.get::<String, _>(8),
+                    )?,
                 })
             })
             .collect();
@@ -2403,7 +2453,8 @@ async fn load_authorized_discovery_summary_items_from_store(
             r#"
             SELECT publication_cursor, resource_did, package_version, package_hash,
                    metadata_hash, did_document_hash, resource_type,
-                   capability_tags_json::text
+                   capability_tags_json::text,
+                   authorized_domains_json::text
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
             WHERE discovery_did = $1 AND publication_cursor > $2 AND publication_cursor <= $3
             ORDER BY publication_cursor
@@ -2426,6 +2477,9 @@ async fn load_authorized_discovery_summary_items_from_store(
                     did_document_hash: row.get::<String, _>(5),
                     resource_type: row.get::<String, _>(6),
                     capability_tags: serde_json::from_str::<Vec<String>>(&row.get::<String, _>(7))?,
+                    authorized_domains: serde_json::from_str::<Vec<String>>(
+                        &row.get::<String, _>(8),
+                    )?,
                 })
             })
             .collect();
@@ -2449,5 +2503,6 @@ fn discovery_notification_item_from_package(
             .and_then(|value| value.as_str().map(ToOwned::to_owned))
             .unwrap_or_else(|| "unknown".to_owned()),
         capability_tags: package.metadata.capability_tags,
+        authorized_domains: package.metadata.authorized_domains,
     })
 }

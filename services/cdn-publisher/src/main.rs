@@ -1485,6 +1485,7 @@ mod tests {
                 name: "Sample".to_owned(),
                 description: "Sample resource".to_owned(),
                 capability_tags: vec![],
+                authorized_domains: vec![],
                 protocol_bindings: vec![],
                 services: vec![],
                 publisher_did: Some("did:oan:AGRG:registrar".to_owned()),

@@ -21,8 +21,8 @@ mode = "static-token"
 static_tokens = ["local-dev-admin-token"]
 
 [security.trust_indexer]
-enabled = false
-endpoint = "http://127.0.0.1:9100"
+enabled = true
+endpoint = "http://127.0.0.1:8088"
 fail_mode = "closed"
 timeout_ms = 500
 poll_interval_ms = 3000
