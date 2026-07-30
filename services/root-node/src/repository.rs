@@ -350,10 +350,28 @@ pub(super) fn sync_discovery_target_state_impl(
                     last_error,
                     updated_at
                 )
-                VALUES (?, 0, 0, ?, 0, NULL, NULL, ?, NULL, ?)
+                VALUES (
+                    ?,
+                    CASE
+                        WHEN ? = 'active' THEN COALESCE((SELECT MAX(publication_cursor) FROM {ROOT_SUBJECT_VERSION_TABLE}), 0)
+                        ELSE 0
+                    END,
+                    0,
+                    ?,
+                    0,
+                    NULL,
+                    NULL,
+                    ?,
+                    NULL,
+                    ?
+                )
                 ON CONFLICT(discovery_did)
                 DO UPDATE SET
                     status = excluded.status,
+                    pending_cursor = CASE
+                        WHEN excluded.status = 'active' THEN MAX({ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor, excluded.pending_cursor)
+                        ELSE {ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor
+                    END,
                     next_attempt_at = CASE
                         WHEN excluded.status = 'revoked' THEN {ROOT_DISCOVERY_TARGET_TABLE}.next_attempt_at
                         ELSE ?
@@ -374,6 +392,7 @@ pub(super) fn sync_discovery_target_state_impl(
                 "#
             ))
             .bind(&did)
+            .bind(&auth_status)
             .bind(&auth_status)
             .bind(&now)
             .bind(&now)
@@ -399,10 +418,28 @@ pub(super) fn sync_discovery_target_state_impl(
                     last_error,
                     updated_at
                 )
-                VALUES ($1, 0, 0, $2, 0, NULL, NULL, $3::timestamptz, NULL, $4::timestamptz)
+                VALUES (
+                    $1,
+                    CASE
+                        WHEN $2 = 'active' THEN COALESCE((SELECT MAX(publication_cursor) FROM {ROOT_SUBJECT_VERSION_TABLE}), 0)
+                        ELSE 0
+                    END,
+                    0,
+                    $2,
+                    0,
+                    NULL,
+                    NULL,
+                    $3::timestamptz,
+                    NULL,
+                    $4::timestamptz
+                )
                 ON CONFLICT(discovery_did)
                 DO UPDATE SET
                     status = excluded.status,
+                    pending_cursor = CASE
+                        WHEN excluded.status = 'active' THEN GREATEST({ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor, excluded.pending_cursor)
+                        ELSE {ROOT_DISCOVERY_TARGET_TABLE}.pending_cursor
+                    END,
                     next_attempt_at = CASE
                         WHEN excluded.status = 'revoked' THEN {ROOT_DISCOVERY_TARGET_TABLE}.next_attempt_at
                         ELSE $5::timestamptz
