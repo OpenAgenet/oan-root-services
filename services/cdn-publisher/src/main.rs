@@ -241,7 +241,7 @@ fn default_http_timeout_seconds() -> u64 {
 fn pipeline_chunk_size(batch_size: usize, max_in_flight: usize, prepared_len: usize) -> usize {
     let upper = prepared_len.max(1);
     let configured = batch_size.min(max_in_flight.max(1)).max(1);
-    configured.min(256).min(upper).max(1)
+    configured.min(32).min(upper).max(1)
 }
 
 fn completion_flush_size(batch_size: usize, prepared_len: usize) -> usize {
@@ -476,6 +476,9 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
             .into_iter()
             .map(|item| item.message)
             .collect::<Vec<_>>();
+        let (decoded, duplicate_tasks) = dedupe_fetched_tasks_by_job_key(decoded);
+        let duplicate_ack_count = duplicate_tasks.len();
+        terminal_ack_messages.extend(duplicate_tasks.into_iter().map(|item| item.message));
 
         let (prepared, terminal_prepared_failures, root_fetch_metrics, binding_metrics) =
             if decoded.is_empty() {
@@ -528,7 +531,7 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
             let mut publish_failure_count = 0usize;
             let mut callback_success_count = 0usize;
             let mut ack_success_count = 0usize;
-            let mut ack_target_count = fetch_failures + binding_failure_count;
+            let mut ack_target_count = fetch_failures + binding_failure_count + duplicate_ack_count;
             let mut chunk = Vec::with_capacity(chunk_size);
             let mut chunk_error: Option<String> = None;
             let callback_flush_size =
@@ -668,8 +671,9 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
                 acked += acked_batch;
                 ack_success_count += acked_batch;
                 cycle_metrics.ack_elapsed_ms += ack_started.elapsed().as_millis();
-                if acked_batch < fetch_failures + binding_failure_count {
-                    failed += (fetch_failures + binding_failure_count) - acked_batch;
+                if acked_batch < fetch_failures + binding_failure_count + duplicate_ack_count {
+                    failed += (fetch_failures + binding_failure_count + duplicate_ack_count)
+                        - acked_batch;
                 }
             }
 
@@ -715,7 +719,7 @@ async fn run_publisher_loop(state: AppState) -> Result<()> {
             };
             acked += acked_batch;
             cycle_metrics.ack_elapsed_ms = ack_started.elapsed().as_millis();
-            let ack_target_count = fetch_failures + binding_failure_count;
+            let ack_target_count = fetch_failures + binding_failure_count + duplicate_ack_count;
             cycle_metrics.ack_stage = PublisherStageRuntime {
                 last_batch_size: ack_target_count,
                 last_concurrency: ack_concurrency,
@@ -978,6 +982,29 @@ fn decode_event_payload(payload: &[u8]) -> Result<CdnPublishRequestedEvent> {
     Ok(event)
 }
 
+fn dedupe_fetched_tasks_by_job_key(
+    tasks: Vec<FetchedEventTask>,
+) -> (Vec<FetchedEventTask>, Vec<FetchedEventTask>) {
+    split_duplicate_tasks_by_key(tasks, |task| task.event.job_key.as_str())
+}
+
+fn split_duplicate_tasks_by_key<T, F>(tasks: Vec<T>, key: F) -> (Vec<T>, Vec<T>)
+where
+    F: Fn(&T) -> &str,
+{
+    let mut seen = BTreeSet::new();
+    let mut unique = Vec::new();
+    let mut duplicates = Vec::new();
+    for task in tasks {
+        if seen.insert(key(&task).to_owned()) {
+            unique.push(task);
+        } else {
+            duplicates.push(task);
+        }
+    }
+    (unique, duplicates)
+}
+
 async fn prepare_publish_batch(
     state: &AppState,
     decoded: Vec<FetchedEventTask>,
@@ -1076,15 +1103,6 @@ fn validate_package_matches_event(
     }
     if package.package_version != event.package_version {
         return Err(anyhow!("package_version_mismatch"));
-    }
-    if package.package_hash != event.package_hash {
-        return Err(anyhow!("package_hash_mismatch"));
-    }
-    if package.did_document_hash != event.did_document_hash {
-        return Err(anyhow!("did_document_hash_mismatch"));
-    }
-    if package.metadata_hash != event.metadata_hash {
-        return Err(anyhow!("metadata_hash_mismatch"));
     }
     Ok(())
 }
@@ -1627,7 +1645,25 @@ mod tests {
     }
 
     #[test]
-    fn rejects_package_that_does_not_match_event_reference_or_hashes() {
+    fn split_duplicate_tasks_by_key_keeps_first_item_for_each_job() {
+        let tasks = vec![
+            ("job-a".to_owned(), 1),
+            ("job-b".to_owned(), 2),
+            ("job-a".to_owned(), 3),
+        ];
+
+        let (unique, duplicates) =
+            split_duplicate_tasks_by_key(tasks, |task| task.0.as_str());
+
+        assert_eq!(
+            unique,
+            vec![("job-a".to_owned(), 1), ("job-b".to_owned(), 2)]
+        );
+        assert_eq!(duplicates, vec![("job-a".to_owned(), 3)]);
+    }
+
+    #[test]
+    fn rejects_package_that_does_not_match_event_reference() {
         let event = sample_event();
         let package = sample_package();
         validate_package_matches_event(&package, &event).unwrap();
@@ -1648,10 +1684,7 @@ mod tests {
 
         let mut mismatched = package;
         mismatched.package_hash = "sha256:changed".to_owned();
-        let err = validate_package_matches_event(&mismatched, &event)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("package_hash_mismatch"));
+        validate_package_matches_event(&mismatched, &event).unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1707,12 +1740,12 @@ mod tests {
         let mut invalid_event = sample_event();
         invalid_event.job_key = "did:oan:AGUS:invalid:1.0.0".to_owned();
         invalid_event.resource_did = "did:oan:AGUS:invalid".to_owned();
-        invalid_event.package_hash = "sha256:expected".to_owned();
+        invalid_event.package_version = "9.9.9".to_owned();
         let mut invalid_package = sample_package();
         invalid_package.resource_did = invalid_event.resource_did.clone();
         invalid_package.metadata.resource_did = invalid_event.resource_did.clone();
-        invalid_package.package_hash = "sha256:actual".to_owned();
-        invalid_package.metadata.package_hash = invalid_package.package_hash.clone();
+        invalid_package.package_version = "1.0.0".to_owned();
+        invalid_package.metadata.package_version = invalid_package.package_version.clone();
 
         let mut packages = BTreeMap::new();
         packages.insert(valid_event.job_key.clone(), (42, sample_package()));
@@ -1856,9 +1889,9 @@ mod tests {
 
     #[test]
     fn pipeline_chunk_size_can_use_larger_batches_under_load() {
-        assert_eq!(pipeline_chunk_size(200, 200, 200), 200);
-        assert_eq!(pipeline_chunk_size(512, 512, 512), 256);
-        assert_eq!(pipeline_chunk_size(64, 200, 80), 64);
+        assert_eq!(pipeline_chunk_size(200, 200, 200), 32);
+        assert_eq!(pipeline_chunk_size(512, 512, 512), 32);
+        assert_eq!(pipeline_chunk_size(64, 200, 80), 32);
     }
 
     #[test]

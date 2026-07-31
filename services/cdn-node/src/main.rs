@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use axum::{
+    extract::DefaultBodyLimit,
     extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
@@ -42,6 +43,7 @@ use tower_http::cors::{AllowHeaders, AllowOrigin, CorsLayer};
 const CDN_PUBLISH_HISTORY_TABLE: &str = "cdn_publish_history";
 const CDN_ROOT_META_TABLE: &str = "cdn_root_meta";
 const CDN_RESOURCE_PACKAGE_TABLE: &str = "cdn_resource_packages";
+const MAX_BATCH_PUBLISH_BODY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 struct ResourceIndexQuery {
@@ -303,6 +305,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .merge(public_routes)
         .merge(admin_routes)
+        .layer(DefaultBodyLimit::max(MAX_BATCH_PUBLISH_BODY_BYTES))
         .with_state(state.clone());
 
     if (state.sqlite.is_some() || state.postgres.is_some()) && state.config.debug.export_snapshots {
@@ -665,8 +668,9 @@ async fn persist_published_resources_batch(
     state: &AppState,
     items: &[ResourceCdnPublishBatchItem],
 ) -> Result<()> {
+    let items = dedupe_publish_items_by_did(items);
     if state.sqlite.is_none() && state.postgres.is_none() {
-        for item in items {
+        for item in &items {
             let package = &item.package;
             let file = did_to_file_name(&package.resource_did);
             state
@@ -678,7 +682,23 @@ async fn persist_published_resources_batch(
             state.data.write(format!("resources/{file}"), package)?;
         }
     }
-    upsert_resource_index_batch(state, items).await
+    upsert_resource_index_batch(state, &items).await
+}
+
+fn dedupe_publish_items_by_did(
+    items: &[ResourceCdnPublishBatchItem],
+) -> Vec<ResourceCdnPublishBatchItem> {
+    let mut deduped = BTreeMap::<String, ResourceCdnPublishBatchItem>::new();
+    for item in items {
+        let did = item.package.resource_did.clone();
+        match deduped.get(&did) {
+            Some(existing) if existing.publication_cursor >= item.publication_cursor => {}
+            _ => {
+                deduped.insert(did, item.clone());
+            }
+        }
+    }
+    deduped.into_values().collect()
 }
 
 async fn get_resource_package(
@@ -2071,6 +2091,61 @@ mod tests {
         );
         assert_eq!(page.0["nextCursor"], 9);
         assert_eq!(page.0["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn publish_resources_batch_accepts_duplicate_did_and_indexes_latest_cursor() {
+        let dir = tempdir().unwrap();
+        let sqlite =
+            SqliteJsonStore::connect(&format!("sqlite:{}", dir.path().join("cdn.db").display()))
+                .await
+                .unwrap();
+        initialize_cdn_sqlite(&sqlite).await.unwrap();
+        let mut state = app_state(dir.path());
+        state.sqlite = Some(sqlite);
+        let mut first = sample_resource_package();
+        first.package_version = "1.0.0".to_owned();
+        let mut second = first.clone();
+        second.package_version = "1.1.0".to_owned();
+        second.metadata.package_version = "1.1.0".to_owned();
+        refresh_resource_package_hashes(&mut second);
+        let request = signed_resource_batch_publish_request(
+            &state,
+            vec![
+                ResourceCdnPublishBatchItem {
+                    publication_cursor: 7,
+                    package: first,
+                },
+                ResourceCdnPublishBatchItem {
+                    publication_cursor: 9,
+                    package: second.clone(),
+                },
+            ],
+        );
+
+        let response = publish_resources_batch(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        assert_eq!(response.0["acceptedCount"], 2);
+        assert_eq!(response.0["failedCount"], 0);
+        assert_eq!(response.0["items"].as_array().unwrap().len(), 2);
+
+        let page = api_resource_index(
+            State(state),
+            Query(ResourceIndexQuery {
+                after_cursor: Some(0),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(page.0["count"], 1);
+        assert_eq!(page.0["items"][0]["cursor"], 9);
+        assert_eq!(page.0["items"][0]["package"]["packageVersion"], "1.1.0");
+        assert_eq!(
+            page.0["items"][0]["package"]["resourceDid"],
+            second.resource_did
+        );
     }
 
     #[tokio::test]
