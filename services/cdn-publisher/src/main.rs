@@ -339,6 +339,7 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(err) = run_publisher_loop(worker_state).await {
             eprintln!("cdn-publisher loop stopped: {err}");
+            std::process::exit(1);
         }
     });
 
