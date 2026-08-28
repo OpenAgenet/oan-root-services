@@ -547,6 +547,15 @@ pub(super) async fn persist_resource_acceptance_impl(
         .get::<i64, _>(0);
 
         sqlx::query(&format!(
+            "UPDATE {ROOT_SUBJECT_VERSION_TABLE} SET publication_cursor = ? WHERE subject_did = ? AND version = ?"
+        ))
+        .bind(publication_cursor)
+        .bind(resource_did)
+        .bind(version)
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query(&format!(
             r#"
             INSERT INTO {ROOT_CDN_JOB_TABLE}(job_key, payload_json, status, attempt_count, lease_owner, lease_expires_at, next_attempt_at, last_error)
             VALUES (?, ?, 'ready', 0, NULL, NULL, ?, NULL)

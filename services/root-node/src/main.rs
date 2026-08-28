@@ -1803,6 +1803,7 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 updated_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS {ROOT_SUBJECT_VERSION_TABLE} (
+                publication_cursor INTEGER UNIQUE,
                 subject_did TEXT NOT NULL,
                 version TEXT NOT NULL,
                 did_document_hash TEXT NOT NULL,
@@ -1853,6 +1854,8 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
     sqlite
         .execute_batch(&format!(
             r#"
+            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+                ADD COLUMN publication_cursor INTEGER;
             ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
                 ADD COLUMN authorized_domains_json TEXT NOT NULL DEFAULT '[]';
             "#
@@ -4823,7 +4826,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                     .client
                     .post(&sync_url)
                     .json(&json!({
-                        "maxPublications": state.config.security.workers.discovery_batch_size,
+                        "maxPublications": max_items,
                         "cursorHint": batch_target_cursor,
                         "items": summary_items
                     }))
@@ -8044,6 +8047,64 @@ capability_tree_file = "../capability-tree.json"
         let status = api_status(State(state)).await.unwrap();
         assert_eq!(status.0["discoveryReadyQueueCount"], 1);
         assert_eq!(status.0["discoveryPendingQueueCount"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_discovery_notify_cycle_sends_effective_max_publications() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state.tag_tree = openagenet_test_tag_tree();
+        state.config.security.workers.discovery_batch_size = 100;
+        state.config.security.workers.discovery_concurrency = 4;
+        let payloads = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let captured_payloads = payloads.clone();
+        let app = Router::new().route(
+            "/discovery/resources/sync-authorized",
+            post(move |Json(payload): Json<Value>| {
+                let captured_payloads = captured_payloads.clone();
+                async move {
+                    captured_payloads.lock().unwrap().push(payload.clone());
+                    let to_cursor = payload
+                        .get("cursorHint")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default();
+                    Json(json!({"status": "synced", "toCursor": to_cursor}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let discovery_key = generate_ed25519_keypair();
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        authorize_discovery_with_endpoint(&state, &discovery_key, &format!("http://{addr}"));
+        for version in 1..=450 {
+            let request = resource_verify_request_with_version(
+                &state,
+                &registrar_key,
+                &resource_key,
+                PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+                &version.to_string(),
+            );
+            let mut package = package_from_request(&state, &request);
+            package.metadata.capability_tags = vec!["openagenet.local.agent".to_owned()];
+            package.metadata.authorized_domains = vec!["*".to_owned()];
+            persist_resource_acceptance(&state, &package).await.unwrap();
+        }
+        sync_discovery_target_state(&state, discovery_did(), "active").unwrap();
+
+        let result = run_discovery_notify_cycle(&state).await.unwrap();
+
+        assert_eq!(result["successCount"], 1);
+        let payloads = payloads.lock().unwrap();
+        let payload = payloads.first().expect("sync payload should be captured");
+        assert_eq!(payload["maxPublications"], 400);
+        assert_eq!(payload["items"].as_array().unwrap().len(), 400);
     }
 
     #[tokio::test(flavor = "multi_thread")]
