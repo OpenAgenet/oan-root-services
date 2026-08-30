@@ -1108,7 +1108,6 @@ async fn main() -> Result<()> {
             "/root/infrastructure/authorization-vcs/issue",
             post(issue_infrastructure_authorization_vc),
         )
-        .route("/root/resources", get(api_resources))
         .route("/root/resources/{did}", get(api_resource_detail))
         .route("/root/resources/{did}/versions", get(api_resource_versions))
         .route(
@@ -3893,22 +3892,16 @@ fn build_infrastructure_authorization_credential(
     serde_json::from_value(unsigned).map_err(Into::into)
 }
 
-async fn api_resources(State(state): State<AppState>) -> ApiResult<Value> {
-    let packages = state
-        .data
-        .read::<BTreeMap<String, ResourcePackage>>("resource-packages/index.json")
-        .unwrap_or_default();
-    let count = packages.len();
-    Ok(Json(json!({
-        "items": packages.into_values().collect::<Vec<_>>(),
-        "count": count
-    })))
-}
-
 async fn api_resource_detail(
     State(state): State<AppState>,
     AxumPath(did): AxumPath<String>,
 ) -> ApiResult<Value> {
+    if state.sqlite.is_some() || state.postgres.is_some() {
+        let package = repository::latest_resource_detail_impl(&state, &did)
+            .await
+            .map_err(ApiError::internal)?;
+        return Ok(Json(json!({ "resourceDid": did, "package": package })));
+    }
     let package: Option<ResourcePackage> = state
         .data
         .read(format!("resource-packages/{}", did_to_file_name(&did)))
@@ -7743,12 +7736,20 @@ capability_tree_file = "../capability-tree.json"
         assert!(!dir.path().join("archive").exists());
 
         let detail = api_resource_version_detail(
-            State(state),
+            State(state.clone()),
             axum::extract::Path((resource_did().to_owned(), "1".to_owned())),
         )
         .await
         .unwrap();
         assert_eq!(detail.0["package"]["resourceDid"], resource_did());
+
+        let latest = api_resource_detail(
+            State(state.clone()),
+            axum::extract::Path(resource_did().to_owned()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(latest.0["package"]["resourceDid"], resource_did());
     }
 
     #[tokio::test(flavor = "multi_thread")]

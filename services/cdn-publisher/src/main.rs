@@ -1653,8 +1653,7 @@ mod tests {
             ("job-a".to_owned(), 3),
         ];
 
-        let (unique, duplicates) =
-            split_duplicate_tasks_by_key(tasks, |task| task.0.as_str());
+        let (unique, duplicates) = split_duplicate_tasks_by_key(tasks, |task| task.0.as_str());
 
         assert_eq!(
             unique,

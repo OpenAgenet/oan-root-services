@@ -326,6 +326,55 @@ pub(super) async fn resource_version_detail_impl(
     Ok(None)
 }
 
+pub(super) async fn latest_resource_detail_impl(
+    state: &AppState,
+    did: &str,
+) -> Result<Option<ResourcePackage>> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT versions.package_json
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = ?
+            "#
+        ))
+        .bind(did)
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return row
+            .map(|row| {
+                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))
+                    .map_err(Into::into)
+            })
+            .transpose();
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT versions.package_json::text
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = $1
+            "#
+        ))
+        .bind(did)
+        .fetch_optional(postgres.pool())
+        .await?;
+        return row
+            .map(|row| {
+                serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))
+                    .map_err(Into::into)
+            })
+            .transpose();
+    }
+    Ok(None)
+}
+
 pub(super) fn sync_discovery_target_state_impl(
     state: &AppState,
     did: &str,
