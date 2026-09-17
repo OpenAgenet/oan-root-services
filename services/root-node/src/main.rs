@@ -1673,7 +1673,13 @@ fn mark_local_governance_inactive(
     did: &str,
     reason: &str,
 ) -> Result<()> {
-    if reason.starts_with("trust_indexer_unavailable_fail_open") {
+    if reason.starts_with("trust_indexer_unavailable") {
+        eprintln!(
+            "skip marking {} {} as governance_inactive because Trust Indexer is unavailable: {}",
+            subject_type.label(),
+            did,
+            reason
+        );
         return Ok(());
     }
     let mut authorization_state = current_authorization_state(state);
@@ -1706,10 +1712,7 @@ fn mark_local_governance_inactive(
             }
         }
     }
-    JsonStore::new(".").write(
-        &state.config.paths.authorization_state_file,
-        &authorization_state,
-    )?;
+    persist_authorization_state(state, authorization_state)?;
     eprintln!(
         "marked {} {} as governance_inactive: {}",
         subject_type.label(),
@@ -1759,10 +1762,7 @@ fn restore_local_governance_active(
         }
     }
     if changed {
-        JsonStore::new(".").write(
-            &state.config.paths.authorization_state_file,
-            &authorization_state,
-        )?;
+        persist_authorization_state(state, authorization_state)?;
     }
     Ok(())
 }
@@ -5596,6 +5596,16 @@ mod tests {
         enable_trust_indexer(state, endpoint);
     }
 
+    fn enable_unreachable_trust_indexer(state: &mut AppState) {
+        state.config.security.trust_indexer.enabled = true;
+        state.config.security.trust_indexer.endpoint = Some("http://127.0.0.1:9".to_owned());
+        state.config.security.trust_indexer.fail_mode = "closed".to_owned();
+        state.trust_indexer_client = reqwest::Client::builder()
+            .timeout(TokioDuration::from_millis(50))
+            .build()
+            .unwrap();
+    }
+
     fn infrastructure_vc_issue_request(
         state: &AppState,
         subject_key: &ed25519_dalek::SigningKey,
@@ -6180,6 +6190,38 @@ mod tests {
             load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
         let registrar = authorization_state.registrars.get(registrar_did()).unwrap();
         assert_eq!(registrar.status, "governance_inactive");
+        let current = current_authorization_state(&state);
+        assert_eq!(
+            current.registrars.get(registrar_did()).unwrap().status,
+            "governance_inactive"
+        );
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_does_not_mark_inactive_when_indexer_unavailable() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        enable_unreachable_trust_indexer(&mut state);
+        let registrar_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+
+        reconcile_governance_state(&state).await.unwrap();
+
+        let authorization_state =
+            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        assert_eq!(
+            authorization_state
+                .registrars
+                .get(registrar_did())
+                .unwrap()
+                .status,
+            "active"
+        );
+        let current = current_authorization_state(&state);
+        assert_eq!(
+            current.registrars.get(registrar_did()).unwrap().status,
+            "active"
+        );
     }
 
     #[tokio::test]
@@ -6212,6 +6254,11 @@ mod tests {
                 .get(registrar_did())
                 .unwrap()
                 .status,
+            "active"
+        );
+        let current = current_authorization_state(&state);
+        assert_eq!(
+            current.registrars.get(registrar_did()).unwrap().status,
             "active"
         );
 
