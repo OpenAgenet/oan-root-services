@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "cdn-node"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -251,7 +251,7 @@ dependencies = [
 
 [[package]]
 name = "cdn-publisher"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-nats",
@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "oan-bulletin"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "ed25519-dalek",
@@ -1441,7 +1441,7 @@ dependencies = [
 
 [[package]]
 name = "oan-core"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "oan-storage",
@@ -1452,7 +1452,7 @@ dependencies = [
 
 [[package]]
 name = "oan-credentials"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "oan-core",
@@ -1464,7 +1464,7 @@ dependencies = [
 
 [[package]]
 name = "oan-crypto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64",
  "bs58",
@@ -1483,7 +1483,7 @@ dependencies = [
 
 [[package]]
 name = "oan-did-oan"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bs58",
  "rand 0.8.6",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "oan-package"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "oan-core",
@@ -1507,7 +1507,7 @@ dependencies = [
 
 [[package]]
 name = "oan-protocol"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "oan-core",
@@ -1519,7 +1519,7 @@ dependencies = [
 
 [[package]]
 name = "oan-publication-events"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "serde",
@@ -1527,7 +1527,7 @@ dependencies = [
 
 [[package]]
 name = "oan-service-security"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1543,7 +1543,7 @@ dependencies = [
 
 [[package]]
 name = "oan-storage"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2016,7 +2016,7 @@ dependencies = [
 
 [[package]]
 name = "root-node"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-nats",

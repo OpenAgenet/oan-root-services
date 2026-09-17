@@ -10,7 +10,7 @@ resolver = "2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/OpenAgenet/oan-root-services"
-version = "0.1.0"
+version = "1.0.0"
 
 [workspace.dependencies]
 anyhow = "1"
