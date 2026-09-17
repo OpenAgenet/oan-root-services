@@ -35,7 +35,7 @@ use oan_protocol::{
 };
 use oan_publication_events::{CdnPublishRequestedEvent, CdnPublishRequestedEventInput};
 use oan_service_security::{
-    bearer_token_from_header, hash_proof, request_id, verify_admin_token,
+    bearer_token_from_header, hash_proof, request_id, verify_admin_token, verify_and_store_nonce,
     verify_controller_authorization_proof, verify_signed_request_envelope, AdminAuthConfig,
     AdminAuthMode, AdminPrincipal, ControllerAuthorizationVerificationContext,
     TrustedUpstreamPolicy,
@@ -279,6 +279,8 @@ struct PathConfig {
     authorization_state_file: PathBuf,
     #[serde(default = "default_request_nonce_file")]
     request_nonce_file: PathBuf,
+    #[serde(default = "default_controller_authorization_nonce_file")]
+    controller_authorization_nonce_file: PathBuf,
     #[serde(default = "default_capability_tree_file")]
     capability_tree_file: PathBuf,
     #[serde(default)]
@@ -291,6 +293,10 @@ fn default_authorization_state_file() -> PathBuf {
 
 fn default_request_nonce_file() -> PathBuf {
     PathBuf::from("../../data/root/request-nonces.json")
+}
+
+fn default_controller_authorization_nonce_file() -> PathBuf {
+    PathBuf::from("../../data/root/controller-authorization-nonces.json")
 }
 
 fn default_admin_nonce_file() -> PathBuf {
@@ -1257,6 +1263,8 @@ fn load_config(path: String) -> Result<Config> {
     config.paths.authorization_state_file =
         resolve_relative(base, &config.paths.authorization_state_file);
     config.paths.request_nonce_file = resolve_relative(base, &config.paths.request_nonce_file);
+    config.paths.controller_authorization_nonce_file =
+        resolve_relative(base, &config.paths.controller_authorization_nonce_file);
     config.security.admin.nonce_store_file =
         resolve_relative(base, &config.security.admin.nonce_store_file);
     if !config.paths.capability_tree_file.as_os_str().is_empty() {
@@ -2171,7 +2179,8 @@ async fn verify_resource_and_publish(
         return Err(ApiError::bad_request("metadata_hash_mismatch"));
     }
     let verified_authority_binding =
-        verify_controller_authorization_for_submission(&request).map_err(ApiError::bad_request)?;
+        verify_controller_authorization_for_submission(&state, &request)
+            .map_err(ApiError::bad_request)?;
     metadata.metadata_hash = metadata_hash.clone();
     metadata.package_hash = request.submission.package_hash.clone();
     let package_hash = hash_json_with_suite(
@@ -4036,13 +4045,6 @@ async fn api_forum_identity_directory(State(state): State<AppState>) -> ApiResul
             package.did_document_hash.clone(),
         );
         entry.node_operator |= package.resource_type == ResourceType::InfrastructureNode;
-        if package.did_document.id == identity_did {
-            for key in forum_public_keys_for_document(&package.did_document) {
-                if !entry.public_keys.iter().any(|item| item.id == key.id) {
-                    entry.public_keys.push(key);
-                }
-            }
-        }
     }
 
     for binding in verified_bindings
@@ -4167,26 +4169,6 @@ fn forum_identity_did_for_package(package: &ResourcePackage) -> Option<String> {
         })
 }
 
-fn forum_public_keys_for_document(document: &DidDocument) -> Vec<ForumIdentityPublicKey> {
-    document
-        .verification_method
-        .iter()
-        .filter(|method| {
-            document
-                .authentication
-                .iter()
-                .any(|item| item == &method.id)
-                || method.controller == document.id
-        })
-        .map(|method| ForumIdentityPublicKey {
-            id: method.id.clone(),
-            controller: method.controller.clone(),
-            public_key_jwk: method.public_key_jwk.clone(),
-            public_key_multibase: method.public_key_multibase.clone(),
-        })
-        .collect()
-}
-
 fn verified_authority_binding_key(controller_did: &str, resource_did: &str) -> String {
     format!("{controller_did}|{resource_did}")
 }
@@ -4243,6 +4225,7 @@ fn verify_resource_request(
 }
 
 fn verify_controller_authorization_for_submission(
+    state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
 ) -> std::result::Result<Option<VerifiedAuthorityBinding>, String> {
     let submission = &request.submission;
@@ -4262,10 +4245,7 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
-    let expected_publisher_did = metadata
-        .publisher_did
-        .as_deref()
-        .filter(|publisher_did| *publisher_did == controller_did);
+    let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method_id = verify_controller_authorization_proof(
         bundle,
         &ControllerAuthorizationVerificationContext {
@@ -4276,6 +4256,7 @@ fn verify_controller_authorization_for_submission(
             expected_metadata_hash: &submission.metadata_hash,
             expected_registrar_did: &request.registrar_did,
             expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+            max_clock_skew_seconds: 60,
             now: Utc::now(),
         },
     )
@@ -4294,6 +4275,20 @@ fn verify_controller_authorization_for_submission(
         .find(|method| method.id == verification_method_id)
         .ok_or_else(|| "controller_authorization_verification_method_missing".to_owned())?;
     let proof_hash = hash_proof(&bundle.proof).map_err(|err| err.to_string())?;
+    verify_and_store_nonce(
+        &state.config.paths.controller_authorization_nonce_file,
+        &bundle.challenge.nonce,
+        Utc::now(),
+        Utc::now(),
+        300,
+    )
+    .map_err(|err| {
+        if err.to_string() == "trusted_upstream_nonce_replayed" {
+            "controller_authorization_nonce_replayed".to_owned()
+        } else {
+            err.to_string()
+        }
+    })?;
     Ok(Some(VerifiedAuthorityBinding {
         controller_did: controller_did.to_owned(),
         publisher_did: expected_publisher_did.map(ToOwned::to_owned),
@@ -5787,6 +5782,8 @@ mod tests {
                     capability_tree_file: dir.join("capability-tree.json"),
                     authorization_state_file: dir.join("authorization-state.json"),
                     request_nonce_file: dir.join("request-nonces.json"),
+                    controller_authorization_nonce_file: dir
+                        .join("controller-authorization-nonces.json"),
                 },
             },
             root_did: root_did().to_owned(),
@@ -6589,6 +6586,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_resource_and_publish_rejects_replayed_external_controller_proof() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        attach_external_controller_proof(
+            &state,
+            &mut request,
+            &registrar_key,
+            "did:oan:AGUS:9ControllerProofReplay",
+        );
+
+        let _ = verify_resource_and_publish(State(state.clone()), Json(request.clone()))
+            .await
+            .unwrap();
+        resign_resource_verify_request(&state, &mut request, &registrar_key);
+        let err = verify_resource_and_publish(State(state), Json(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "controller_authorization_nonce_replayed");
+    }
+
+    #[tokio::test]
     async fn forum_identity_directory_uses_verified_controller_binding_keys() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
@@ -7165,7 +7194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forum_identity_directory_includes_keys_when_identity_matches_document() {
+    async fn forum_identity_directory_does_not_infer_keys_from_did_document() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
         let registrar_key = generate_ed25519_keypair();
@@ -7187,11 +7216,7 @@ mod tests {
         let response = api_forum_identity_directory(State(state)).await.unwrap();
         let item = &response.0["items"][0];
         assert_eq!(item["did"], resource_did());
-        assert_eq!(
-            item["publicKeys"][0]["id"],
-            format!("{}#key-1", resource_did())
-        );
-        assert_eq!(item["publicKeys"][0]["publicKeyJwk"]["crv"], "Ed25519");
+        assert_eq!(item["publicKeys"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]
