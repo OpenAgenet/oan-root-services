@@ -30,13 +30,15 @@ use oan_protocol::{
     HealthResponse, InfrastructureAuthorizationVcIssuePayload,
     InfrastructureAuthorizationVcIssueRequest, ResourceVerifyAndPublishRequest,
     RootAuthorizeRequest, PATH_ROOT_INFRASTRUCTURE_AUTHORIZATION_VCS_ISSUE,
-    PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PURPOSE_INFRASTRUCTURE_AUTHORIZATION_VC_ISSUE,
-    PURPOSE_VERIFY_AND_PUBLISH,
+    PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+    PURPOSE_INFRASTRUCTURE_AUTHORIZATION_VC_ISSUE, PURPOSE_VERIFY_AND_PUBLISH,
 };
 use oan_publication_events::{CdnPublishRequestedEvent, CdnPublishRequestedEventInput};
 use oan_service_security::{
-    bearer_token_from_header, request_id, verify_admin_token, verify_signed_request_envelope,
-    AdminAuthConfig, AdminAuthMode, AdminPrincipal, TrustedUpstreamPolicy,
+    bearer_token_from_header, request_id, verify_admin_token,
+    verify_controller_authorization_proof, verify_signed_request_envelope, AdminAuthConfig,
+    AdminAuthMode, AdminPrincipal, ControllerAuthorizationVerificationContext,
+    TrustedUpstreamPolicy,
 };
 #[cfg(test)]
 use oan_service_security::{
@@ -2137,6 +2139,7 @@ async fn verify_resource_and_publish(
     if metadata_hash != request.submission.metadata_hash {
         return Err(ApiError::bad_request("metadata_hash_mismatch"));
     }
+    verify_controller_authorization_for_submission(&request).map_err(ApiError::bad_request)?;
     metadata.metadata_hash = metadata_hash.clone();
     metadata.package_hash = request.submission.package_hash.clone();
     let package_hash = hash_json_with_suite(
@@ -4155,6 +4158,54 @@ fn verify_resource_request(
     Ok(())
 }
 
+fn verify_controller_authorization_for_submission(
+    request: &ResourceVerifyAndPublishRequest,
+) -> std::result::Result<Option<String>, String> {
+    let submission = &request.submission;
+    let Some(metadata) = submission.did_document.oan_metadata.as_ref() else {
+        return Ok(None);
+    };
+    let Some(controller_did) = metadata.controller_did.as_deref() else {
+        return Ok(None);
+    };
+    if controller_did == submission.resource_did {
+        return Ok(None);
+    }
+    let Some(bundle) = submission.controller_authorization_proof.as_ref() else {
+        eprintln!(
+            "controller authorization proof missing at root for resource {} controlled by {}",
+            submission.resource_did, controller_did
+        );
+        return Err("controller_authorization_proof_required".to_owned());
+    };
+    let expected_publisher_did = metadata
+        .publisher_did
+        .as_deref()
+        .filter(|publisher_did| *publisher_did == controller_did);
+    verify_controller_authorization_proof(
+        bundle,
+        &ControllerAuthorizationVerificationContext {
+            expected_resource_did: &submission.resource_did,
+            expected_controller_did: controller_did,
+            expected_publisher_did,
+            expected_did_document_hash: &submission.did_document_hash,
+            expected_metadata_hash: &submission.metadata_hash,
+            expected_registrar_did: &request.registrar_did,
+            expected_purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
+            now: Utc::now(),
+        },
+    )
+    .map(Some)
+    .map_err(|err| {
+        let message = err.to_string();
+        eprintln!(
+            "controller authorization proof rejected at root for resource {} controlled by {}: {}",
+            submission.resource_did, controller_did, message
+        );
+        message
+    })
+}
+
 fn build_resource_metadata(
     submission: &oan_protocol::ResourceRegistrationSubmission,
 ) -> Result<ResourceMetadata> {
@@ -5396,7 +5447,8 @@ mod tests {
         SigningKey as OanSigningKey, VerifyingKey as OanVerifyingKey,
     };
     use oan_protocol::{
-        DidControlChallenge, SubjectControlProofBundle, PURPOSE_RESOURCE_REGISTRATION,
+        ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
+        SubjectControlProofBundle, PURPOSE_RESOURCE_REGISTRATION,
     };
     use oan_service_security::hash_proof;
     use tempfile::tempdir;
@@ -5458,7 +5510,8 @@ mod tests {
                 public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
             authentication: vec![key_id.clone()],
-            assertion_method: vec![key_id],
+            assertion_method: vec![key_id.clone()],
+            capability_invocation: vec![key_id],
             service: vec![],
             oan_metadata: None,
         }
@@ -5544,7 +5597,8 @@ mod tests {
                 public_key_jwk: Some(public_key_jwk(&verifying_key)),
             }],
             authentication: vec![key_id.clone()],
-            assertion_method: vec![key_id],
+            assertion_method: vec![key_id.clone()],
+            capability_invocation: vec![key_id],
             service: vec![ServiceEndpoint {
                 id: format!("{did}#download"),
                 service_type: "SkillPackageDownload".to_owned(),
@@ -6059,6 +6113,7 @@ mod tests {
             hash_algorithm: "sha256".to_owned(),
             registration_credential: json!({"status":"active"}),
             subject_control_proof: proof_bundle.clone(),
+            controller_authorization_proof: None,
         })
         .unwrap();
         metadata.metadata_hash.clear();
@@ -6092,6 +6147,7 @@ mod tests {
             hash_algorithm: "sha256".to_owned(),
             registration_credential: json!({"status":"active"}),
             subject_control_proof: proof_bundle,
+            controller_authorization_proof: None,
         };
         let registrar_signing_key = OanSigningKey::Ed25519 {
             suite: CryptoSuite::Ed25519Sha256,
@@ -6116,6 +6172,138 @@ mod tests {
             submission,
             upstream_auth,
         }
+    }
+
+    fn resign_resource_verify_request(
+        state: &AppState,
+        request: &mut ResourceVerifyAndPublishRequest,
+        registrar_key: &ed25519_dalek::SigningKey,
+    ) {
+        let registrar_signing_key = OanSigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: registrar_key.clone(),
+        };
+        request.upstream_auth = create_signed_request_envelope(SignedRequestEnvelopeInput {
+            request_id: request_id("resource-verify-and-publish"),
+            protocol_version: OAN_RESOURCE_PROTOCOL_VERSION.to_owned(),
+            purpose: PURPOSE_VERIFY_AND_PUBLISH.to_owned(),
+            method: "POST".to_owned(),
+            path: PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH.to_owned(),
+            aud: state.root_did.clone(),
+            payload: &request.submission,
+            creator: registrar_did().to_owned(),
+            verification_method: format!("{}#key-1", registrar_did()),
+            signing_key: &registrar_signing_key,
+            nonce: request_nonce("resource-verify-and-publish"),
+        })
+        .unwrap();
+    }
+
+    fn refresh_resource_submission_hashes_for_test(request: &mut ResourceVerifyAndPublishRequest) {
+        let did_document_hash =
+            hash_json_with_suite(CryptoSuite::Ed25519Sha256, &request.submission.did_document)
+                .map(|hash| format!("sha256:{hash}"))
+                .unwrap();
+        request.submission.did_document_hash = did_document_hash.clone();
+        request
+            .submission
+            .subject_control_proof
+            .challenge
+            .did_document_hash = did_document_hash.clone();
+        let mut metadata = build_resource_metadata(&request.submission).unwrap();
+        metadata.metadata_hash.clear();
+        metadata.package_hash.clear();
+        let metadata_hash =
+            hash_resource_metadata_with_suite(CryptoSuite::Ed25519Sha256, &metadata)
+                .map(|hash| format!("sha256:{hash}"))
+                .unwrap();
+        request.submission.metadata_hash = metadata_hash.clone();
+        request.submission.package_hash = hash_json_with_suite(
+            CryptoSuite::Ed25519Sha256,
+            &json!({
+                "packageVersion": request.submission.package_version,
+                "resourceDid": request.submission.resource_did,
+                "resourceType": request.submission.resource_type,
+                "didDocumentHash": did_document_hash,
+                "metadataHash": metadata_hash,
+                "hashAlgorithm": request.submission.hash_algorithm,
+            }),
+        )
+        .map(|hash| format!("sha256:{hash}"))
+        .unwrap();
+    }
+
+    fn attach_external_controller_proof(
+        state: &AppState,
+        request: &mut ResourceVerifyAndPublishRequest,
+        registrar_key: &ed25519_dalek::SigningKey,
+        controller_did: &str,
+    ) {
+        let controller_key = generate_ed25519_keypair();
+        let controller_method = format!("{controller_did}#key-1");
+        let verifying_key = OanVerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: controller_key.verifying_key(),
+        };
+        let controller_document = DidDocument {
+            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+            id: controller_did.to_owned(),
+            verification_method: vec![VerificationMethod {
+                id: controller_method.clone(),
+                method_type: "Ed25519VerificationKey2020".to_owned(),
+                controller: controller_did.to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                public_key_format: Some("multibase".to_owned()),
+                public_key_multibase: Some(public_key_multibase(&verifying_key)),
+                public_key_jwk: Some(public_key_jwk(&verifying_key)),
+            }],
+            authentication: vec![controller_method.clone()],
+            assertion_method: vec![controller_method.clone()],
+            capability_invocation: vec![controller_method.clone()],
+            service: vec![],
+            oan_metadata: None,
+        };
+        let metadata = request
+            .submission
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap();
+        metadata.controller_did = Some(controller_did.to_owned());
+        metadata.publisher_did = Some(controller_did.to_owned());
+        refresh_resource_submission_hashes_for_test(request);
+        let challenge = ControllerAuthorizationChallenge {
+            challenge_id: "controller-auth-test".to_owned(),
+            resource_did: request.submission.resource_did.clone(),
+            controller_did: controller_did.to_owned(),
+            publisher_did: Some(controller_did.to_owned()),
+            did_document_hash: request.submission.did_document_hash.clone(),
+            metadata_hash: request.submission.metadata_hash.clone(),
+            registrar_did: request.registrar_did.clone(),
+            purpose: PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION.to_owned(),
+            verification_method: controller_method.clone(),
+            nonce: "controller-auth-nonce".to_owned(),
+            issued_at: Utc::now(),
+            expires_at: Utc::now() + Duration::seconds(300),
+        };
+        let controller_signing_key = OanSigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: controller_key,
+        };
+        let proof = build_data_integrity_proof(
+            &challenge,
+            controller_did.to_owned(),
+            controller_method,
+            &controller_signing_key,
+        )
+        .unwrap();
+        request.submission.controller_authorization_proof =
+            Some(ControllerAuthorizationProofBundle {
+                challenge,
+                controller_did_document: controller_document,
+                proof,
+            });
+        resign_resource_verify_request(state, request, registrar_key);
     }
 
     #[test]
@@ -6235,6 +6423,64 @@ mod tests {
         let queue = read_cdn_queue(&state).await.unwrap();
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].resource_did, resource_did());
+    }
+
+    #[tokio::test]
+    async fn verify_resource_and_publish_rejects_external_controller_without_proof() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        request
+            .submission
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .controller_did = Some("did:oan:AGUS:ControllerMissingProof".to_owned());
+        refresh_resource_submission_hashes_for_test(&mut request);
+        resign_resource_verify_request(&state, &mut request, &registrar_key);
+
+        let err = verify_resource_and_publish(State(state), Json(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "controller_authorization_proof_required");
+    }
+
+    #[tokio::test]
+    async fn verify_resource_and_publish_accepts_external_controller_proof() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        attach_external_controller_proof(
+            &state,
+            &mut request,
+            &registrar_key,
+            "did:oan:AGUS:9ControllerProofAccepted",
+        );
+
+        let response = verify_resource_and_publish(State(state), Json(request))
+            .await
+            .unwrap();
+
+        assert_eq!(response.0["status"], "resource-verified-and-queued");
     }
 
     #[tokio::test]
