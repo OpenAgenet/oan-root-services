@@ -35,7 +35,7 @@ use oan_protocol::{
 };
 use oan_publication_events::{CdnPublishRequestedEvent, CdnPublishRequestedEventInput};
 use oan_service_security::{
-    bearer_token_from_header, request_id, verify_admin_token,
+    bearer_token_from_header, hash_proof, request_id, verify_admin_token,
     verify_controller_authorization_proof, verify_signed_request_envelope, AdminAuthConfig,
     AdminAuthMode, AdminPrincipal, ControllerAuthorizationVerificationContext,
     TrustedUpstreamPolicy,
@@ -474,6 +474,37 @@ struct ForumIdentityPublicKey {
     public_key_jwk: Option<Value>,
     #[serde(rename = "publicKeyMultibase", skip_serializing_if = "Option::is_none")]
     public_key_multibase: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VerifiedAuthorityBinding {
+    #[serde(rename = "controllerDid")]
+    controller_did: String,
+    #[serde(rename = "publisherDid", skip_serializing_if = "Option::is_none")]
+    publisher_did: Option<String>,
+    #[serde(rename = "resourceDid")]
+    resource_did: String,
+    #[serde(rename = "resourceType")]
+    resource_type: ResourceType,
+    #[serde(rename = "packageVersion")]
+    package_version: String,
+    #[serde(rename = "didDocumentHash")]
+    did_document_hash: String,
+    #[serde(rename = "metadataHash")]
+    metadata_hash: String,
+    #[serde(rename = "verificationMethod")]
+    verification_method: String,
+    #[serde(rename = "publicKeyJwk", skip_serializing_if = "Option::is_none")]
+    public_key_jwk: Option<Value>,
+    #[serde(rename = "publicKeyMultibase", skip_serializing_if = "Option::is_none")]
+    public_key_multibase: Option<String>,
+    #[serde(rename = "proofHash")]
+    proof_hash: String,
+    #[serde(rename = "verifiedAt")]
+    verified_at: DateTime<Utc>,
+    #[serde(rename = "acceptedAt")]
+    accepted_at: DateTime<Utc>,
+    status: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2139,7 +2170,8 @@ async fn verify_resource_and_publish(
     if metadata_hash != request.submission.metadata_hash {
         return Err(ApiError::bad_request("metadata_hash_mismatch"));
     }
-    verify_controller_authorization_for_submission(&request).map_err(ApiError::bad_request)?;
+    let verified_authority_binding =
+        verify_controller_authorization_for_submission(&request).map_err(ApiError::bad_request)?;
     metadata.metadata_hash = metadata_hash.clone();
     metadata.package_hash = request.submission.package_hash.clone();
     let package_hash = hash_json_with_suite(
@@ -2212,6 +2244,11 @@ async fn verify_resource_and_publish(
         .map_err(|err| ApiError::bad_request(err.to_string()))?;
 
     archive_resource_verified(&state, &package).map_err(ApiError::internal)?;
+    if let Some(binding) = verified_authority_binding {
+        persist_verified_authority_binding(&state, binding)
+            .await
+            .map_err(ApiError::internal)?;
+    }
     persist_resource_acceptance(&state, &package)
         .await
         .map_err(ApiError::internal)?;
@@ -3960,6 +3997,7 @@ async fn api_forum_identity_directory(State(state): State<AppState>) -> ApiResul
     let generated_at = Utc::now().to_rfc3339();
     let accepted_after = forum_identity_directory_cutoff();
     let mut identities = BTreeMap::<String, ForumIdentityDirectoryItem>::new();
+    let verified_bindings = load_verified_authority_bindings(&state).map_err(ApiError::internal)?;
 
     for forum_package in packages
         .into_iter()
@@ -4003,6 +4041,23 @@ async fn api_forum_identity_directory(State(state): State<AppState>) -> ApiResul
                 if !entry.public_keys.iter().any(|item| item.id == key.id) {
                     entry.public_keys.push(key);
                 }
+            }
+        }
+    }
+
+    for binding in verified_bindings
+        .into_values()
+        .filter(|binding| binding.accepted_at >= accepted_after && binding.status == "active")
+    {
+        if let Some(entry) = identities.get_mut(&binding.controller_did) {
+            let key = ForumIdentityPublicKey {
+                id: binding.verification_method,
+                controller: binding.controller_did,
+                public_key_jwk: binding.public_key_jwk,
+                public_key_multibase: binding.public_key_multibase,
+            };
+            if !entry.public_keys.iter().any(|item| item.id == key.id) {
+                entry.public_keys.push(key);
             }
         }
     }
@@ -4132,6 +4187,35 @@ fn forum_public_keys_for_document(document: &DidDocument) -> Vec<ForumIdentityPu
         .collect()
 }
 
+fn verified_authority_binding_key(controller_did: &str, resource_did: &str) -> String {
+    format!("{controller_did}|{resource_did}")
+}
+
+fn load_verified_authority_bindings(
+    state: &AppState,
+) -> Result<BTreeMap<String, VerifiedAuthorityBinding>> {
+    Ok(state
+        .data
+        .read("authority-bindings/verified-controller-bindings.json")
+        .unwrap_or_default())
+}
+
+async fn persist_verified_authority_binding(
+    state: &AppState,
+    binding: VerifiedAuthorityBinding,
+) -> Result<()> {
+    let mut bindings = load_verified_authority_bindings(state)?;
+    bindings.insert(
+        verified_authority_binding_key(&binding.controller_did, &binding.resource_did),
+        binding,
+    );
+    state.data.write(
+        "authority-bindings/verified-controller-bindings.json",
+        &bindings,
+    )?;
+    Ok(())
+}
+
 fn push_unique(items: &mut Vec<String>, value: String) {
     if !items.iter().any(|item| item == &value) {
         items.push(value);
@@ -4160,7 +4244,7 @@ fn verify_resource_request(
 
 fn verify_controller_authorization_for_submission(
     request: &ResourceVerifyAndPublishRequest,
-) -> std::result::Result<Option<String>, String> {
+) -> std::result::Result<Option<VerifiedAuthorityBinding>, String> {
     let submission = &request.submission;
     let Some(metadata) = submission.did_document.oan_metadata.as_ref() else {
         return Ok(None);
@@ -4182,7 +4266,7 @@ fn verify_controller_authorization_for_submission(
         .publisher_did
         .as_deref()
         .filter(|publisher_did| *publisher_did == controller_did);
-    verify_controller_authorization_proof(
+    let verification_method_id = verify_controller_authorization_proof(
         bundle,
         &ControllerAuthorizationVerificationContext {
             expected_resource_did: &submission.resource_did,
@@ -4195,7 +4279,6 @@ fn verify_controller_authorization_for_submission(
             now: Utc::now(),
         },
     )
-    .map(Some)
     .map_err(|err| {
         let message = err.to_string();
         eprintln!(
@@ -4203,7 +4286,30 @@ fn verify_controller_authorization_for_submission(
             submission.resource_did, controller_did, message
         );
         message
-    })
+    })?;
+    let verification_method = bundle
+        .controller_did_document
+        .verification_method
+        .iter()
+        .find(|method| method.id == verification_method_id)
+        .ok_or_else(|| "controller_authorization_verification_method_missing".to_owned())?;
+    let proof_hash = hash_proof(&bundle.proof).map_err(|err| err.to_string())?;
+    Ok(Some(VerifiedAuthorityBinding {
+        controller_did: controller_did.to_owned(),
+        publisher_did: expected_publisher_did.map(ToOwned::to_owned),
+        resource_did: submission.resource_did.clone(),
+        resource_type: submission.resource_type.clone(),
+        package_version: submission.package_version.clone(),
+        did_document_hash: submission.did_document_hash.clone(),
+        metadata_hash: submission.metadata_hash.clone(),
+        verification_method: verification_method_id,
+        public_key_jwk: verification_method.public_key_jwk.clone(),
+        public_key_multibase: verification_method.public_key_multibase.clone(),
+        proof_hash,
+        verified_at: Utc::now(),
+        accepted_at: Utc::now(),
+        status: "active".to_owned(),
+    }))
 }
 
 fn build_resource_metadata(
@@ -5450,7 +5556,6 @@ mod tests {
         ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
         SubjectControlProofBundle, PURPOSE_RESOURCE_REGISTRATION,
     };
-    use oan_service_security::hash_proof;
     use tempfile::tempdir;
 
     fn root_did() -> &'static str {
@@ -6481,6 +6586,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.0["status"], "resource-verified-and-queued");
+    }
+
+    #[tokio::test]
+    async fn forum_identity_directory_uses_verified_controller_binding_keys() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let controller_did = "did:oan:AGUS:9ControllerDirectoryKey";
+        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+
+        let publish_response = verify_resource_and_publish(State(state.clone()), Json(request))
+            .await
+            .unwrap();
+        assert_eq!(publish_response.0["status"], "resource-verified-and-queued");
+        let response = api_forum_identity_directory(State(state)).await.unwrap();
+        let item = response.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["did"] == controller_did)
+            .unwrap();
+
+        assert_eq!(item["resourceCount"], 1);
+        assert_eq!(item["resourceDids"][0], resource_did());
+        assert_eq!(
+            item["publicKeys"][0]["id"],
+            format!("{controller_did}#key-1")
+        );
+        assert_eq!(item["publicKeys"][0]["controller"], controller_did);
+        assert!(item["publicKeys"][0]["publicKeyJwk"]["x"].is_string());
     }
 
     #[tokio::test]
