@@ -8160,6 +8160,48 @@ capability_tree_file = "../capability-tree.json"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn api_cdn_publication_jobs_packages_rejects_oversized_stored_package() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state
+            .config
+            .security
+            .admin
+            .static_tokens
+            .push("test-admin-token".to_owned());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let mut package = package_from_request(&state, &request);
+        package.metadata.description = "x".repeat(MAX_CDN_PUBLICATION_PACKAGE_BYTES);
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        let err = api_cdn_publication_jobs_packages(
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str("Bearer test-admin-token").unwrap(),
+            )]),
+            State(state),
+            Json(CdnPublicationJobsPackageRequest {
+                jobs: vec![CdnPublicationJobRef {
+                    job_key: format!("{}:{}", package.resource_did, package.package_version),
+                }],
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "resource_package_too_large");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn api_mark_published_advances_authorized_discovery_targets() {
         let dir = tempdir().unwrap();
         let mut state = app_state_with_sqlite(dir.path()).await;

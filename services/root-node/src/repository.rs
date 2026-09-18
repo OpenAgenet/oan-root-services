@@ -2205,27 +2205,24 @@ pub(super) async fn resource_packages_for_jobs_impl(
         return Ok(BTreeMap::new());
     }
     if let Some(sqlite) = &state.sqlite {
-        let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT subject_did, version, package_json, publication_cursor FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
-        ));
-        for (index, (_, subject_did, version)) in pairs.iter().enumerate() {
-            if index > 0 {
-                builder.push(" OR ");
-            }
-            builder
-                .push("(subject_did = ")
-                .push_bind(subject_did)
-                .push(" AND version = ")
-                .push_bind(version)
-                .push(")");
-        }
-        let rows = builder.build().fetch_all(sqlite.pool()).await?;
         let mut packages = BTreeMap::new();
         let mut response_bytes = 0_usize;
-        for row in rows {
-            let subject_did = row.get::<String, _>(0);
-            let version = row.get::<String, _>(1);
-            let package_json = row.get::<String, _>(2);
+        for (job_key, subject_did, version) in &pairs {
+            let row = sqlx::query(&format!(
+                r#"
+                SELECT package_json, publication_cursor
+                FROM {ROOT_SUBJECT_VERSION_TABLE}
+                WHERE subject_did = ? AND version = ?
+                "#
+            ))
+            .bind(subject_did)
+            .bind(version)
+            .fetch_optional(sqlite.pool())
+            .await?;
+            let Some(row) = row else {
+                continue;
+            };
+            let package_json = row.get::<String, _>(0);
             if package_json.len() > MAX_CDN_PUBLICATION_PACKAGE_BYTES {
                 return Err(anyhow!("resource_package_too_large"));
             }
@@ -2234,37 +2231,30 @@ pub(super) async fn resource_packages_for_jobs_impl(
                 return Err(anyhow!("batch_response_too_large"));
             }
             let package = serde_json::from_str::<ResourcePackage>(&package_json)?;
-            let publication_cursor = row.get::<i64, _>(3);
-            packages.insert(
-                format!("{subject_did}:{version}"),
-                (package, publication_cursor),
-            );
+            let publication_cursor = row.get::<i64, _>(1);
+            packages.insert(job_key.clone(), (package, publication_cursor));
         }
         return Ok(packages);
     }
     if let Some(postgres) = &state.postgres {
-        let mut builder =
-            QueryBuilder::<Postgres>::new("WITH requested(job_key, subject_did, version) AS (");
-        builder.push_values(pairs.iter(), |mut row, (job_key, subject_did, version)| {
-            row.push_bind(job_key)
-                .push_bind(subject_did)
-                .push_bind(version);
-        });
-        builder.push(format!(
-            r#")
-            SELECT requested.job_key, versions.package_json::text, versions.publication_cursor
-            FROM requested
-            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
-              ON versions.subject_did = requested.subject_did
-             AND versions.version = requested.version
-            "#
-        ));
-        let rows = builder.build().fetch_all(postgres.pool()).await?;
         let mut packages = BTreeMap::new();
         let mut response_bytes = 0_usize;
-        for row in rows {
-            let job_key = row.get::<String, _>(0);
-            let package_json = row.get::<String, _>(1);
+        for (job_key, subject_did, version) in &pairs {
+            let row = sqlx::query(&format!(
+                r#"
+                SELECT package_json::text, publication_cursor
+                FROM {ROOT_SUBJECT_VERSION_TABLE}
+                WHERE subject_did = $1 AND version = $2
+                "#
+            ))
+            .bind(subject_did)
+            .bind(version)
+            .fetch_optional(postgres.pool())
+            .await?;
+            let Some(row) = row else {
+                continue;
+            };
+            let package_json = row.get::<String, _>(0);
             if package_json.len() > MAX_CDN_PUBLICATION_PACKAGE_BYTES {
                 return Err(anyhow!("resource_package_too_large"));
             }
@@ -2273,8 +2263,8 @@ pub(super) async fn resource_packages_for_jobs_impl(
                 return Err(anyhow!("batch_response_too_large"));
             }
             let package = serde_json::from_str::<ResourcePackage>(&package_json)?;
-            let publication_cursor = row.get::<i64, _>(2);
-            packages.insert(job_key, (package, publication_cursor));
+            let publication_cursor = row.get::<i64, _>(1);
+            packages.insert(job_key.clone(), (package, publication_cursor));
         }
         return Ok(packages);
     }

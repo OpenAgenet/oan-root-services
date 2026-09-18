@@ -47,6 +47,8 @@ const MAX_BATCH_PUBLISH_BODY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_BATCH_GET_DIDS: usize = 100;
 const MAX_BATCH_GET_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BATCH_GET_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_INDEX_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_INDEX_PAGE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 struct ResourceIndexQuery {
@@ -819,7 +821,12 @@ async fn api_resources_catalog(
     let after_cursor = query.after_cursor.unwrap_or(0).max(0);
     let page = read_resource_index_page(&state, after_cursor, limit)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(|err| match err.to_string().as_str() {
+            "resource_index_package_too_large" | "resource_index_page_too_large" => {
+                ApiError::bad_request(err.to_string())
+            }
+            _ => ApiError::internal(err),
+        })?;
     let items = page
         .items
         .into_iter()
@@ -981,7 +988,12 @@ async fn api_resource_index(
     let after_cursor = query.after_cursor.unwrap_or(0).max(0);
     let page = read_resource_index_page(&state, after_cursor, limit)
         .await
-        .map_err(ApiError::internal)?;
+        .map_err(|err| match err.to_string().as_str() {
+            "resource_index_package_too_large" | "resource_index_page_too_large" => {
+                ApiError::bad_request(err.to_string())
+            }
+            _ => ApiError::internal(err),
+        })?;
     Ok(Json(
         serde_json::to_value(page).map_err(|err| ApiError::internal(err.into()))?,
     ))
@@ -1003,6 +1015,7 @@ async fn read_resource_index_page(
     let page_limit = limit.max(1);
     let fetch_limit = page_limit + 1;
     let mut rows = Vec::<ResourceCdnIndexItem>::new();
+    let mut page_bytes = 0_usize;
     if let Some(sqlite) = &state.sqlite {
         let db_rows = sqlx::query(&format!(
             r#"
@@ -1018,10 +1031,13 @@ async fn read_resource_index_page(
         .fetch_all(sqlite.pool())
         .await?;
         for row in db_rows {
-            rows.push(ResourceCdnIndexItem {
-                cursor: row.get::<i64, _>(0),
-                package: serde_json::from_str(&row.get::<String, _>(1))?,
-            });
+            let package_json = row.get::<String, _>(1);
+            push_resource_index_item(
+                &mut rows,
+                &mut page_bytes,
+                row.get::<i64, _>(0),
+                &package_json,
+            )?;
         }
     } else if let Some(postgres) = &state.postgres {
         let db_rows = sqlx::query(&format!(
@@ -1038,10 +1054,13 @@ async fn read_resource_index_page(
         .fetch_all(postgres.pool())
         .await?;
         for row in db_rows {
-            rows.push(ResourceCdnIndexItem {
-                cursor: row.get::<i64, _>(0),
-                package: serde_json::from_str(&row.get::<String, _>(1))?,
-            });
+            let package_json = row.get::<String, _>(1);
+            push_resource_index_item(
+                &mut rows,
+                &mut page_bytes,
+                row.get::<i64, _>(0),
+                &package_json,
+            )?;
         }
     } else {
         let mut indexed = state
@@ -1061,7 +1080,20 @@ async fn read_resource_index_page(
                 .cmp(&b.cursor)
                 .then(a.package.resource_did.cmp(&b.package.resource_did))
         });
-        rows = indexed.into_iter().take(fetch_limit as usize).collect();
+        for item in indexed.into_iter().take(fetch_limit as usize) {
+            let package_bytes = serde_json::to_vec(&item.package)?.len();
+            if package_bytes > MAX_INDEX_PACKAGE_BYTES {
+                return Err(anyhow::anyhow!("resource_index_package_too_large"));
+            }
+            page_bytes = page_bytes.saturating_add(package_bytes);
+            if page_bytes > MAX_INDEX_PAGE_BYTES {
+                return Err(anyhow::anyhow!("resource_index_page_too_large"));
+            }
+            rows.push(ResourceCdnIndexItem {
+                cursor: item.cursor,
+                package: item.package,
+            });
+        }
     }
     let has_more = rows.len() as i64 > page_limit;
     if has_more {
@@ -1075,6 +1107,27 @@ async fn read_resource_index_page(
         next_cursor,
         has_more,
     })
+}
+
+fn push_resource_index_item(
+    rows: &mut Vec<ResourceCdnIndexItem>,
+    page_bytes: &mut usize,
+    cursor: i64,
+    package_json: &str,
+) -> Result<()> {
+    let package_bytes = package_json.len();
+    if package_bytes > MAX_INDEX_PACKAGE_BYTES {
+        return Err(anyhow::anyhow!("resource_index_package_too_large"));
+    }
+    *page_bytes = page_bytes.saturating_add(package_bytes);
+    if *page_bytes > MAX_INDEX_PAGE_BYTES {
+        return Err(anyhow::anyhow!("resource_index_page_too_large"));
+    }
+    rows.push(ResourceCdnIndexItem {
+        cursor,
+        package: serde_json::from_str(package_json)?,
+    });
+    Ok(())
 }
 
 async fn read_resource_index(state: &AppState) -> Result<Vec<ResourcePackage>> {
@@ -1589,46 +1642,46 @@ async fn read_resource_packages_by_dids(
     }
     if let Some(sqlite) = &state.sqlite {
         let mut packages = BTreeMap::new();
-        for chunk in dids.chunks(500) {
-            let mut builder = QueryBuilder::<Sqlite>::new(format!(
-                "SELECT resource_did, package_json FROM {CDN_RESOURCE_PACKAGE_TABLE} WHERE resource_did IN ("
-            ));
-            let mut separated = builder.separated(", ");
-            for did in chunk {
-                separated.push_bind(did);
+        let mut response_bytes = 0_usize;
+        for did in dids {
+            let row = sqlx::query(&format!(
+                "SELECT package_json FROM {CDN_RESOURCE_PACKAGE_TABLE} WHERE resource_did = ?"
+            ))
+            .bind(did)
+            .fetch_optional(sqlite.pool())
+            .await?;
+            let Some(row) = row else {
+                continue;
+            };
+            let package_json = row.get::<String, _>(0);
+            if package_json.len() > MAX_BATCH_GET_PACKAGE_BYTES {
+                return Err(anyhow::anyhow!("resource_package_too_large"));
             }
-            separated.push_unseparated(")");
-            let rows = builder.build().fetch_all(sqlite.pool()).await?;
-            let mut response_bytes = 0_usize;
-            for row in rows {
-                let package_json = row.get::<String, _>(1);
-                let package_bytes = package_json.len();
-                if package_bytes > MAX_BATCH_GET_PACKAGE_BYTES {
-                    return Err(anyhow::anyhow!("resource_package_too_large"));
-                }
-                response_bytes = response_bytes.saturating_add(package_bytes);
-                if response_bytes > MAX_BATCH_GET_RESPONSE_BYTES {
-                    return Err(anyhow::anyhow!("batch_response_too_large"));
-                }
-                packages.insert(
-                    row.get::<String, _>(0),
-                    serde_json::from_str::<ResourcePackage>(&package_json)?,
-                );
+            response_bytes = response_bytes.saturating_add(package_json.len());
+            if response_bytes > MAX_BATCH_GET_RESPONSE_BYTES {
+                return Err(anyhow::anyhow!("batch_response_too_large"));
             }
+            packages.insert(
+                did.clone(),
+                serde_json::from_str::<ResourcePackage>(&package_json)?,
+            );
         }
         return Ok(packages);
     }
     if let Some(postgres) = &state.postgres {
-        let rows = sqlx::query(&format!(
-            "SELECT resource_did, package_json::text FROM {CDN_RESOURCE_PACKAGE_TABLE} WHERE resource_did = ANY($1)"
-        ))
-        .bind(dids)
-        .fetch_all(postgres.pool())
-        .await?;
         let mut packages = BTreeMap::new();
         let mut response_bytes = 0_usize;
-        for row in rows {
-            let package_json = row.get::<String, _>(1);
+        for did in dids {
+            let row = sqlx::query(&format!(
+                "SELECT package_json::text FROM {CDN_RESOURCE_PACKAGE_TABLE} WHERE resource_did = $1"
+            ))
+            .bind(did)
+            .fetch_optional(postgres.pool())
+            .await?;
+            let Some(row) = row else {
+                continue;
+            };
+            let package_json = row.get::<String, _>(0);
             let package_bytes = package_json.len();
             if package_bytes > MAX_BATCH_GET_PACKAGE_BYTES {
                 return Err(anyhow::anyhow!("resource_package_too_large"));
@@ -1638,7 +1691,7 @@ async fn read_resource_packages_by_dids(
                 return Err(anyhow::anyhow!("batch_response_too_large"));
             }
             packages.insert(
-                row.get::<String, _>(0),
+                did.clone(),
                 serde_json::from_str::<ResourcePackage>(&package_json)?,
             );
         }
@@ -2215,6 +2268,34 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "invalid_resource_index_page_limit");
+    }
+
+    #[tokio::test]
+    async fn resource_index_rejects_oversized_package_page_items() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let mut package = sample_resource_package();
+        package.metadata.description = "x".repeat(MAX_INDEX_PACKAGE_BYTES);
+        state
+            .data
+            .write(
+                "resources/index.json",
+                &BTreeMap::from([(package.resource_did.clone(), package)]),
+            )
+            .unwrap();
+
+        let err = api_resource_index(
+            State(state),
+            Query(ResourceIndexQuery {
+                after_cursor: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "resource_index_package_too_large");
     }
 
     #[tokio::test]
