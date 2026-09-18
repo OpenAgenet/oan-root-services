@@ -79,6 +79,10 @@ const ROOT_PACKAGE_JOB_TABLE: &str = "root_verified_package_jobs";
 const ROOT_DEBUG_EXPORT_INTERVAL_MS: u64 = 2_000;
 const ROOT_STATUS_CACHE_TTL_MS: u64 = 500;
 const FORUM_IDENTITY_DIRECTORY_ACCEPTED_AFTER: &str = "2026-09-14T16:00:00Z";
+const MAX_CDN_PUBLICATION_JOB_REQUESTS: usize = 100;
+const MAX_CDN_PUBLICATION_JOB_KEY_BYTES: usize = 2048;
+const MAX_CDN_PUBLICATION_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CDN_PUBLICATION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize)]
 struct Config {
@@ -1950,15 +1954,25 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
         .await?;
     sqlite
         .execute_batch(&format!(
-            r#"
-            ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
-                ADD COLUMN publication_cursor INTEGER;
-            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
-                ADD COLUMN authorized_domains_json TEXT NOT NULL DEFAULT '[]';
-            "#
+            "ALTER TABLE {ROOT_SUBJECT_VERSION_TABLE}
+             ADD COLUMN publication_cursor INTEGER;"
         ))
         .await
         .ok();
+    sqlite
+        .execute_batch(&format!(
+            "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+             ADD COLUMN authorized_domains_json TEXT NOT NULL DEFAULT '[]';"
+        ))
+        .await
+        .ok();
+    sqlite
+        .execute_batch(&format!(
+            "UPDATE {ROOT_SUBJECT_VERSION_TABLE}
+             SET publication_cursor = rowid
+             WHERE publication_cursor IS NULL;"
+        ))
+        .await?;
     sqlite.ensure_leased_job_table(ROOT_CDN_JOB_TABLE).await?;
     sqlite
         .ensure_leased_job_table(ROOT_CDN_OUTBOX_TABLE)
@@ -3422,6 +3436,9 @@ async fn api_mark_cdn_publication_jobs_published(
     if request.jobs.is_empty() {
         return Err(ApiError::bad_request("empty_jobs"));
     }
+    if request.jobs.len() > MAX_CDN_PUBLICATION_JOB_REQUESTS {
+        return Err(ApiError::bad_request("too_many_jobs"));
+    }
     let job_keys = request
         .jobs
         .iter()
@@ -3429,6 +3446,12 @@ async fn api_mark_cdn_publication_jobs_published(
         .collect::<Vec<_>>();
     if job_keys.iter().any(|job_key| job_key.is_empty()) {
         return Err(ApiError::bad_request("empty_job_key"));
+    }
+    if job_keys
+        .iter()
+        .any(|job_key| job_key.len() > MAX_CDN_PUBLICATION_JOB_KEY_BYTES)
+    {
+        return Err(ApiError::bad_request("job_key_too_long"));
     }
     let authorization_state = current_authorization_state(&state);
     let completion = repository::complete_cdn_publication_jobs_impl(
@@ -3494,6 +3517,9 @@ async fn api_cdn_publication_jobs_packages(
     if request.jobs.is_empty() {
         return Err(ApiError::bad_request("empty_jobs"));
     }
+    if request.jobs.len() > MAX_CDN_PUBLICATION_JOB_REQUESTS {
+        return Err(ApiError::bad_request("too_many_jobs"));
+    }
     let job_keys = request
         .jobs
         .iter()
@@ -3502,14 +3528,27 @@ async fn api_cdn_publication_jobs_packages(
     if job_keys.iter().any(|job_key| job_key.is_empty()) {
         return Err(ApiError::bad_request("empty_job_key"));
     }
+    if job_keys
+        .iter()
+        .any(|job_key| job_key.len() > MAX_CDN_PUBLICATION_JOB_KEY_BYTES)
+    {
+        return Err(ApiError::bad_request("job_key_too_long"));
+    }
     let packages = resource_packages_for_jobs(&state, &job_keys)
         .await
-        .map_err(ApiError::internal)?;
-    let items = job_keys
-        .iter()
-        .filter_map(|job_key| {
-            packages.get(job_key).map(|(package, publication_cursor)| {
-                json!({
+        .map_err(|err| match err.to_string().as_str() {
+            "resource_package_too_large" | "batch_response_too_large" => {
+                ApiError::bad_request(err.to_string())
+            }
+            _ => ApiError::internal(err),
+        })?;
+    let mut response_bytes = 0_usize;
+    let mut items = Vec::new();
+    for job_key in &job_keys {
+        let Some((package, publication_cursor)) = packages.get(job_key) else {
+            continue;
+        };
+        let item = json!({
                     "jobKey": job_key,
                     "publicationCursor": publication_cursor,
                     "resourceDid": package.resource_did,
@@ -3518,10 +3557,17 @@ async fn api_cdn_publication_jobs_packages(
                     "didDocumentHash": package.did_document_hash,
                     "metadataHash": package.metadata_hash,
                     "package": package
-                })
-            })
-        })
-        .collect::<Vec<_>>();
+        });
+        let item_bytes = serde_json::to_vec(&item).map_err(ApiError::internal)?.len();
+        if item_bytes > MAX_CDN_PUBLICATION_PACKAGE_BYTES {
+            return Err(ApiError::bad_request("resource_package_too_large"));
+        }
+        if response_bytes.saturating_add(item_bytes) > MAX_CDN_PUBLICATION_RESPONSE_BYTES {
+            return Err(ApiError::bad_request("batch_response_too_large"));
+        }
+        response_bytes = response_bytes.saturating_add(item_bytes);
+        items.push(item);
+    }
     Ok(Json(json!({
         "status": "ok",
         "requestedCount": request.jobs.len(),
@@ -8082,6 +8128,38 @@ capability_tree_file = "../capability-tree.json"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn api_cdn_publication_jobs_packages_rejects_too_many_jobs() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state_with_sqlite(dir.path()).await;
+        state
+            .config
+            .security
+            .admin
+            .static_tokens
+            .push("test-admin-token".to_owned());
+
+        let err = api_cdn_publication_jobs_packages(
+            HeaderMap::from_iter([(
+                axum::http::header::AUTHORIZATION,
+                HeaderValue::from_str("Bearer test-admin-token").unwrap(),
+            )]),
+            State(state),
+            Json(CdnPublicationJobsPackageRequest {
+                jobs: (0..=MAX_CDN_PUBLICATION_JOB_REQUESTS)
+                    .map(|index| CdnPublicationJobRef {
+                        job_key: format!("did:oan:SKLG:batch-{index}:1"),
+                    })
+                    .collect(),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "too_many_jobs");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn api_mark_published_advances_authorized_discovery_targets() {
         let dir = tempdir().unwrap();
         let mut state = app_state_with_sqlite(dir.path()).await;
@@ -8735,6 +8813,49 @@ capability_tree_file = "../capability-tree.json"
         assert!(cursors[&keys[0]] < cursors[&keys[1]]);
         assert!(!cursors.contains_key(&keys[2]));
         assert!(!cursors.contains_key(&keys[3]));
+    }
+
+    #[tokio::test]
+    async fn sqlite_initialization_backfills_legacy_publication_cursor() {
+        let dir = tempdir().unwrap();
+        let sqlite_url = format!("sqlite:{}", dir.path().join("legacy-root.db").display());
+        let sqlite = SqliteJsonStore::connect(&sqlite_url).await.unwrap();
+        sqlite
+            .execute_batch(&format!(
+                r#"
+                CREATE TABLE {ROOT_SUBJECT_VERSION_TABLE} (
+                    subject_did TEXT NOT NULL,
+                    version TEXT NOT NULL,
+                    did_document_hash TEXT NOT NULL,
+                    metadata_hash TEXT NOT NULL,
+                    package_json TEXT NOT NULL,
+                    archive_path TEXT NOT NULL,
+                    accepted_at TEXT NOT NULL,
+                    PRIMARY KEY(subject_did, version)
+                );
+                INSERT INTO {ROOT_SUBJECT_VERSION_TABLE}(
+                    subject_did, version, did_document_hash, metadata_hash,
+                    package_json, archive_path, accepted_at
+                ) VALUES (
+                    'did:oan:SKLG:legacy', '1', 'sha256:did', 'sha256:metadata',
+                    '{{}}', 'resources/legacy/1', '2026-09-18T00:00:00Z'
+                );
+                "#
+            ))
+            .await
+            .unwrap();
+
+        initialize_root_sqlite(&sqlite).await.unwrap();
+
+        let cursor = sqlx::query_scalar::<_, Option<i64>>(&format!(
+            "SELECT publication_cursor FROM {ROOT_SUBJECT_VERSION_TABLE}
+             WHERE subject_did = 'did:oan:SKLG:legacy' AND version = '1'"
+        ))
+        .fetch_one(sqlite.pool())
+        .await
+        .unwrap();
+        assert!(cursor.is_some());
+        assert!(cursor.unwrap() > 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

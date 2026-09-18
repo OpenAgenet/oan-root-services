@@ -6,6 +6,9 @@
 use super::*;
 use sqlx::Postgres;
 
+const MAX_CDN_PUBLICATION_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_CDN_PUBLICATION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct CdnPublicationBatchCompletion {
     pub marked_count: usize,
@@ -2137,7 +2140,7 @@ pub(super) async fn publication_cursors_for_jobs_impl(
     }
     if let Some(sqlite) = &state.sqlite {
         let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT subject_did, version, rowid FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
+            "SELECT subject_did, version, publication_cursor FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
         ));
         for (index, (_, subject_did, version)) in pairs.iter().enumerate() {
             if index > 0 {
@@ -2203,7 +2206,7 @@ pub(super) async fn resource_packages_for_jobs_impl(
     }
     if let Some(sqlite) = &state.sqlite {
         let mut builder = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT subject_did, version, package_json, rowid FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
+            "SELECT subject_did, version, package_json, publication_cursor FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE "
         ));
         for (index, (_, subject_did, version)) in pairs.iter().enumerate() {
             if index > 0 {
@@ -2218,10 +2221,19 @@ pub(super) async fn resource_packages_for_jobs_impl(
         }
         let rows = builder.build().fetch_all(sqlite.pool()).await?;
         let mut packages = BTreeMap::new();
+        let mut response_bytes = 0_usize;
         for row in rows {
             let subject_did = row.get::<String, _>(0);
             let version = row.get::<String, _>(1);
-            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(2))?;
+            let package_json = row.get::<String, _>(2);
+            if package_json.len() > MAX_CDN_PUBLICATION_PACKAGE_BYTES {
+                return Err(anyhow!("resource_package_too_large"));
+            }
+            response_bytes = response_bytes.saturating_add(package_json.len());
+            if response_bytes > MAX_CDN_PUBLICATION_RESPONSE_BYTES {
+                return Err(anyhow!("batch_response_too_large"));
+            }
+            let package = serde_json::from_str::<ResourcePackage>(&package_json)?;
             let publication_cursor = row.get::<i64, _>(3);
             packages.insert(
                 format!("{subject_did}:{version}"),
@@ -2249,9 +2261,18 @@ pub(super) async fn resource_packages_for_jobs_impl(
         ));
         let rows = builder.build().fetch_all(postgres.pool()).await?;
         let mut packages = BTreeMap::new();
+        let mut response_bytes = 0_usize;
         for row in rows {
             let job_key = row.get::<String, _>(0);
-            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
+            let package_json = row.get::<String, _>(1);
+            if package_json.len() > MAX_CDN_PUBLICATION_PACKAGE_BYTES {
+                return Err(anyhow!("resource_package_too_large"));
+            }
+            response_bytes = response_bytes.saturating_add(package_json.len());
+            if response_bytes > MAX_CDN_PUBLICATION_RESPONSE_BYTES {
+                return Err(anyhow!("batch_response_too_large"));
+            }
+            let package = serde_json::from_str::<ResourcePackage>(&package_json)?;
             let publication_cursor = row.get::<i64, _>(2);
             packages.insert(job_key, (package, publication_cursor));
         }
@@ -2602,10 +2623,10 @@ pub(super) async fn authorized_discovery_summary_items_impl(
         while scan_cursor < target_cursor && items_by_cursor.len() < max_items {
             let rows = sqlx::query(&format!(
                 r#"
-                SELECT rowid, package_json
+                SELECT publication_cursor, package_json
                 FROM {ROOT_SUBJECT_VERSION_TABLE}
-                WHERE rowid > ? AND rowid <= ?
-                ORDER BY rowid
+                WHERE publication_cursor > ? AND publication_cursor <= ?
+                ORDER BY publication_cursor
                 LIMIT ?
                 "#
             ))
