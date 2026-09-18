@@ -222,30 +222,63 @@ pub(super) async fn bootstrap_root_bulletin_from_json_impl(state: &AppState) -> 
     Ok(())
 }
 
-pub(super) async fn resource_versions_impl(state: &AppState, did: &str) -> Result<Vec<Value>> {
+#[derive(Debug)]
+pub(super) struct ResourceVersionsPage {
+    pub items: Vec<Value>,
+    pub next_version: Option<String>,
+    pub has_more: bool,
+}
+
+pub(super) async fn resource_versions_impl(
+    state: &AppState,
+    did: &str,
+    after_version: Option<&str>,
+    limit: u32,
+) -> Result<ResourceVersionsPage> {
+    let fetch_limit = i64::from(limit).saturating_add(1);
     if let Some(sqlite) = &state.sqlite {
         let rows = sqlx::query(&format!(
             r#"
             SELECT version, did_document_hash, metadata_hash, accepted_at
             FROM {ROOT_SUBJECT_VERSION_TABLE}
-            WHERE subject_did = ?
+            WHERE subject_did = ? AND (? IS NULL OR version > ?)
             ORDER BY version
+            LIMIT ?
             "#
         ))
         .bind(did)
+        .bind(after_version)
+        .bind(after_version)
+        .bind(fetch_limit)
         .fetch_all(sqlite.pool())
         .await?;
-        return Ok(rows
+        let mut items = rows
             .into_iter()
             .map(|row| {
-                json!({
+                Ok::<_, anyhow::Error>(json!({
                     "packageVersion": row.get::<String, _>(0),
                     "didDocumentHash": row.get::<String, _>(1),
                     "metadataHash": row.get::<String, _>(2),
                     "acceptedAt": row.get::<String, _>(3),
-                })
+                }))
             })
-            .collect());
+            .collect::<Result<Vec<_>>>()?;
+        let has_more = items.len() > limit as usize;
+        if has_more {
+            items.truncate(limit as usize);
+        }
+        return Ok(ResourceVersionsPage {
+            next_version: if has_more {
+                items
+                    .last()
+                    .and_then(|item| item["packageVersion"].as_str())
+                    .map(ToOwned::to_owned)
+            } else {
+                None
+            },
+            has_more,
+            items,
+        });
     }
     if let Some(postgres) = &state.postgres {
         let rows = sqlx::query(&format!(
@@ -253,26 +286,134 @@ pub(super) async fn resource_versions_impl(state: &AppState, did: &str) -> Resul
             SELECT version, did_document_hash, metadata_hash,
                    to_char(accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
             FROM {ROOT_SUBJECT_VERSION_TABLE}
-            WHERE subject_did = $1
+            WHERE subject_did = $1 AND ($2::text IS NULL OR version > $2)
             ORDER BY version
+            LIMIT $3
             "#
         ))
         .bind(did)
+        .bind(after_version)
+        .bind(fetch_limit)
         .fetch_all(postgres.pool())
         .await?;
-        return Ok(rows
+        let mut items = rows
             .into_iter()
             .map(|row| {
-                json!({
+                Ok::<_, anyhow::Error>(json!({
                     "packageVersion": row.get::<String, _>(0),
                     "didDocumentHash": row.get::<String, _>(1),
                     "metadataHash": row.get::<String, _>(2),
                     "acceptedAt": row.get::<String, _>(3),
-                })
+                }))
             })
-            .collect());
+            .collect::<Result<Vec<_>>>()?;
+        let has_more = items.len() > limit as usize;
+        if has_more {
+            items.truncate(limit as usize);
+        }
+        return Ok(ResourceVersionsPage {
+            next_version: if has_more {
+                items
+                    .last()
+                    .and_then(|item| item["packageVersion"].as_str())
+                    .map(ToOwned::to_owned)
+            } else {
+                None
+            },
+            has_more,
+            items,
+        });
     }
-    Ok(Vec::new())
+    Ok(ResourceVersionsPage {
+        items: Vec::new(),
+        next_version: None,
+        has_more: false,
+    })
+}
+
+#[derive(Debug)]
+pub(super) struct BulletinEventsPage {
+    pub items: Vec<Value>,
+    pub next: Option<u64>,
+    pub has_more: bool,
+}
+
+pub(super) fn bulletin_events_page_impl(
+    state: &AppState,
+    after: Option<u64>,
+    limit: u32,
+) -> Result<BulletinEventsPage> {
+    let fetch_limit = i64::from(limit).saturating_add(1);
+    block_on_sqlite(async {
+        if let Some(sqlite) = &state.sqlite {
+            let rows = sqlx::query(&format!(
+                "SELECT event_json FROM {ROOT_BULLETIN_EVENT_TABLE}
+                 WHERE (? IS NULL OR sequence > ?) ORDER BY sequence LIMIT ?"
+            ))
+            .bind(after.map(|value| value as i64))
+            .bind(after.map(|value| value as i64))
+            .bind(fetch_limit)
+            .fetch_all(sqlite.pool())
+            .await?;
+            let mut items = rows
+                .into_iter()
+                .map(|row| {
+                    serde_json::from_str::<Value>(&row.get::<String, _>(0))
+                        .map_err(anyhow::Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let has_more = items.len() > limit as usize;
+            if has_more {
+                items.truncate(limit as usize);
+            }
+            let next = items
+                .last()
+                .and_then(|item| item.get("core"))
+                .and_then(|core| core.get("sequence"))
+                .and_then(Value::as_u64);
+            return Ok(BulletinEventsPage {
+                items,
+                next: if has_more { next } else { None },
+                has_more,
+            });
+        }
+        if let Some(postgres) = &state.postgres {
+            let rows = sqlx::query(&format!(
+                "SELECT event_json::text FROM {ROOT_BULLETIN_EVENT_TABLE}
+                 WHERE ($1::bigint IS NULL OR sequence > $1) ORDER BY sequence LIMIT $2"
+            ))
+            .bind(after.map(|value| value as i64))
+            .bind(fetch_limit)
+            .fetch_all(postgres.pool())
+            .await?;
+            let mut items = rows
+                .into_iter()
+                .map(|row| {
+                    serde_json::from_str::<Value>(&row.get::<String, _>(0))
+                        .map_err(anyhow::Error::from)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let has_more = items.len() > limit as usize;
+            if has_more {
+                items.truncate(limit as usize);
+            }
+            let next = items
+                .last()
+                .and_then(|item| item.get("core"))
+                .and_then(|core| core.get("sequence"))
+                .and_then(Value::as_u64);
+            return Ok(BulletinEventsPage {
+                items,
+                next: if has_more { next } else { None },
+                has_more,
+            });
+        }
+        Ok(BulletinEventsPage {
+            items: Vec::new(),
+            next: None,
+            has_more: false,
+        })
+    })
 }
 
 pub(super) async fn resource_version_detail_impl(
@@ -2228,6 +2369,7 @@ async fn postgres_publication_projection_rows_by_cursor_range(
     state: &AppState,
     delivered_cursor: i64,
     target_cursor: i64,
+    max_items: usize,
 ) -> Result<Vec<PublicationProjectionRow>> {
     let Some(postgres) = &state.postgres else {
         return Ok(Vec::new());
@@ -2240,10 +2382,12 @@ async fn postgres_publication_projection_rows_by_cursor_range(
         FROM {ROOT_SUBJECT_VERSION_TABLE}
         WHERE publication_cursor > $1 AND publication_cursor <= $2
         ORDER BY publication_cursor
+        LIMIT $3
         "#
     ))
     .bind(delivered_cursor)
     .bind(target_cursor)
+    .bind(max_items as i64)
     .fetch_all(postgres.pool())
     .await?;
     rows.into_iter()
@@ -2423,6 +2567,7 @@ pub(super) async fn authorized_discovery_summary_items_impl(
     discovery_did: &str,
     delivered_cursor: i64,
     target_cursor: i64,
+    max_items: usize,
 ) -> Result<Vec<DiscoveryNotificationItem>> {
     if target_cursor <= delivered_cursor {
         return Ok(Vec::new());
@@ -2443,6 +2588,7 @@ pub(super) async fn authorized_discovery_summary_items_impl(
         discovery_did,
         delivered_cursor,
         target_cursor,
+        max_items,
     )
     .await?;
     let mut items_by_cursor = std::collections::BTreeMap::<i64, DiscoveryNotificationItem>::new();
@@ -2451,54 +2597,81 @@ pub(super) async fn authorized_discovery_summary_items_impl(
     }
 
     if let Some(sqlite) = &state.sqlite {
-        let rows = sqlx::query(&format!(
-            r#"
-            SELECT rowid, package_json
-            FROM {ROOT_SUBJECT_VERSION_TABLE}
-            WHERE rowid > ? AND rowid <= ?
-            ORDER BY rowid
-            "#
-        ))
-        .bind(delivered_cursor)
-        .bind(target_cursor)
-        .fetch_all(sqlite.pool())
-        .await?;
-        for row in rows {
-            let publication_cursor = row.get::<i64, _>(0);
-            if items_by_cursor.contains_key(&publication_cursor) {
-                continue;
+        let window = max_items.max(1).saturating_mul(4).max(100);
+        let mut scan_cursor = delivered_cursor;
+        while scan_cursor < target_cursor && items_by_cursor.len() < max_items {
+            let rows = sqlx::query(&format!(
+                r#"
+                SELECT rowid, package_json
+                FROM {ROOT_SUBJECT_VERSION_TABLE}
+                WHERE rowid > ? AND rowid <= ?
+                ORDER BY rowid
+                LIMIT ?
+                "#
+            ))
+            .bind(scan_cursor)
+            .bind(target_cursor)
+            .bind(window as i64)
+            .fetch_all(sqlite.pool())
+            .await?;
+            if rows.is_empty() {
+                break;
             }
-            let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
-            let item = discovery_notification_item_from_package(publication_cursor, package)?;
-            if authorized_domains_match(
-                &item.authorized_domains,
-                &discovery_auth.authorized_domains,
-            ) {
-                items_by_cursor.insert(publication_cursor, item);
+            let row_count = rows.len();
+            for row in rows {
+                let publication_cursor = row.get::<i64, _>(0);
+                scan_cursor = publication_cursor;
+                if items_by_cursor.contains_key(&publication_cursor) {
+                    continue;
+                }
+                let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?;
+                let item = discovery_notification_item_from_package(publication_cursor, package)?;
+                if authorized_domains_match(
+                    &item.authorized_domains,
+                    &discovery_auth.authorized_domains,
+                ) {
+                    items_by_cursor.insert(publication_cursor, item);
+                }
+            }
+            if row_count < window {
+                break;
             }
         }
-        return Ok(items_by_cursor.into_values().collect());
+        return Ok(items_by_cursor.into_values().take(max_items).collect());
     } else if state.postgres.is_some() {
-        let rows = postgres_publication_projection_rows_by_cursor_range(
-            state,
-            delivered_cursor,
-            target_cursor,
-        )
-        .await?;
-        for row in rows {
-            let publication_cursor = row.publication_cursor;
-            if items_by_cursor.contains_key(&publication_cursor) {
-                continue;
+        let window = max_items.max(1).saturating_mul(4).max(100);
+        let mut scan_cursor = delivered_cursor;
+        while scan_cursor < target_cursor && items_by_cursor.len() < max_items {
+            let rows = postgres_publication_projection_rows_by_cursor_range(
+                state,
+                scan_cursor,
+                target_cursor,
+                window,
+            )
+            .await?;
+            if rows.is_empty() {
+                break;
             }
-            let item = discovery_notification_item_from_projection(row);
-            if authorized_domains_match(
-                &item.authorized_domains,
-                &discovery_auth.authorized_domains,
-            ) {
-                items_by_cursor.insert(publication_cursor, item);
+            let row_count = rows.len();
+            for row in rows {
+                let publication_cursor = row.publication_cursor;
+                scan_cursor = publication_cursor;
+                if items_by_cursor.contains_key(&publication_cursor) {
+                    continue;
+                }
+                let item = discovery_notification_item_from_projection(row);
+                if authorized_domains_match(
+                    &item.authorized_domains,
+                    &discovery_auth.authorized_domains,
+                ) {
+                    items_by_cursor.insert(publication_cursor, item);
+                }
+            }
+            if row_count < window {
+                break;
             }
         }
-        return Ok(items_by_cursor.into_values().collect());
+        return Ok(items_by_cursor.into_values().take(max_items).collect());
     }
     Ok(items_by_cursor.into_values().collect())
 }
@@ -2508,6 +2681,7 @@ async fn load_authorized_discovery_summary_items_from_store(
     discovery_did: &str,
     delivered_cursor: i64,
     target_cursor: i64,
+    max_items: usize,
 ) -> Result<Vec<DiscoveryNotificationItem>> {
     if let Some(sqlite) = &state.sqlite {
         let db_rows = sqlx::query(&format!(
@@ -2518,11 +2692,13 @@ async fn load_authorized_discovery_summary_items_from_store(
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
             WHERE discovery_did = ? AND publication_cursor > ? AND publication_cursor <= ?
             ORDER BY publication_cursor
+            LIMIT ?
             "#
         ))
         .bind(discovery_did)
         .bind(delivered_cursor)
         .bind(target_cursor)
+        .bind(max_items as i64)
         .fetch_all(sqlite.pool())
         .await?;
         return db_rows
@@ -2553,11 +2729,13 @@ async fn load_authorized_discovery_summary_items_from_store(
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
             WHERE discovery_did = $1 AND publication_cursor > $2 AND publication_cursor <= $3
             ORDER BY publication_cursor
+            LIMIT $4
             "#
         ))
         .bind(discovery_did)
         .bind(delivered_cursor)
         .bind(target_cursor)
+        .bind(max_items as i64)
         .fetch_all(postgres.pool())
         .await?;
         return db_rows

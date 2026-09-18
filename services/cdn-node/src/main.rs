@@ -53,6 +53,17 @@ struct ResourceIndexQuery {
     limit: Option<i64>,
 }
 
+#[derive(Clone, Debug, Default, Deserialize)]
+struct PublishHistoryQuery {
+    #[serde(rename = "afterKey", default)]
+    after_key: Option<String>,
+    #[serde(default)]
+    limit: Option<u32>,
+}
+
+const CDN_DEFAULT_PAGE_SIZE: i64 = 100;
+const CDN_MAX_PAGE_SIZE: i64 = 500;
+
 #[derive(Clone, Debug, Deserialize)]
 struct ResourceBatchGetRequest {
     #[serde(rename = "resourceDids")]
@@ -751,25 +762,58 @@ async fn get_metadata(
     read_by_did(&state, "metadata", &did).await
 }
 
+async fn resource_count(state: &AppState) -> Result<i64> {
+    if let Some(sqlite) = &state.sqlite {
+        return Ok(sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {CDN_RESOURCE_PACKAGE_TABLE}"
+        ))
+        .fetch_one(sqlite.pool())
+        .await?);
+    }
+    if let Some(postgres) = &state.postgres {
+        return Ok(sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM {CDN_RESOURCE_PACKAGE_TABLE}"
+        ))
+        .fetch_one(postgres.pool())
+        .await?);
+    }
+    Ok(read_resource_index(state).await?.len() as i64)
+}
+
 async fn api_status(State(state): State<AppState>) -> ApiResult<serde_json::Value> {
-    let resources = read_resource_index(&state)
-        .await
-        .map_err(ApiError::internal)?;
+    let resource_count = resource_count(&state).await.map_err(ApiError::internal)?;
     Ok(Json(json!({
         "status": "ok",
-        "resourceCount": resources.len(),
+        "resourceCount": resource_count,
         "rootDid": read_root_meta(&state, "root_did").await.map_err(ApiError::internal)?,
         "generatedAt": read_root_meta(&state, "generated_at").await.map_err(ApiError::internal)?
     })))
 }
 
-async fn api_resources_catalog(State(state): State<AppState>) -> ApiResult<serde_json::Value> {
-    let resources = read_resource_index(&state)
+async fn api_resources_catalog(
+    State(state): State<AppState>,
+    Query(query): Query<ResourceIndexQuery>,
+) -> ApiResult<serde_json::Value> {
+    let after_cursor = query.after_cursor.unwrap_or(0).max(0);
+    let limit = query
+        .limit
+        .unwrap_or(CDN_DEFAULT_PAGE_SIZE)
+        .clamp(1, CDN_MAX_PAGE_SIZE);
+    let page = read_resource_index_page(&state, after_cursor, limit)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(
-        json!({ "items": resources, "count": resources.len() }),
-    ))
+    let items = page
+        .items
+        .into_iter()
+        .map(|item| item.package)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "items": items,
+        "count": items.len(),
+        "afterCursor": after_cursor,
+        "nextCursor": page.next_cursor,
+        "hasMore": page.has_more
+    })))
 }
 
 async fn api_resource_catalog_detail(
@@ -806,31 +850,76 @@ async fn api_metadata_detail(
 }
 
 async fn api_resource_catalog_stats(State(state): State<AppState>) -> ApiResult<serde_json::Value> {
-    let resources = read_resource_index(&state)
-        .await
-        .map_err(ApiError::internal)?;
     let mut resource_type_counts = serde_json::Map::new();
-    for package in &resources {
-        let key = package.resource_type.as_str();
-        let count = resource_type_counts
-            .get(key)
-            .and_then(Value::as_u64)
-            .unwrap_or(0)
-            + 1;
-        resource_type_counts.insert(key.to_owned(), json!(count));
-    }
+    let resource_count = if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            "SELECT resource_type, COUNT(*) FROM {CDN_RESOURCE_PACKAGE_TABLE} GROUP BY resource_type"
+        ))
+        .fetch_all(sqlite.pool())
+        .await
+        .map_err(|err| ApiError::internal(err.into()))?;
+        let mut total = 0_i64;
+        for row in rows {
+            let count = row.get::<i64, _>(1);
+            total += count;
+            resource_type_counts.insert(row.get::<String, _>(0), json!(count));
+        }
+        total
+    } else if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            "SELECT resource_type, COUNT(*) FROM {CDN_RESOURCE_PACKAGE_TABLE} GROUP BY resource_type"
+        ))
+        .fetch_all(postgres.pool())
+        .await
+        .map_err(|err| ApiError::internal(err.into()))?;
+        let mut total = 0_i64;
+        for row in rows {
+            let count = row.get::<i64, _>(1);
+            total += count;
+            resource_type_counts.insert(row.get::<String, _>(0), json!(count));
+        }
+        total
+    } else {
+        let resources = read_resource_index(&state)
+            .await
+            .map_err(ApiError::internal)?;
+        for package in &resources {
+            let key = package.resource_type.as_str();
+            let count = resource_type_counts
+                .get(key)
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                + 1;
+            resource_type_counts.insert(key.to_owned(), json!(count));
+        }
+        resources.len() as i64
+    };
     Ok(Json(json!({
-        "resourceCount": resources.len(),
+        "resourceCount": resource_count,
         "resourceTypeCounts": resource_type_counts,
         "version": OAN_RESOURCE_PROTOCOL_VERSION
     })))
 }
 
-async fn api_publish_history(State(state): State<AppState>) -> ApiResult<serde_json::Value> {
-    let history = read_publish_history(&state)
-        .await
-        .map_err(ApiError::internal)?;
-    Ok(Json(json!({ "items": history, "count": history.len() })))
+async fn api_publish_history(
+    State(state): State<AppState>,
+    Query(query): Query<PublishHistoryQuery>,
+) -> ApiResult<serde_json::Value> {
+    let limit = query
+        .limit
+        .unwrap_or(CDN_DEFAULT_PAGE_SIZE as u32)
+        .clamp(1, CDN_MAX_PAGE_SIZE as u32) as i64;
+    let (items, next_key, has_more) =
+        read_publish_history_page(&state, query.after_key.as_deref(), limit)
+            .await
+            .map_err(ApiError::internal)?;
+    Ok(Json(json!({
+        "items": items,
+        "count": items.len(),
+        "afterKey": query.after_key,
+        "nextKey": if has_more { next_key } else { None::<String> },
+        "hasMore": has_more
+    })))
 }
 
 async fn api_purge(
@@ -871,22 +960,16 @@ async fn api_resource_index(
     Query(query): Query<ResourceIndexQuery>,
 ) -> ApiResult<serde_json::Value> {
     let after_cursor = query.after_cursor.unwrap_or(0).max(0);
-    if query.after_cursor.is_some() || query.limit.is_some() {
-        let limit = query.limit.unwrap_or(500).clamp(1, 5_000);
-        let page = read_resource_index_page(&state, after_cursor, limit)
-            .await
-            .map_err(ApiError::internal)?;
-        return Ok(Json(
-            serde_json::to_value(page).map_err(|err| ApiError::internal(err.into()))?,
-        ));
-    }
-    let items = read_resource_index(&state)
+    let limit = query
+        .limit
+        .unwrap_or(CDN_DEFAULT_PAGE_SIZE)
+        .clamp(1, CDN_MAX_PAGE_SIZE);
+    let page = read_resource_index_page(&state, after_cursor, limit)
         .await
         .map_err(ApiError::internal)?;
-    Ok(Json(json!({
-        "items": items,
-        "count": items.len()
-    })))
+    Ok(Json(
+        serde_json::to_value(page).map_err(|err| ApiError::internal(err.into()))?,
+    ))
 }
 
 async fn read_resource_index_page(
@@ -1307,6 +1390,7 @@ async fn append_publish_history_values(state: &AppState, items: &[Value]) -> Res
     Ok(())
 }
 
+#[cfg(test)]
 async fn read_publish_history(state: &AppState) -> Result<Vec<Value>> {
     if let Some(sqlite) = &state.sqlite {
         let rows = sqlx::query(&format!(
@@ -1337,17 +1421,107 @@ async fn read_publish_history(state: &AppState) -> Result<Vec<Value>> {
     Ok(state.data.read("publish-history.json").unwrap_or_default())
 }
 
+async fn read_publish_history_page(
+    state: &AppState,
+    after_key: Option<&str>,
+    limit: i64,
+) -> Result<(Vec<Value>, Option<String>, bool)> {
+    let fetch_limit = limit.saturating_add(1);
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            "SELECT history_key, item_json
+             FROM {CDN_PUBLISH_HISTORY_TABLE}
+             WHERE (? IS NULL OR history_key > ?)
+             ORDER BY history_key
+             LIMIT ?"
+        ))
+        .bind(after_key)
+        .bind(after_key)
+        .bind(fetch_limit)
+        .fetch_all(sqlite.pool())
+        .await?;
+        let fetched_len = rows.len();
+        let mut items = Vec::new();
+        let mut next_key = None;
+        for row in rows.into_iter().take(limit as usize) {
+            next_key = Some(row.get::<String, _>(0));
+            items.push(serde_json::from_str::<Value>(&row.get::<String, _>(1))?);
+        }
+        let has_more = fetched_len > limit as usize;
+        return Ok((items, next_key, has_more));
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            "SELECT history_key, item_json::text
+             FROM {CDN_PUBLISH_HISTORY_TABLE}
+             WHERE ($1::text IS NULL OR history_key > $1)
+             ORDER BY history_key
+             LIMIT $2"
+        ))
+        .bind(after_key)
+        .bind(fetch_limit)
+        .fetch_all(postgres.pool())
+        .await?;
+        let fetched_len = rows.len();
+        let mut items = Vec::new();
+        let mut next_key = None;
+        for row in rows.into_iter().take(limit as usize) {
+            next_key = Some(row.get::<String, _>(0));
+            items.push(serde_json::from_str::<Value>(&row.get::<String, _>(1))?);
+        }
+        let has_more = fetched_len > limit as usize;
+        return Ok((items, next_key, has_more));
+    }
+    let history: Vec<Value> = state.data.read("publish-history.json").unwrap_or_default();
+    let start = after_key
+        .and_then(|key| key.parse::<usize>().ok())
+        .unwrap_or(0);
+    let mut items = history
+        .into_iter()
+        .skip(start)
+        .take(limit as usize + 1)
+        .collect::<Vec<_>>();
+    let has_more = items.len() > limit as usize;
+    if has_more {
+        items.truncate(limit as usize);
+    }
+    let next_key = if has_more {
+        Some((start + items.len()).to_string())
+    } else {
+        None
+    };
+    Ok((std::mem::take(&mut items), next_key, has_more))
+}
+
 async fn export_cdn_debug_snapshot(state: &AppState) -> Result<()> {
     if state.sqlite.is_none() && state.postgres.is_none() {
         return Ok(());
     }
-    let resources = read_resource_index(state).await?;
-    let index = resources
-        .into_iter()
-        .map(|package| (package.resource_did.clone(), package))
-        .collect::<BTreeMap<_, _>>();
+    let mut after_cursor = 0;
+    let mut index = BTreeMap::new();
+    loop {
+        let page = read_resource_index_page(state, after_cursor, CDN_DEFAULT_PAGE_SIZE).await?;
+        let next = page.next_cursor;
+        for item in page.items {
+            index.insert(item.package.resource_did.clone(), item.package);
+        }
+        if !page.has_more {
+            break;
+        }
+        after_cursor = next;
+    }
     state.data.write("resources/index.json", &index)?;
-    let history = read_publish_history(state).await?;
+    let mut after_key = None;
+    let mut history = Vec::new();
+    loop {
+        let (items, next, has_more) =
+            read_publish_history_page(state, after_key.as_deref(), CDN_DEFAULT_PAGE_SIZE).await?;
+        history.extend(items);
+        if !has_more {
+            break;
+        }
+        after_key = next;
+    }
     state.data.write("publish-history.json", &history)?;
     Ok(())
 }
@@ -1510,6 +1684,7 @@ mod tests {
             }],
             authentication: vec![key_id.clone()],
             assertion_method: vec![key_id],
+            capability_invocation: vec![],
             service: vec![],
             oan_metadata: Some(OanMetadata {
                 subject_type: ResourceType::InfrastructureNode,
@@ -1552,6 +1727,7 @@ mod tests {
             }],
             authentication: vec![format!("{resource_did}#key-1")],
             assertion_method: vec![format!("{resource_did}#key-1")],
+            capability_invocation: vec![],
             service: vec![],
             oan_metadata: Some(OanMetadata {
                 subject_type: ResourceType::Skill,
@@ -1897,6 +2073,61 @@ mod tests {
         let stats = api_resource_catalog_stats(State(state)).await.unwrap();
         assert_eq!(stats.0["resourceCount"], 0);
         assert_eq!(stats.0["version"], OAN_RESOURCE_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn catalog_and_history_endpoints_are_bounded_by_default() {
+        let dir = tempdir().unwrap();
+        let sqlite =
+            SqliteJsonStore::connect(&format!("sqlite:{}", dir.path().join("cdn.db").display()))
+                .await
+                .unwrap();
+        initialize_cdn_sqlite(&sqlite).await.unwrap();
+        let mut state = app_state(dir.path());
+        state.sqlite = Some(sqlite);
+        let first = sample_resource_package();
+        let second =
+            sample_resource_package_with_did("did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu");
+        persist_published_resources_batch(
+            &state,
+            &[
+                ResourceCdnPublishBatchItem {
+                    publication_cursor: 1,
+                    package: first,
+                },
+                ResourceCdnPublishBatchItem {
+                    publication_cursor: 2,
+                    package: second,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let catalog = api_resources_catalog(
+            State(state.clone()),
+            Query(ResourceIndexQuery::default()),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(catalog["count"], 2);
+        assert_eq!(catalog["hasMore"], false);
+        assert!(catalog["nextCursor"].is_number());
+
+        let history = api_publish_history(
+            State(state),
+            Query(PublishHistoryQuery {
+                after_key: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(history["count"], 1);
+        assert_eq!(history["hasMore"], true);
+        assert!(history["nextKey"].is_string());
     }
 
     #[tokio::test]

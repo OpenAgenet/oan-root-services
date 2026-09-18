@@ -5,7 +5,7 @@
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -251,6 +251,22 @@ struct WorkerSecurityConfig {
     #[serde(default = "default_worker_http_timeout_seconds")]
     http_timeout_seconds: u64,
 }
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct ResourceVersionsQuery {
+    #[serde(rename = "afterVersion")]
+    after_version: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+struct BulletinEventsQuery {
+    after: Option<u64>,
+    limit: Option<u32>,
+}
+
+const ROOT_DEFAULT_PAGE_SIZE: u32 = 100;
+const ROOT_MAX_PAGE_SIZE: u32 = 500;
 
 impl Default for WorkerSecurityConfig {
     fn default() -> Self {
@@ -3290,12 +3306,26 @@ async fn api_discovery_detail(
 async fn api_resource_versions(
     State(state): State<AppState>,
     AxumPath(did): AxumPath<String>,
+    Query(query): Query<ResourceVersionsQuery>,
 ) -> ApiResult<Value> {
+    let limit = query.limit.unwrap_or(ROOT_DEFAULT_PAGE_SIZE);
+    if limit == 0 || limit > ROOT_MAX_PAGE_SIZE {
+        return Err(ApiError::bad_request(
+            "invalid_resource_versions_page_limit",
+        ));
+    }
     if state.sqlite.is_some() || state.postgres.is_some() {
-        let items = repository::resource_versions_impl(&state, &did)
-            .await
-            .map_err(ApiError::internal)?;
-        return Ok(Json(json!({ "did": did, "items": items })));
+        let page =
+            repository::resource_versions_impl(&state, &did, query.after_version.as_deref(), limit)
+                .await
+                .map_err(ApiError::internal)?;
+        return Ok(Json(json!({
+            "did": did,
+            "items": page.items,
+            "count": page.items.len(),
+            "nextVersion": page.next_version,
+            "hasMore": page.has_more
+        })));
     }
     let prefix = format!(
         "archive/{}",
@@ -3307,7 +3337,31 @@ async fn api_resource_versions(
         .ok()
         .and_then(|value| value.as_array().cloned())
         .unwrap_or_default();
-    Ok(Json(json!({ "did": did, "items": index })))
+    let mut items = index;
+    if let Some(after_version) = query.after_version.as_deref() {
+        items.retain(|item| {
+            item.get("packageVersion")
+                .and_then(Value::as_str)
+                .is_some_and(|version| version > after_version)
+        });
+    }
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next_version = if has_more {
+        items
+            .last()
+            .and_then(|item| item.get("packageVersion"))
+            .cloned()
+    } else {
+        None
+    };
+    Ok(Json(json!({
+        "did": did,
+        "items": items,
+        "count": items.len(),
+        "nextVersion": next_version,
+        "hasMore": has_more
+    })))
 }
 
 async fn api_resource_version_detail(
@@ -3520,9 +3574,44 @@ async fn api_validate_tags(
     })))
 }
 
-async fn api_bulletin_events(State(state): State<AppState>) -> ApiResult<Value> {
+async fn api_bulletin_events(
+    State(state): State<AppState>,
+    Query(query): Query<BulletinEventsQuery>,
+) -> ApiResult<Value> {
+    let limit = query.limit.unwrap_or(ROOT_DEFAULT_PAGE_SIZE);
+    if limit == 0 || limit > ROOT_MAX_PAGE_SIZE {
+        return Err(ApiError::bad_request("invalid_bulletin_page_limit"));
+    }
+    if state.sqlite.is_some() || state.postgres.is_some() {
+        let page = repository::bulletin_events_page_impl(&state, query.after, limit)
+            .map_err(ApiError::internal)?;
+        return Ok(Json(json!({
+            "items": page.items,
+            "count": page.items.len(),
+            "next": page.next,
+            "hasMore": page.has_more
+        })));
+    }
     let bulletin = read_bulletin(&state).map_err(ApiError::internal)?;
-    Ok(Json(json!({ "items": bulletin.events })))
+    let mut items = bulletin
+        .events
+        .into_iter()
+        .filter(|event| query.after.is_none_or(|after| event.core.sequence > after))
+        .map(|event| serde_json::to_value(event).map_err(ApiError::internal))
+        .collect::<Result<Vec<_>, _>>()?;
+    let has_more = items.len() > limit as usize;
+    items.truncate(limit as usize);
+    let next = items
+        .last()
+        .and_then(|item| item.get("core"))
+        .and_then(|core| core.get("sequence"))
+        .cloned();
+    Ok(Json(json!({
+        "items": items,
+        "count": items.len(),
+        "next": if has_more { next } else { None },
+        "hasMore": has_more
+    })))
 }
 
 async fn api_bulletin_event_detail(
@@ -4910,12 +4999,14 @@ async fn authorized_discovery_summary_items(
     discovery_did: &str,
     delivered_cursor: i64,
     target_cursor: i64,
+    max_items: usize,
 ) -> Result<Vec<DiscoveryNotificationItem>> {
     repository::authorized_discovery_summary_items_impl(
         state,
         discovery_did,
         delivered_cursor,
         target_cursor,
+        max_items,
     )
     .await
 }
@@ -5176,17 +5267,15 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         }));
                     }
                 };
-                let mut summary_items = authorized_discovery_summary_items(
+                let summary_items = authorized_discovery_summary_items(
                     &state,
                     &lease.discovery_did,
                     lease.delivered_cursor,
                     lease.target_cursor,
+                    discovery_item_batch_size.max(1),
                 )
                 .await?;
                 let max_items = discovery_item_batch_size.max(1);
-                if summary_items.len() > max_items {
-                    summary_items.truncate(max_items);
-                }
                 let batch_target_cursor = summary_items
                     .last()
                     .map(|item| item.publication_cursor)
@@ -7121,6 +7210,7 @@ mod tests {
         let versions = api_resource_versions(
             State(state.clone()),
             axum::extract::Path(resource_did().to_owned()),
+            Query(ResourceVersionsQuery::default()),
         )
         .await
         .unwrap();
@@ -7133,6 +7223,55 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(detail.0["package"]["packageVersion"], "1.0.0");
+    }
+
+    #[tokio::test]
+    async fn resource_versions_reject_zero_limit_and_page_versions() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+
+        for version in ["1.0.0", "1.1.0"] {
+            let request = resource_verify_request_with_version(
+                &state,
+                &registrar_key,
+                &resource_key,
+                PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+                version,
+            );
+            verify_resource_and_publish(State(state.clone()), Json(request))
+                .await
+                .unwrap();
+        }
+
+        let invalid = api_resource_versions(
+            State(state.clone()),
+            axum::extract::Path(resource_did().to_owned()),
+            Query(ResourceVersionsQuery {
+                after_version: None,
+                limit: Some(0),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+
+        let page = api_resource_versions(
+            State(state),
+            axum::extract::Path(resource_did().to_owned()),
+            Query(ResourceVersionsQuery {
+                after_version: None,
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(page["count"], 1);
+        assert_eq!(page["hasMore"], true);
+        assert_eq!(page["nextVersion"], "1.0.0");
     }
 
     #[tokio::test]
@@ -8363,9 +8502,10 @@ capability_tree_file = "../capability-tree.json"
         .await
         .unwrap();
         assert_eq!(completion.advanced_discovery_count, target_cursors.len());
-        let items = authorized_discovery_summary_items(&state, discovery_did(), 0, i64::MAX)
-            .await
-            .unwrap();
+        let items =
+            authorized_discovery_summary_items(&state, discovery_did(), 0, i64::MAX, 10_000)
+                .await
+                .unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].package_version, "1");
         assert_eq!(items[0].capability_tags, vec!["openagenet.local.agent"]);
@@ -8514,9 +8654,10 @@ capability_tree_file = "../capability-tree.json"
             .await
             .unwrap();
 
-        let items = authorized_discovery_summary_items(&state, discovery_did(), 0, i64::MAX)
-            .await
-            .unwrap();
+        let items =
+            authorized_discovery_summary_items(&state, discovery_did(), 0, i64::MAX, 10_000)
+                .await
+                .unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].publication_cursor, 1);
         assert_eq!(items[1].publication_cursor, 2);

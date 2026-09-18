@@ -1545,6 +1545,7 @@ dependencies = [
 name = "oan-storage"
 version = "1.0.0"
 dependencies = [
+ "futures-util",
  "serde",
  "serde_json",
  "sqlx",
