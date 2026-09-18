@@ -1491,6 +1491,7 @@ mod tests {
                 verification_method: vec![],
                 authentication: vec![],
                 assertion_method: vec![],
+                capability_invocation: vec![],
                 service: vec![],
                 oan_metadata: None,
             },

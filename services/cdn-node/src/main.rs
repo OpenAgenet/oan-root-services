@@ -794,11 +794,8 @@ async fn api_resources_catalog(
     State(state): State<AppState>,
     Query(query): Query<ResourceIndexQuery>,
 ) -> ApiResult<serde_json::Value> {
+    let limit = validated_resource_index_limit(query.limit)?;
     let after_cursor = query.after_cursor.unwrap_or(0).max(0);
-    let limit = query
-        .limit
-        .unwrap_or(CDN_DEFAULT_PAGE_SIZE)
-        .clamp(1, CDN_MAX_PAGE_SIZE);
     let page = read_resource_index_page(&state, after_cursor, limit)
         .await
         .map_err(ApiError::internal)?;
@@ -959,17 +956,22 @@ async fn api_resource_index(
     State(state): State<AppState>,
     Query(query): Query<ResourceIndexQuery>,
 ) -> ApiResult<serde_json::Value> {
+    let limit = validated_resource_index_limit(query.limit)?;
     let after_cursor = query.after_cursor.unwrap_or(0).max(0);
-    let limit = query
-        .limit
-        .unwrap_or(CDN_DEFAULT_PAGE_SIZE)
-        .clamp(1, CDN_MAX_PAGE_SIZE);
     let page = read_resource_index_page(&state, after_cursor, limit)
         .await
         .map_err(ApiError::internal)?;
     Ok(Json(
         serde_json::to_value(page).map_err(|err| ApiError::internal(err.into()))?,
     ))
+}
+
+fn validated_resource_index_limit(limit: Option<i64>) -> Result<i64, ApiError> {
+    let limit = limit.unwrap_or(CDN_DEFAULT_PAGE_SIZE);
+    if !(1..=CDN_MAX_PAGE_SIZE).contains(&limit) {
+        return Err(ApiError::bad_request("invalid_resource_index_page_limit"));
+    }
+    Ok(limit)
 }
 
 async fn read_resource_index_page(
@@ -2088,6 +2090,8 @@ mod tests {
         let first = sample_resource_package();
         let second =
             sample_resource_package_with_did("did:oan:SKLG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu");
+        let first_did = first.resource_did.clone();
+        let second_did = second.resource_did.clone();
         persist_published_resources_batch(
             &state,
             &[
@@ -2103,10 +2107,22 @@ mod tests {
         )
         .await
         .unwrap();
+        append_publish_history_values(
+            &state,
+            &[
+                json!({"resourceDid": first_did}),
+                json!({"resourceDid": second_did}),
+            ],
+        )
+        .await
+        .unwrap();
 
         let catalog = api_resources_catalog(
             State(state.clone()),
-            Query(ResourceIndexQuery::default()),
+            Query(ResourceIndexQuery {
+                after_cursor: None,
+                limit: None,
+            }),
         )
         .await
         .unwrap()
@@ -2128,6 +2144,36 @@ mod tests {
         assert_eq!(history["count"], 1);
         assert_eq!(history["hasMore"], true);
         assert!(history["nextKey"].is_string());
+    }
+
+    #[tokio::test]
+    async fn resource_index_rejects_invalid_page_limits() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+
+        let err = api_resource_index(
+            State(state.clone()),
+            Query(ResourceIndexQuery {
+                after_cursor: None,
+                limit: Some(0),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "invalid_resource_index_page_limit");
+
+        let err = api_resources_catalog(
+            State(state),
+            Query(ResourceIndexQuery {
+                after_cursor: None,
+                limit: Some(CDN_MAX_PAGE_SIZE + 1),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "invalid_resource_index_page_limit");
     }
 
     #[tokio::test]

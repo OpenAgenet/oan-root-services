@@ -7241,7 +7241,7 @@ mod tests {
                 PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
                 version,
             );
-            verify_resource_and_publish(State(state.clone()), Json(request))
+            let _ = verify_resource_and_publish(State(state.clone()), Json(request))
                 .await
                 .unwrap();
         }
