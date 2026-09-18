@@ -34,6 +34,8 @@ use std::{
 use tokio::{task::JoinSet, time::Duration as TokioDuration};
 use url::Url;
 
+const ROOT_BATCH_MAX_JOBS: usize = 100;
+
 #[derive(Clone, Debug, Deserialize)]
 struct Config {
     server: ServerConfig,
@@ -1145,56 +1147,58 @@ async fn fetch_resource_packages_batch(
         &state.config.root.endpoint,
         &state.config.root.package_batch_path,
     )?;
-    let jobs = events
-        .iter()
-        .map(|event| {
-            json!({
-                "jobKey": event.job_key
-            })
-        })
-        .collect::<Vec<_>>();
-    let response = state
-        .client
-        .post(url)
-        .bearer_auth(admin_token)
-        .json(&json!({ "jobs": jobs }))
-        .send()
-        .await?;
-    let status = response.status();
-    let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        return Err(anyhow!("root_package_batch_failed:{status}:{value}"));
-    }
-    let items = serde_json::from_value::<Vec<RootBatchPackageItem>>(
-        value
-            .get("items")
-            .cloned()
-            .ok_or_else(|| anyhow!("root_package_batch_items_missing"))?,
-    )?;
     let mut packages = BTreeMap::new();
-    for item in items {
-        if item.job_key.trim().is_empty() {
-            return Err(anyhow!("root_package_batch_job_key_missing"));
+    for chunk in events.chunks(ROOT_BATCH_MAX_JOBS) {
+        let jobs = chunk
+            .iter()
+            .map(|event| {
+                json!({
+                    "jobKey": event.job_key
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = state
+            .client
+            .post(url.clone())
+            .bearer_auth(admin_token)
+            .json(&json!({ "jobs": jobs }))
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            return Err(anyhow!("root_package_batch_failed:{status}:{value}"));
         }
-        if item.publication_cursor <= 0 {
-            return Err(anyhow!("root_package_batch_cursor_missing"));
+        let items = serde_json::from_value::<Vec<RootBatchPackageItem>>(
+            value
+                .get("items")
+                .cloned()
+                .ok_or_else(|| anyhow!("root_package_batch_items_missing"))?,
+        )?;
+        for item in items {
+            if item.job_key.trim().is_empty() {
+                return Err(anyhow!("root_package_batch_job_key_missing"));
+            }
+            if item.publication_cursor <= 0 {
+                return Err(anyhow!("root_package_batch_cursor_missing"));
+            }
+            if item.resource_did != item.package.resource_did {
+                return Err(anyhow!("root_package_batch_resource_did_mismatch"));
+            }
+            if item.package_version != item.package.package_version {
+                return Err(anyhow!("root_package_batch_package_version_mismatch"));
+            }
+            if item.package_hash != item.package.package_hash {
+                return Err(anyhow!("root_package_batch_package_hash_mismatch"));
+            }
+            if item.did_document_hash != item.package.did_document_hash {
+                return Err(anyhow!("root_package_batch_did_document_hash_mismatch"));
+            }
+            if item.metadata_hash != item.package.metadata_hash {
+                return Err(anyhow!("root_package_batch_metadata_hash_mismatch"));
+            }
+            packages.insert(item.job_key, (item.publication_cursor, item.package));
         }
-        if item.resource_did != item.package.resource_did {
-            return Err(anyhow!("root_package_batch_resource_did_mismatch"));
-        }
-        if item.package_version != item.package.package_version {
-            return Err(anyhow!("root_package_batch_package_version_mismatch"));
-        }
-        if item.package_hash != item.package.package_hash {
-            return Err(anyhow!("root_package_batch_package_hash_mismatch"));
-        }
-        if item.did_document_hash != item.package.did_document_hash {
-            return Err(anyhow!("root_package_batch_did_document_hash_mismatch"));
-        }
-        if item.metadata_hash != item.package.metadata_hash {
-            return Err(anyhow!("root_package_batch_metadata_hash_mismatch"));
-        }
-        packages.insert(item.job_key, (item.publication_cursor, item.package));
     }
     Ok(packages)
 }
@@ -1304,17 +1308,19 @@ async fn mark_root_jobs_published(
         &state.config.root.mark_published_path,
     )?;
     let jobs = build_mark_published_jobs(items);
-    let response = state
-        .client
-        .post(url)
-        .bearer_auth(admin_token)
-        .json(&json!({ "jobs": jobs }))
-        .send()
-        .await?;
-    let status = response.status();
-    let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
-    if !status.is_success() {
-        return Err(anyhow!("root_mark_published_failed:{status}:{value}"));
+    for chunk in jobs.chunks(ROOT_BATCH_MAX_JOBS) {
+        let response = state
+            .client
+            .post(url.clone())
+            .bearer_auth(admin_token)
+            .json(&json!({ "jobs": chunk }))
+            .send()
+            .await?;
+        let status = response.status();
+        let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+        if !status.is_success() {
+            return Err(anyhow!("root_mark_published_failed:{status}:{value}"));
+        }
     }
     Ok(())
 }
@@ -1438,6 +1444,7 @@ mod tests {
     use oan_crypto::{generate_keypair, SigningKey as OanSigningKey};
     use oan_package::{ResourceMetadata, RootProof};
     use oan_publication_events::CDN_PUBLISH_REQUESTED_EVENT_TYPE;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn test_state() -> AppState {
         let keypair = generate_keypair(CryptoSuite::Ed25519Sha256).unwrap();
@@ -1543,6 +1550,22 @@ mod tests {
             metadata_hash: "sha256:metadata".to_owned(),
             created_at: Utc::now(),
         })
+    }
+
+    fn sample_event_for(index: usize) -> CdnPublishRequestedEvent {
+        let mut event = sample_event();
+        event.job_key = format!("did:oan:AGUS:test-{index}:1.0.0");
+        event.resource_did = format!("did:oan:AGUS:test-{index}");
+        event.publication_cursor = index as i64 + 1;
+        event
+    }
+
+    fn sample_package_for(index: usize) -> ResourcePackage {
+        let mut package = sample_package();
+        package.resource_did = format!("did:oan:AGUS:test-{index}");
+        package.did_document.id = package.resource_did.clone();
+        package.metadata.resource_did = package.resource_did.clone();
+        package
     }
 
     #[test]
@@ -1733,6 +1756,148 @@ mod tests {
         assert_eq!(classified.prepared.len(), 1);
         assert_eq!(classified.prepared[0].1, 42);
         assert_eq!(classified.prepared[0].2.resource_did, "did:oan:AGUS:test");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fetches_root_packages_in_root_limited_chunks() {
+        #[derive(Clone)]
+        struct HandlerState {
+            calls: Arc<AtomicUsize>,
+        }
+
+        async fn package_batch_handler(
+            State(state): State<HandlerState>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            let jobs = body
+                .get("jobs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(jobs.len() <= ROOT_BATCH_MAX_JOBS);
+            let items = jobs
+                .into_iter()
+                .enumerate()
+                .map(|(offset, job)| {
+                    let job_key = job.get("jobKey").and_then(Value::as_str).unwrap();
+                    let index = job_key
+                        .trim_start_matches("did:oan:AGUS:test-")
+                        .trim_end_matches(":1.0.0")
+                        .parse::<usize>()
+                        .unwrap();
+                    let package = sample_package_for(index);
+                    json!({
+                        "jobKey": job_key,
+                        "publicationCursor": index as i64 + 1,
+                        "resourceDid": package.resource_did,
+                        "packageVersion": package.package_version,
+                        "packageHash": package.package_hash,
+                        "didDocumentHash": package.did_document_hash,
+                        "metadataHash": package.metadata_hash,
+                        "package": package,
+                        "offset": offset
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(json!({
+                "status": "ok",
+                "requestedCount": items.len(),
+                "foundCount": items.len(),
+                "items": items
+            }))
+        }
+
+        let handler_state = HandlerState {
+            calls: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route(
+                "/root/internal/cdn-publication-jobs/packages",
+                axum::routing::post(package_batch_handler),
+            )
+            .with_state(handler_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state();
+        state.config.root.endpoint = format!("http://{addr}");
+        state.config.root.admin_token = Some("test-admin".to_owned());
+        let events = (0..=ROOT_BATCH_MAX_JOBS)
+            .map(sample_event_for)
+            .collect::<Vec<_>>();
+        let event_refs = events.iter().collect::<Vec<_>>();
+        let packages = fetch_resource_packages_batch(&state, &event_refs)
+            .await
+            .unwrap();
+
+        assert_eq!(packages.len(), ROOT_BATCH_MAX_JOBS + 1);
+        assert_eq!(handler_state.calls.load(Ordering::SeqCst), 2);
+        assert!(packages.contains_key("did:oan:AGUS:test-0:1.0.0"));
+        assert!(packages.contains_key("did:oan:AGUS:test-100:1.0.0"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn marks_root_jobs_published_in_root_limited_chunks() {
+        #[derive(Clone)]
+        struct HandlerState {
+            calls: Arc<AtomicUsize>,
+            jobs: Arc<AtomicUsize>,
+        }
+
+        async fn mark_published_handler(
+            State(state): State<HandlerState>,
+            Json(body): Json<Value>,
+        ) -> Json<Value> {
+            state.calls.fetch_add(1, Ordering::SeqCst);
+            let jobs = body
+                .get("jobs")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            assert!(jobs.len() <= ROOT_BATCH_MAX_JOBS);
+            state.jobs.fetch_add(jobs.len(), Ordering::SeqCst);
+            Json(json!({
+                "status": "ok",
+                "markedCount": jobs.len()
+            }))
+        }
+
+        let handler_state = HandlerState {
+            calls: Arc::new(AtomicUsize::new(0)),
+            jobs: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route(
+                "/root/internal/cdn-publication-jobs/mark-published",
+                axum::routing::post(mark_published_handler),
+            )
+            .with_state(handler_state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut state = test_state();
+        state.config.root.endpoint = format!("http://{addr}");
+        state.config.root.admin_token = Some("test-admin".to_owned());
+        let packages = (0..=ROOT_BATCH_MAX_JOBS)
+            .map(|index| (index as i64 + 1, sample_package_for(index)))
+            .collect::<Vec<_>>();
+        let request = build_cdn_batch_publish_request(&state, packages).unwrap();
+        mark_root_jobs_published(&state, &request.items)
+            .await
+            .unwrap();
+
+        assert_eq!(handler_state.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            handler_state.jobs.load(Ordering::SeqCst),
+            ROOT_BATCH_MAX_JOBS + 1
+        );
     }
 
     #[test]
