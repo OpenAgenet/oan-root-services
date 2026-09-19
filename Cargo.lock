@@ -234,6 +234,7 @@ dependencies = [
  "axum",
  "chrono",
  "ed25519-dalek",
+ "futures",
  "oan-core",
  "oan-crypto",
  "oan-package",

@@ -13,6 +13,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
+use futures::TryStreamExt;
 use oan_core::DidDocument;
 use oan_package::ResourcePackage;
 use oan_protocol::{
@@ -930,10 +931,7 @@ async fn api_publish_history(
     State(state): State<AppState>,
     Query(query): Query<PublishHistoryQuery>,
 ) -> ApiResult<serde_json::Value> {
-    let limit = query
-        .limit
-        .unwrap_or(CDN_DEFAULT_PAGE_SIZE as u32)
-        .clamp(1, CDN_MAX_PAGE_SIZE as u32) as i64;
+    let limit = validated_publish_history_limit(query.limit)?;
     let (items, next_key, has_more) =
         read_publish_history_page(&state, query.after_key.as_deref(), limit)
             .await
@@ -945,6 +943,14 @@ async fn api_publish_history(
         "nextKey": if has_more { next_key } else { None::<String> },
         "hasMore": has_more
     })))
+}
+
+fn validated_publish_history_limit(limit: Option<u32>) -> Result<i64, ApiError> {
+    let limit = limit.unwrap_or(CDN_DEFAULT_PAGE_SIZE as u32);
+    if !(1..=CDN_MAX_PAGE_SIZE as u32).contains(&limit) {
+        return Err(ApiError::bad_request("invalid_publish_history_page_limit"));
+    }
+    Ok(i64::from(limit))
 }
 
 async fn api_purge(
@@ -1016,8 +1022,9 @@ async fn read_resource_index_page(
     let fetch_limit = page_limit + 1;
     let mut rows = Vec::<ResourceCdnIndexItem>::new();
     let mut page_bytes = 0_usize;
+    let mut has_more = false;
     if let Some(sqlite) = &state.sqlite {
-        let db_rows = sqlx::query(&format!(
+        let query = format!(
             r#"
             SELECT publication_cursor, package_json
             FROM {CDN_RESOURCE_PACKAGE_TABLE}
@@ -1025,12 +1032,12 @@ async fn read_resource_index_page(
             ORDER BY publication_cursor, resource_did
             LIMIT ?
             "#
-        ))
-        .bind(after_cursor)
-        .bind(fetch_limit)
-        .fetch_all(sqlite.pool())
-        .await?;
-        for row in db_rows {
+        );
+        let mut db_rows = sqlx::query(&query)
+            .bind(after_cursor)
+            .bind(page_limit)
+            .fetch(sqlite.pool());
+        while let Some(row) = db_rows.try_next().await? {
             let package_json = row.get::<String, _>(1);
             push_resource_index_item(
                 &mut rows,
@@ -1039,8 +1046,18 @@ async fn read_resource_index_page(
                 &package_json,
             )?;
         }
+        let probe_cursor = rows.last().map(|item| item.cursor).unwrap_or(after_cursor);
+        has_more = sqlx::query(&format!(
+            "SELECT 1 FROM {CDN_RESOURCE_PACKAGE_TABLE}
+             WHERE publication_cursor > ?
+             LIMIT 1"
+        ))
+        .bind(probe_cursor)
+        .fetch_optional(sqlite.pool())
+        .await?
+        .is_some();
     } else if let Some(postgres) = &state.postgres {
-        let db_rows = sqlx::query(&format!(
+        let query = format!(
             r#"
             SELECT publication_cursor, package_json::text
             FROM {CDN_RESOURCE_PACKAGE_TABLE}
@@ -1048,12 +1065,12 @@ async fn read_resource_index_page(
             ORDER BY publication_cursor, resource_did
             LIMIT $2
             "#
-        ))
-        .bind(after_cursor)
-        .bind(fetch_limit)
-        .fetch_all(postgres.pool())
-        .await?;
-        for row in db_rows {
+        );
+        let mut db_rows = sqlx::query(&query)
+            .bind(after_cursor)
+            .bind(page_limit)
+            .fetch(postgres.pool());
+        while let Some(row) = db_rows.try_next().await? {
             let package_json = row.get::<String, _>(1);
             push_resource_index_item(
                 &mut rows,
@@ -1062,6 +1079,16 @@ async fn read_resource_index_page(
                 &package_json,
             )?;
         }
+        let probe_cursor = rows.last().map(|item| item.cursor).unwrap_or(after_cursor);
+        has_more = sqlx::query(&format!(
+            "SELECT 1 FROM {CDN_RESOURCE_PACKAGE_TABLE}
+             WHERE publication_cursor > $1
+             LIMIT 1"
+        ))
+        .bind(probe_cursor)
+        .fetch_optional(postgres.pool())
+        .await?
+        .is_some();
     } else {
         let mut indexed = state
             .data
@@ -1094,10 +1121,6 @@ async fn read_resource_index_page(
                 package: item.package,
             });
         }
-    }
-    let has_more = rows.len() as i64 > page_limit;
-    if has_more {
-        rows.truncate(page_limit as usize);
     }
     let next_cursor = rows.last().map(|item| item.cursor).unwrap_or(after_cursor);
     Ok(ResourceCdnIndexResponse {
@@ -2226,7 +2249,7 @@ mod tests {
         assert!(catalog["nextCursor"].is_number());
 
         let history = api_publish_history(
-            State(state),
+            State(state.clone()),
             Query(PublishHistoryQuery {
                 after_key: None,
                 limit: Some(1),
@@ -2238,6 +2261,84 @@ mod tests {
         assert_eq!(history["count"], 1);
         assert_eq!(history["hasMore"], true);
         assert!(history["nextKey"].is_string());
+
+        let tail = api_publish_history(
+            State(state.clone()),
+            Query(PublishHistoryQuery {
+                after_key: history["nextKey"].as_str().map(ToOwned::to_owned),
+                limit: Some(1),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(tail["count"], 1);
+        assert_eq!(tail["hasMore"], false);
+    }
+
+    #[tokio::test]
+    async fn sqlite_resource_index_stops_before_an_oversized_extra_row() {
+        let dir = tempdir().unwrap();
+        let sqlite =
+            SqliteJsonStore::connect(&format!("sqlite:{}", dir.path().join("cdn.db").display()))
+                .await
+                .unwrap();
+        initialize_cdn_sqlite(&sqlite).await.unwrap();
+        let mut state = app_state(dir.path());
+        state.sqlite = Some(sqlite);
+
+        let first = sample_resource_package();
+        let second =
+            sample_resource_package_with_did("did:oan:SKLG:stream-bbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        persist_published_resources_batch(
+            &state,
+            &[
+                ResourceCdnPublishBatchItem {
+                    publication_cursor: 1,
+                    package: first,
+                },
+                ResourceCdnPublishBatchItem {
+                    publication_cursor: 2,
+                    package: second,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let oversized =
+            sample_resource_package_with_did("did:oan:SKLG:stream-cccccccccccccccccccccccccccc");
+        let oversized_json =
+            serde_json::to_string(&oversized).unwrap() + &"x".repeat(MAX_INDEX_PACKAGE_BYTES);
+        sqlx::query(&format!(
+            "INSERT INTO {CDN_RESOURCE_PACKAGE_TABLE}
+             (resource_did, publication_cursor, resource_type, package_version, package_json, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)"
+        ))
+        .bind(&oversized.resource_did)
+        .bind(3_i64)
+        .bind(oversized.resource_type.as_str())
+        .bind(&oversized.package_version)
+        .bind(oversized_json)
+        .bind(Utc::now().to_rfc3339())
+        .execute(state.sqlite.as_ref().unwrap().pool())
+        .await
+        .unwrap();
+
+        let page = api_resource_index(
+            State(state),
+            Query(ResourceIndexQuery {
+                after_cursor: None,
+                limit: Some(2),
+            }),
+        )
+        .await
+        .unwrap()
+        .0;
+
+        assert_eq!(page["count"], 2);
+        assert_eq!(page["hasMore"], true);
+        assert_eq!(page["nextCursor"], 2);
     }
 
     #[tokio::test]
@@ -2268,6 +2369,27 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "invalid_resource_index_page_limit");
+    }
+
+    #[tokio::test]
+    async fn publish_history_rejects_invalid_page_limits() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+
+        for limit in [Some(0), Some(CDN_MAX_PAGE_SIZE as u32 + 1)] {
+            let err = api_publish_history(
+                State(state.clone()),
+                Query(PublishHistoryQuery {
+                    after_key: None,
+                    limit,
+                }),
+            )
+            .await
+            .unwrap_err();
+
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(err.message, "invalid_publish_history_page_limit");
+        }
     }
 
     #[tokio::test]
