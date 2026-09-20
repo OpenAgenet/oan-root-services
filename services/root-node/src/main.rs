@@ -76,6 +76,9 @@ const ROOT_BULLETIN_EVENT_TABLE: &str = "root_bulletin_events";
 const ROOT_SUBJECT_LATEST_TABLE: &str = "root_subject_latest";
 const ROOT_SUBJECT_VERSION_TABLE: &str = "root_subject_versions";
 const ROOT_PACKAGE_JOB_TABLE: &str = "root_verified_package_jobs";
+const ROOT_IDENTITY_RESOURCE_TABLE: &str = "root_identity_resources";
+const ROOT_IDENTITY_BINDING_TABLE: &str = "root_identity_bindings";
+const ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE: &str = "root_identity_bootstrap_state";
 const ROOT_DEBUG_EXPORT_INTERVAL_MS: u64 = 2_000;
 const ROOT_STATUS_CACHE_TTL_MS: u64 = 500;
 const FORUM_IDENTITY_DIRECTORY_ACCEPTED_AFTER: &str = "2026-09-14T16:00:00Z";
@@ -534,9 +537,25 @@ struct VerifiedAuthorityBinding {
 }
 
 #[derive(Clone, Debug)]
-struct ForumResourcePackage {
-    package: ResourcePackage,
+struct IdentityResourceProjection {
+    identity_did: String,
+    resource_did: String,
+    resource_type: String,
+    did_document_hash: String,
+    package_version: String,
+    publication_cursor: i64,
     accepted_at: DateTime<Utc>,
+    eligible: bool,
+}
+
+#[derive(Clone, Debug)]
+struct IdentityBindingProjection {
+    controller_did: String,
+    verification_method: String,
+    public_key_jwk: Option<Value>,
+    public_key_multibase: Option<String>,
+    accepted_at: DateTime<Utc>,
+    status: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -1188,6 +1207,9 @@ async fn main() -> Result<()> {
     };
 
     bootstrap_root_bulletin_from_json(&state).await?;
+    if let Err(err) = bootstrap_identity_directory_projection(&state).await {
+        eprintln!("identity directory projection bootstrap skipped: {err}");
+    }
     if state.config.security.trust_indexer.enabled {
         reconcile_governance_state(&state).await?;
     }
@@ -1200,10 +1222,7 @@ async fn main() -> Result<()> {
         .route("/root/registrars/{did}", get(api_registrar_detail))
         .route("/root/discovery-nodes", get(api_discovery_nodes))
         .route("/root/discovery-nodes/{did}", get(api_discovery_detail))
-        .route(
-            "/root/forum/identity-directory",
-            get(api_forum_identity_directory),
-        )
+        .route("/root/identity-directory", get(api_identity_directory))
         .route(
             "/root/infrastructure/authorization-vcs/issue",
             post(issue_infrastructure_authorization_vc),
@@ -1949,6 +1968,35 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 authorized_domains_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
+            CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_RESOURCE_TABLE} (
+                resource_did TEXT PRIMARY KEY,
+                identity_did TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                did_document_hash TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                publication_cursor INTEGER NOT NULL,
+                accepted_at TEXT NOT NULL,
+                eligible INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_BINDING_TABLE} (
+                controller_did TEXT NOT NULL,
+                resource_did TEXT NOT NULL,
+                verification_method TEXT NOT NULL,
+                public_key_jwk TEXT,
+                public_key_multibase TEXT,
+                accepted_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY(controller_did, resource_did, verification_method)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} (
+                name TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                last_cursor INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                last_error TEXT
+            );
             "#
         ))
         .await?;
@@ -2052,6 +2100,35 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb,
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
+            CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_RESOURCE_TABLE} (
+                resource_did TEXT PRIMARY KEY,
+                identity_did TEXT NOT NULL,
+                resource_type TEXT NOT NULL,
+                did_document_hash TEXT NOT NULL,
+                package_version TEXT NOT NULL,
+                publication_cursor BIGINT NOT NULL,
+                accepted_at TIMESTAMPTZ NOT NULL,
+                eligible BOOLEAN NOT NULL DEFAULT TRUE,
+                updated_at TIMESTAMPTZ NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_BINDING_TABLE} (
+                controller_did TEXT NOT NULL,
+                resource_did TEXT NOT NULL,
+                verification_method TEXT NOT NULL,
+                public_key_jwk JSONB,
+                public_key_multibase TEXT,
+                accepted_at TIMESTAMPTZ NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL,
+                PRIMARY KEY(controller_did, resource_did, verification_method)
+            );
+            CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} (
+                name TEXT PRIMARY KEY,
+                status TEXT NOT NULL,
+                last_cursor BIGINT NOT NULL DEFAULT 0,
+                updated_at TIMESTAMPTZ NOT NULL,
+                last_error TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_root_subject_versions_subject_version
             ON {ROOT_SUBJECT_VERSION_TABLE}(subject_did, accepted_at DESC);
             CREATE INDEX IF NOT EXISTS idx_root_subject_versions_cursor
@@ -2071,6 +2148,10 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
             ON {ROOT_DISCOVERY_ITEM_TABLE}(discovery_did, publication_cursor);
             CREATE INDEX IF NOT EXISTS idx_root_discovery_items_gc
             ON {ROOT_DISCOVERY_ITEM_TABLE}(discovery_did, publication_cursor DESC);
+            CREATE INDEX IF NOT EXISTS idx_root_identity_resources_identity
+            ON {ROOT_IDENTITY_RESOURCE_TABLE}(identity_did, accepted_at, publication_cursor);
+            CREATE INDEX IF NOT EXISTS idx_root_identity_bindings_controller
+            ON {ROOT_IDENTITY_BINDING_TABLE}(controller_did, accepted_at);
             "#
         ))
         .await?;
@@ -4134,56 +4215,43 @@ async fn api_resource_detail(
     Ok(Json(json!({ "resourceDid": did, "package": package })))
 }
 
-async fn api_forum_identity_directory(State(state): State<AppState>) -> ApiResult<Value> {
-    let packages = latest_forum_resource_packages(&state)
+async fn api_identity_directory(State(state): State<AppState>) -> ApiResult<Value> {
+    let resources = read_identity_resource_projections(&state)
         .await
         .map_err(ApiError::internal)?;
     let generated_at = Utc::now().to_rfc3339();
-    let accepted_after = forum_identity_directory_cutoff();
+    let accepted_after = identity_directory_cutoff();
     let mut identities = BTreeMap::<String, ForumIdentityDirectoryItem>::new();
-    let verified_bindings = load_verified_authority_bindings(&state).map_err(ApiError::internal)?;
 
-    for forum_package in packages
+    for resource in resources
         .into_iter()
-        .filter(|item| item.accepted_at >= accepted_after)
+        .filter(|item| item.eligible && item.accepted_at >= accepted_after)
     {
-        let package = forum_package.package;
-        let Some(identity_did) = forum_identity_did_for_package(&package) else {
-            continue;
-        };
-        let entry =
-            identities
-                .entry(identity_did.clone())
-                .or_insert_with(|| ForumIdentityDirectoryItem {
-                    did: identity_did.clone(),
-                    status: "active".to_owned(),
-                    did_document_hashes: Vec::new(),
-                    public_keys: Vec::new(),
-                    resource_count: 0,
-                    resource_dids: Vec::new(),
-                    resource_types: Vec::new(),
-                    node_operator: false,
-                    updated_at: generated_at.clone(),
-                });
+        let entry = identities
+            .entry(resource.identity_did.clone())
+            .or_insert_with(|| ForumIdentityDirectoryItem {
+                did: resource.identity_did.clone(),
+                status: "active".to_owned(),
+                did_document_hashes: Vec::new(),
+                public_keys: Vec::new(),
+                resource_count: 0,
+                resource_dids: Vec::new(),
+                resource_types: Vec::new(),
+                node_operator: false,
+                updated_at: generated_at.clone(),
+            });
 
         entry.resource_count += 1;
-        push_unique(&mut entry.resource_dids, package.resource_did.clone());
-        push_unique(
-            &mut entry.resource_types,
-            serde_json::to_value(&package.resource_type)
-                .ok()
-                .and_then(|value| value.as_str().map(ToOwned::to_owned))
-                .unwrap_or_else(|| "unknown".to_owned()),
-        );
-        push_unique(
-            &mut entry.did_document_hashes,
-            package.did_document_hash.clone(),
-        );
-        entry.node_operator |= package.resource_type == ResourceType::InfrastructureNode;
+        push_unique(&mut entry.resource_dids, resource.resource_did);
+        push_unique(&mut entry.resource_types, resource.resource_type.clone());
+        push_unique(&mut entry.did_document_hashes, resource.did_document_hash);
+        entry.node_operator |= resource.resource_type == "infrastructure_node";
     }
 
-    for binding in verified_bindings
-        .into_values()
+    for binding in read_identity_binding_projections(&state)
+        .await
+        .map_err(ApiError::internal)?
+        .into_iter()
         .filter(|binding| binding.accepted_at >= accepted_after && binding.status == "active")
     {
         if let Some(entry) = identities.get_mut(&binding.controller_did) {
@@ -4211,16 +4279,17 @@ async fn api_forum_identity_directory(State(state): State<AppState>) -> ApiResul
     })))
 }
 
-async fn latest_forum_resource_packages(state: &AppState) -> Result<Vec<ForumResourcePackage>> {
+async fn read_identity_resource_projections(
+    state: &AppState,
+) -> Result<Vec<IdentityResourceProjection>> {
     if let Some(sqlite) = &state.sqlite {
         let rows = sqlx::query(&format!(
             r#"
-            SELECT versions.package_json, versions.accepted_at
-            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
-            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
-              ON versions.subject_did = latest.subject_did
-             AND versions.version = latest.current_version
-            ORDER BY latest.subject_did
+            SELECT identity_did, resource_did, resource_type, did_document_hash,
+                   package_version, publication_cursor, accepted_at, eligible
+            FROM {ROOT_IDENTITY_RESOURCE_TABLE}
+            WHERE eligible = 1
+            ORDER BY identity_did, resource_did
             "#
         ))
         .fetch_all(sqlite.pool())
@@ -4228,11 +4297,15 @@ async fn latest_forum_resource_packages(state: &AppState) -> Result<Vec<ForumRes
         return rows
             .into_iter()
             .map(|row| {
-                let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?;
-                let accepted_at = parse_forum_identity_timestamp(&row.get::<String, _>(1))?;
-                Ok(ForumResourcePackage {
-                    package,
-                    accepted_at,
+                Ok(IdentityResourceProjection {
+                    identity_did: row.get::<String, _>(0),
+                    resource_did: row.get::<String, _>(1),
+                    resource_type: row.get::<String, _>(2),
+                    did_document_hash: row.get::<String, _>(3),
+                    package_version: row.get::<String, _>(4),
+                    publication_cursor: row.get::<i64, _>(5),
+                    accepted_at: parse_identity_timestamp(&row.get::<String, _>(6))?,
+                    eligible: row.get::<i64, _>(7) != 0,
                 })
             })
             .collect();
@@ -4240,13 +4313,13 @@ async fn latest_forum_resource_packages(state: &AppState) -> Result<Vec<ForumRes
     if let Some(postgres) = &state.postgres {
         let rows = sqlx::query(&format!(
             r#"
-            SELECT versions.package_json::text,
-                   to_char(versions.accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
-            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
-            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
-              ON versions.subject_did = latest.subject_did
-             AND versions.version = latest.current_version
-            ORDER BY latest.subject_did
+            SELECT identity_did, resource_did, resource_type, did_document_hash,
+                   package_version, publication_cursor,
+                   to_char(accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                   eligible
+            FROM {ROOT_IDENTITY_RESOURCE_TABLE}
+            WHERE eligible = TRUE
+            ORDER BY identity_did, resource_did
             "#
         ))
         .fetch_all(postgres.pool())
@@ -4254,11 +4327,15 @@ async fn latest_forum_resource_packages(state: &AppState) -> Result<Vec<ForumRes
         return rows
             .into_iter()
             .map(|row| {
-                let package = serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(0))?;
-                let accepted_at = parse_forum_identity_timestamp(&row.get::<String, _>(1))?;
-                Ok(ForumResourcePackage {
-                    package,
-                    accepted_at,
+                Ok(IdentityResourceProjection {
+                    identity_did: row.get::<String, _>(0),
+                    resource_did: row.get::<String, _>(1),
+                    resource_type: row.get::<String, _>(2),
+                    did_document_hash: row.get::<String, _>(3),
+                    package_version: row.get::<String, _>(4),
+                    publication_cursor: row.get::<i64, _>(5),
+                    accepted_at: parse_identity_timestamp(&row.get::<String, _>(6))?,
+                    eligible: row.get::<bool, _>(7),
                 })
             })
             .collect();
@@ -4266,16 +4343,84 @@ async fn latest_forum_resource_packages(state: &AppState) -> Result<Vec<ForumRes
     Ok(Vec::new())
 }
 
-fn forum_identity_directory_cutoff() -> DateTime<Utc> {
-    parse_forum_identity_timestamp(FORUM_IDENTITY_DIRECTORY_ACCEPTED_AFTER)
-        .expect("forum identity directory cutoff must be a valid RFC3339 timestamp")
+async fn read_identity_binding_projections(
+    state: &AppState,
+) -> Result<Vec<IdentityBindingProjection>> {
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT controller_did, verification_method, public_key_jwk,
+                   public_key_multibase, accepted_at, status
+            FROM {ROOT_IDENTITY_BINDING_TABLE}
+            WHERE status = 'active'
+            ORDER BY controller_did, resource_did, verification_method
+            "#
+        ))
+        .fetch_all(sqlite.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| {
+                let public_key_jwk = row
+                    .get::<Option<String>, _>(2)
+                    .map(|value| serde_json::from_str::<Value>(&value))
+                    .transpose()?;
+                Ok(IdentityBindingProjection {
+                    controller_did: row.get::<String, _>(0),
+                    verification_method: row.get::<String, _>(1),
+                    public_key_jwk,
+                    public_key_multibase: row.get::<Option<String>, _>(3),
+                    accepted_at: parse_identity_timestamp(&row.get::<String, _>(4))?,
+                    status: row.get::<String, _>(5),
+                })
+            })
+            .collect();
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT controller_did, verification_method, public_key_jwk::text,
+                   public_key_multibase,
+                   to_char(accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'),
+                   status
+            FROM {ROOT_IDENTITY_BINDING_TABLE}
+            WHERE status = 'active'
+            ORDER BY controller_did, resource_did, verification_method
+            "#
+        ))
+        .fetch_all(postgres.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| {
+                let public_key_jwk = row
+                    .get::<Option<String>, _>(2)
+                    .map(|value| serde_json::from_str::<Value>(&value))
+                    .transpose()?;
+                Ok(IdentityBindingProjection {
+                    controller_did: row.get::<String, _>(0),
+                    verification_method: row.get::<String, _>(1),
+                    public_key_jwk,
+                    public_key_multibase: row.get::<Option<String>, _>(3),
+                    accepted_at: parse_identity_timestamp(&row.get::<String, _>(4))?,
+                    status: row.get::<String, _>(5),
+                })
+            })
+            .collect();
+    }
+    Ok(Vec::new())
 }
 
-fn parse_forum_identity_timestamp(value: &str) -> Result<DateTime<Utc>> {
+fn identity_directory_cutoff() -> DateTime<Utc> {
+    parse_identity_timestamp(FORUM_IDENTITY_DIRECTORY_ACCEPTED_AFTER)
+        .expect("identity directory cutoff must be a valid RFC3339 timestamp")
+}
+
+fn parse_identity_timestamp(value: &str) -> Result<DateTime<Utc>> {
     Ok(DateTime::parse_from_rfc3339(value)?.with_timezone(&Utc))
 }
 
-fn forum_identity_did_for_package(package: &ResourcePackage) -> Option<String> {
+fn identity_did_for_package(package: &ResourcePackage) -> Option<String> {
     package
         .did_document
         .oan_metadata
@@ -4304,6 +4449,541 @@ fn forum_identity_did_for_package(package: &ResourcePackage) -> Option<String> {
         })
 }
 
+async fn bootstrap_identity_directory_projection(state: &AppState) -> Result<()> {
+    if state.sqlite.is_none() && state.postgres.is_none() {
+        return Ok(());
+    }
+    bootstrap_identity_binding_projections(state).await?;
+    backfill_identity_resource_projections(state, 100).await
+}
+
+async fn bootstrap_identity_binding_projections(state: &AppState) -> Result<()> {
+    if identity_bootstrap_status(state, "binding_projection")
+        .await?
+        .as_deref()
+        == Some("complete")
+    {
+        return Ok(());
+    }
+    let result = async {
+        for binding in load_verified_authority_bindings(state)?.into_values() {
+            if binding.status == "active" && binding.accepted_at >= identity_directory_cutoff() {
+                upsert_identity_binding_projection(state, &binding).await?;
+            }
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            upsert_identity_bootstrap_state(state, "binding_projection", "complete", 0, None).await
+        }
+        Err(err) => {
+            upsert_identity_bootstrap_state(
+                state,
+                "binding_projection",
+                "failed",
+                0,
+                Some(&err.to_string()),
+            )
+            .await?;
+            Err(err)
+        }
+    }
+}
+
+async fn identity_bootstrap_status(state: &AppState, name: &str) -> Result<Option<String>> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            "SELECT status FROM {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} WHERE name = ?"
+        ))
+        .bind(name)
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<String, _>(0)));
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            "SELECT status FROM {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} WHERE name = $1"
+        ))
+        .bind(name)
+        .fetch_optional(postgres.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<String, _>(0)));
+    }
+    Ok(None)
+}
+
+async fn identity_bootstrap_last_cursor(state: &AppState, name: &str) -> Result<i64> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            "SELECT last_cursor FROM {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} WHERE name = ?"
+        ))
+        .bind(name)
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<i64, _>(0)).unwrap_or_default());
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            "SELECT last_cursor FROM {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE} WHERE name = $1"
+        ))
+        .bind(name)
+        .fetch_optional(postgres.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<i64, _>(0)).unwrap_or_default());
+    }
+    Ok(0)
+}
+
+async fn upsert_identity_bootstrap_state(
+    state: &AppState,
+    name: &str,
+    status: &str,
+    last_cursor: i64,
+    last_error: Option<&str>,
+) -> Result<()> {
+    let updated_at = Utc::now().to_rfc3339();
+    if let Some(sqlite) = &state.sqlite {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE}(
+                name, status, last_cursor, updated_at, last_error
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(name)
+            DO UPDATE SET
+                status = excluded.status,
+                last_cursor = excluded.last_cursor,
+                updated_at = excluded.updated_at,
+                last_error = excluded.last_error
+            "#
+        ))
+        .bind(name)
+        .bind(status)
+        .bind(last_cursor)
+        .bind(&updated_at)
+        .bind(last_error)
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {ROOT_IDENTITY_BOOTSTRAP_STATE_TABLE}(
+                name, status, last_cursor, updated_at, last_error
+            )
+            VALUES ($1, $2, $3, $4::timestamptz, $5)
+            ON CONFLICT(name)
+            DO UPDATE SET
+                status = excluded.status,
+                last_cursor = excluded.last_cursor,
+                updated_at = excluded.updated_at,
+                last_error = excluded.last_error
+            "#
+        ))
+        .bind(name)
+        .bind(status)
+        .bind(last_cursor)
+        .bind(&updated_at)
+        .bind(last_error)
+        .execute(postgres.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn bootstrap_resource_projection_done(state: &AppState) -> Result<bool> {
+    Ok(identity_bootstrap_status(state, "resource_projection")
+        .await?
+        .as_deref()
+        == Some("complete"))
+}
+
+async fn mark_resource_projection_failed(
+    state: &AppState,
+    cursor: i64,
+    error: &anyhow::Error,
+) -> Result<()> {
+    upsert_identity_bootstrap_state(
+        state,
+        "resource_projection",
+        "failed",
+        cursor,
+        Some(&error.to_string()),
+    )
+    .await
+}
+
+async fn mark_resource_projection_progress(state: &AppState, cursor: i64) -> Result<()> {
+    upsert_identity_bootstrap_state(state, "resource_projection", "running", cursor, None).await
+}
+
+async fn mark_resource_projection_complete(state: &AppState, cursor: i64) -> Result<()> {
+    upsert_identity_bootstrap_state(state, "resource_projection", "complete", cursor, None).await
+}
+
+async fn backfill_identity_resource_projections(state: &AppState, batch_size: i64) -> Result<()> {
+    if bootstrap_resource_projection_done(state).await? {
+        return Ok(());
+    }
+    let cutoff = identity_directory_cutoff();
+    let mut after_cursor = identity_bootstrap_last_cursor(state, "resource_projection").await?;
+    loop {
+        let batch = latest_identity_backfill_batch(state, cutoff, after_cursor, batch_size).await?;
+        if batch.is_empty() {
+            mark_resource_projection_complete(state, after_cursor).await?;
+            break;
+        }
+        for item in batch {
+            let item_cursor = item.publication_cursor;
+            if let Err(err) = upsert_identity_resource_projection(state, &item.package).await {
+                mark_resource_projection_failed(state, after_cursor, &err).await?;
+                return Err(err);
+            }
+            after_cursor = item_cursor;
+            mark_resource_projection_progress(state, after_cursor).await?;
+        }
+    }
+    Ok(())
+}
+
+struct IdentityBackfillPackage {
+    publication_cursor: i64,
+    package: ResourcePackage,
+}
+
+async fn latest_identity_backfill_batch(
+    state: &AppState,
+    cutoff: DateTime<Utc>,
+    after_cursor: i64,
+    limit: i64,
+) -> Result<Vec<IdentityBackfillPackage>> {
+    if let Some(sqlite) = &state.sqlite {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT versions.publication_cursor, versions.package_json
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE versions.accepted_at >= ?
+              AND versions.publication_cursor > ?
+            ORDER BY versions.publication_cursor
+            LIMIT ?
+            "#
+        ))
+        .bind(cutoff.to_rfc3339())
+        .bind(after_cursor)
+        .bind(limit)
+        .fetch_all(sqlite.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| {
+                Ok(IdentityBackfillPackage {
+                    publication_cursor: row.get::<i64, _>(0),
+                    package: serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+                })
+            })
+            .collect();
+    }
+    if let Some(postgres) = &state.postgres {
+        let rows = sqlx::query(&format!(
+            r#"
+            SELECT versions.publication_cursor, versions.package_json::text
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE versions.accepted_at >= $1::timestamptz
+              AND versions.publication_cursor > $2
+            ORDER BY versions.publication_cursor
+            LIMIT $3
+            "#
+        ))
+        .bind(cutoff.to_rfc3339())
+        .bind(after_cursor)
+        .bind(limit)
+        .fetch_all(postgres.pool())
+        .await?;
+        return rows
+            .into_iter()
+            .map(|row| {
+                Ok(IdentityBackfillPackage {
+                    publication_cursor: row.get::<i64, _>(0),
+                    package: serde_json::from_str::<ResourcePackage>(&row.get::<String, _>(1))?,
+                })
+            })
+            .collect();
+    }
+    Ok(Vec::new())
+}
+
+fn resource_type_label(resource_type: &ResourceType) -> String {
+    serde_json::to_value(resource_type)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn identity_projection_from_package(
+    package: &ResourcePackage,
+) -> Option<IdentityResourceProjection> {
+    let identity_did = identity_did_for_package(package)?;
+    Some(IdentityResourceProjection {
+        identity_did,
+        resource_did: package.resource_did.clone(),
+        resource_type: resource_type_label(&package.resource_type),
+        did_document_hash: package.did_document_hash.clone(),
+        package_version: package.package_version.clone(),
+        publication_cursor: 0,
+        accepted_at: Utc::now(),
+        eligible: true,
+    })
+}
+
+async fn upsert_identity_resource_projection(
+    state: &AppState,
+    package: &ResourcePackage,
+) -> Result<()> {
+    let Some(mut projection) = identity_projection_from_package(package) else {
+        return Ok(());
+    };
+    projection.accepted_at = current_latest_accepted_at(state, &package.resource_did)
+        .await?
+        .unwrap_or(projection.accepted_at);
+    projection.publication_cursor = current_latest_publication_cursor(state, &package.resource_did)
+        .await?
+        .unwrap_or_default();
+    projection.eligible = projection.accepted_at >= identity_directory_cutoff();
+    let updated_at = Utc::now();
+    if let Some(sqlite) = &state.sqlite {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {ROOT_IDENTITY_RESOURCE_TABLE}(
+                resource_did, identity_did, resource_type, did_document_hash,
+                package_version, publication_cursor, accepted_at, eligible, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(resource_did)
+            DO UPDATE SET
+                identity_did = excluded.identity_did,
+                resource_type = excluded.resource_type,
+                did_document_hash = excluded.did_document_hash,
+                package_version = excluded.package_version,
+                publication_cursor = excluded.publication_cursor,
+                accepted_at = excluded.accepted_at,
+                eligible = excluded.eligible,
+                updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(&projection.resource_did)
+        .bind(&projection.identity_did)
+        .bind(&projection.resource_type)
+        .bind(&projection.did_document_hash)
+        .bind(&projection.package_version)
+        .bind(projection.publication_cursor)
+        .bind(projection.accepted_at.to_rfc3339())
+        .bind(if projection.eligible { 1_i64 } else { 0_i64 })
+        .bind(updated_at.to_rfc3339())
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {ROOT_IDENTITY_RESOURCE_TABLE}(
+                resource_did, identity_did, resource_type, did_document_hash,
+                package_version, publication_cursor, accepted_at, eligible, updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7::timestamptz, $8, $9::timestamptz)
+            ON CONFLICT(resource_did)
+            DO UPDATE SET
+                identity_did = excluded.identity_did,
+                resource_type = excluded.resource_type,
+                did_document_hash = excluded.did_document_hash,
+                package_version = excluded.package_version,
+                publication_cursor = excluded.publication_cursor,
+                accepted_at = excluded.accepted_at,
+                eligible = excluded.eligible,
+                updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(&projection.resource_did)
+        .bind(&projection.identity_did)
+        .bind(&projection.resource_type)
+        .bind(&projection.did_document_hash)
+        .bind(&projection.package_version)
+        .bind(projection.publication_cursor)
+        .bind(projection.accepted_at.to_rfc3339())
+        .bind(projection.eligible)
+        .bind(updated_at.to_rfc3339())
+        .execute(postgres.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn current_latest_accepted_at(
+    state: &AppState,
+    resource_did: &str,
+) -> Result<Option<DateTime<Utc>>> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT versions.accepted_at
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = ?
+            "#
+        ))
+        .bind(resource_did)
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return row
+            .map(|row| parse_identity_timestamp(&row.get::<String, _>(0)))
+            .transpose();
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT to_char(versions.accepted_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"')
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = $1
+            "#
+        ))
+        .bind(resource_did)
+        .fetch_optional(postgres.pool())
+        .await?;
+        return row
+            .map(|row| parse_identity_timestamp(&row.get::<String, _>(0)))
+            .transpose();
+    }
+    Ok(None)
+}
+
+async fn current_latest_publication_cursor(
+    state: &AppState,
+    resource_did: &str,
+) -> Result<Option<i64>> {
+    if let Some(sqlite) = &state.sqlite {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT versions.publication_cursor
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = ?
+            "#
+        ))
+        .bind(resource_did)
+        .fetch_optional(sqlite.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<i64, _>(0)));
+    }
+    if let Some(postgres) = &state.postgres {
+        let row = sqlx::query(&format!(
+            r#"
+            SELECT versions.publication_cursor
+            FROM {ROOT_SUBJECT_LATEST_TABLE} AS latest
+            JOIN {ROOT_SUBJECT_VERSION_TABLE} AS versions
+              ON versions.subject_did = latest.subject_did
+             AND versions.version = latest.current_version
+            WHERE latest.subject_did = $1
+            "#
+        ))
+        .bind(resource_did)
+        .fetch_optional(postgres.pool())
+        .await?;
+        return Ok(row.map(|row| row.get::<i64, _>(0)));
+    }
+    Ok(None)
+}
+
+async fn upsert_identity_binding_projection(
+    state: &AppState,
+    binding: &VerifiedAuthorityBinding,
+) -> Result<()> {
+    let updated_at = Utc::now();
+    if let Some(sqlite) = &state.sqlite {
+        let public_key_jwk = binding
+            .public_key_jwk
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {ROOT_IDENTITY_BINDING_TABLE}(
+                controller_did, resource_did, verification_method, public_key_jwk,
+                public_key_multibase, accepted_at, status, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(controller_did, resource_did, verification_method)
+            DO UPDATE SET
+                public_key_jwk = excluded.public_key_jwk,
+                public_key_multibase = excluded.public_key_multibase,
+                accepted_at = excluded.accepted_at,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(&binding.controller_did)
+        .bind(&binding.resource_did)
+        .bind(&binding.verification_method)
+        .bind(public_key_jwk)
+        .bind(&binding.public_key_multibase)
+        .bind(binding.accepted_at.to_rfc3339())
+        .bind(&binding.status)
+        .bind(updated_at.to_rfc3339())
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        let public_key_jwk = binding
+            .public_key_jwk
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()?;
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {ROOT_IDENTITY_BINDING_TABLE}(
+                controller_did, resource_did, verification_method, public_key_jwk,
+                public_key_multibase, accepted_at, status, updated_at
+            )
+            VALUES ($1, $2, $3, $4::jsonb, $5, $6::timestamptz, $7, $8::timestamptz)
+            ON CONFLICT(controller_did, resource_did, verification_method)
+            DO UPDATE SET
+                public_key_jwk = excluded.public_key_jwk,
+                public_key_multibase = excluded.public_key_multibase,
+                accepted_at = excluded.accepted_at,
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            "#
+        ))
+        .bind(&binding.controller_did)
+        .bind(&binding.resource_did)
+        .bind(&binding.verification_method)
+        .bind(public_key_jwk)
+        .bind(&binding.public_key_multibase)
+        .bind(binding.accepted_at.to_rfc3339())
+        .bind(&binding.status)
+        .bind(updated_at.to_rfc3339())
+        .execute(postgres.pool())
+        .await?;
+    }
+    Ok(())
+}
+
 fn verified_authority_binding_key(controller_did: &str, resource_did: &str) -> String {
     format!("{controller_did}|{resource_did}")
 }
@@ -4321,6 +5001,12 @@ async fn persist_verified_authority_binding(
     state: &AppState,
     binding: VerifiedAuthorityBinding,
 ) -> Result<()> {
+    if let Err(err) = upsert_identity_binding_projection(state, &binding).await {
+        eprintln!(
+            "identity directory binding projection skipped for {} controlled by {}: {err}",
+            binding.resource_did, binding.controller_did
+        );
+    }
     let mut bindings = load_verified_authority_bindings(state)?;
     bindings.insert(
         verified_authority_binding_key(&binding.controller_did, &binding.resource_did),
@@ -4578,6 +5264,12 @@ fn archive_resource_verified(state: &AppState, package: &ResourcePackage) -> Res
 
 async fn persist_resource_acceptance(state: &AppState, package: &ResourcePackage) -> Result<()> {
     repository::persist_resource_acceptance_impl(state, package).await?;
+    if let Err(err) = upsert_identity_resource_projection(state, package).await {
+        eprintln!(
+            "identity directory resource projection skipped for {}: {err}",
+            package.resource_did
+        );
+    }
     invalidate_status_counts_cache(state);
     signal_worker_event(state, true);
     Ok(())
@@ -5672,7 +6364,7 @@ fn tag(id: &str, label: &str, parent: Option<&str>, aliases: &[&str]) -> Capabil
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{routing::post, Router};
+    use axum::{body::Body, http::Request, routing::post, Router};
     use chrono::Duration;
     use oan_core::{
         CryptoSuite, ImplementationLink, OanMetadata, ProtocolBinding, ResourceDescription,
@@ -5687,6 +6379,7 @@ mod tests {
         SubjectControlProofBundle, PURPOSE_RESOURCE_REGISTRATION,
     };
     use tempfile::tempdir;
+    use tower::ServiceExt;
 
     fn root_did() -> &'static str {
         "did:oan:AGRT:5HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
@@ -6772,7 +7465,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(publish_response.0["status"], "resource-verified-and-queued");
-        let response = api_forum_identity_directory(State(state)).await.unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
         let item = response.0["items"]
             .as_array()
             .unwrap()
@@ -7321,7 +8014,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forum_identity_directory_lists_registered_resource_identities() {
+    async fn identity_directory_lists_registered_resource_identities() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
         let registrar_key = generate_ed25519_keypair();
@@ -7337,7 +8030,7 @@ mod tests {
             .await
             .unwrap();
 
-        let response = api_forum_identity_directory(State(state)).await.unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
         assert_eq!(response.0["acceptedAfter"], "2026-09-14T16:00:00+00:00");
         let item = &response.0["items"][0];
         assert_eq!(item["did"], "did:oan:AGUS:8HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu");
@@ -7348,7 +8041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forum_identity_directory_excludes_resources_before_cutoff() {
+    async fn identity_directory_excludes_resources_before_cutoff() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
         let registrar_key = generate_ed25519_keypair();
@@ -7366,7 +8059,7 @@ mod tests {
 
         let sqlite = state.sqlite.as_ref().unwrap();
         sqlx::query(&format!(
-            "UPDATE {ROOT_SUBJECT_VERSION_TABLE} SET accepted_at = ? WHERE subject_did = ?"
+            "UPDATE {ROOT_IDENTITY_RESOURCE_TABLE} SET accepted_at = ?, eligible = 0 WHERE resource_did = ?"
         ))
         .bind("2026-09-14T15:59:59Z")
         .bind(resource_did())
@@ -7374,12 +8067,12 @@ mod tests {
         .await
         .unwrap();
 
-        let response = api_forum_identity_directory(State(state)).await.unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
         assert!(response.0["items"].as_array().unwrap().is_empty());
     }
 
     #[tokio::test]
-    async fn forum_identity_directory_does_not_infer_keys_from_did_document() {
+    async fn identity_directory_does_not_infer_keys_from_did_document() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
         let registrar_key = generate_ed25519_keypair();
@@ -7398,10 +8091,266 @@ mod tests {
         package.metadata.publisher_did = Some(package.resource_did.clone());
         persist_resource_acceptance(&state, &package).await.unwrap();
 
-        let response = api_forum_identity_directory(State(state)).await.unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
         let item = &response.0["items"][0];
         assert_eq!(item["did"], resource_did());
         assert_eq!(item["publicKeys"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn identity_directory_route_replaces_old_forum_path() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let app = Router::new()
+            .route("/root/identity-directory", get(api_identity_directory))
+            .with_state(state);
+
+        let new_response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/root/identity-directory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let old_response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/root/forum/identity-directory")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(new_response.status(), StatusCode::OK);
+        assert_eq!(old_response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn identity_directory_does_not_fallback_to_full_package_scan() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let package = package_from_request(&state, &request);
+        repository::persist_resource_acceptance_impl(&state, &package)
+            .await
+            .unwrap();
+
+        let response = api_identity_directory(State(state)).await.unwrap();
+
+        assert!(response.0["items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn identity_directory_backfill_reads_cutoff_candidates_into_projection() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let package = package_from_request(&state, &request);
+        repository::persist_resource_acceptance_impl(&state, &package)
+            .await
+            .unwrap();
+
+        backfill_identity_resource_projections(&state, 1)
+            .await
+            .unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
+
+        let items = response.0["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["resourceDids"][0], resource_did());
+    }
+
+    #[tokio::test]
+    async fn identity_directory_backfill_continues_when_projection_partially_exists() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let package_a = package_from_request(&state, &request);
+        let mut package_b = package_a.clone();
+        package_b.resource_did = "did:oan:SKLG:9DirectorySecondResource".to_owned();
+        package_b.did_document.id = package_b.resource_did.clone();
+        package_b.metadata.resource_did = package_b.resource_did.clone();
+        package_b.metadata.subject_did = Some(package_b.resource_did.clone());
+        repository::persist_resource_acceptance_impl(&state, &package_a)
+            .await
+            .unwrap();
+        repository::persist_resource_acceptance_impl(&state, &package_b)
+            .await
+            .unwrap();
+        upsert_identity_resource_projection(&state, &package_a)
+            .await
+            .unwrap();
+
+        backfill_identity_resource_projections(&state, 1)
+            .await
+            .unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
+        let mut dids = response.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|item| item["resourceDids"].as_array().unwrap().iter())
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        dids.sort_unstable();
+
+        assert_eq!(
+            dids,
+            vec![resource_did(), "did:oan:SKLG:9DirectorySecondResource",]
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_directory_merges_binding_after_resource_projection() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let controller_did = "did:oan:AGUS:9DirectoryBindingFirst";
+        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+        let binding = verify_controller_authorization_for_submission(&state, &request)
+            .unwrap()
+            .unwrap();
+        upsert_identity_binding_projection(&state, &binding)
+            .await
+            .unwrap();
+        let package = package_from_request(&state, &request);
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        let response = api_identity_directory(State(state)).await.unwrap();
+        let item = response.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["did"] == controller_did)
+            .unwrap();
+
+        assert_eq!(item["resourceCount"], 1);
+        assert_eq!(item["publicKeys"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            item["publicKeys"][0]["id"],
+            format!("{controller_did}#key-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn identity_directory_bootstrap_projects_existing_verified_bindings() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let controller_did = "did:oan:AGUS:9DirectoryBootstrapBinding";
+        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+        let binding = verify_controller_authorization_for_submission(&state, &request)
+            .unwrap()
+            .unwrap();
+        let mut bindings = BTreeMap::new();
+        bindings.insert(
+            verified_authority_binding_key(&binding.controller_did, &binding.resource_did),
+            binding,
+        );
+        state
+            .data
+            .write(
+                "authority-bindings/verified-controller-bindings.json",
+                &bindings,
+            )
+            .unwrap();
+        let package = package_from_request(&state, &request);
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        bootstrap_identity_binding_projections(&state)
+            .await
+            .unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
+        let item = response.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["did"] == controller_did)
+            .unwrap();
+
+        assert_eq!(item["publicKeys"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn identity_directory_replaces_resource_identity_projection() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let mut package = package_from_request(&state, &request);
+        if let Some(metadata) = package.did_document.oan_metadata.as_mut() {
+            metadata.controller_did = Some("did:oan:AGUS:9DirectoryOldIdentity".to_owned());
+        }
+        persist_resource_acceptance(&state, &package).await.unwrap();
+        if let Some(metadata) = package.did_document.oan_metadata.as_mut() {
+            metadata.controller_did = Some("did:oan:AGUS:9DirectoryNewIdentity".to_owned());
+        }
+        package.package_version = "1.0.1".to_owned();
+        persist_resource_acceptance(&state, &package).await.unwrap();
+
+        let response = api_identity_directory(State(state)).await.unwrap();
+        let items = response.0["items"].as_array().unwrap();
+
+        assert!(items
+            .iter()
+            .all(|item| item["did"] != "did:oan:AGUS:9DirectoryOldIdentity"));
+        let item = items
+            .iter()
+            .find(|item| item["did"] == "did:oan:AGUS:9DirectoryNewIdentity")
+            .unwrap();
+        assert_eq!(item["resourceCount"], 1);
+        assert_eq!(item["resourceDids"][0], resource_did());
     }
 
     #[tokio::test]
