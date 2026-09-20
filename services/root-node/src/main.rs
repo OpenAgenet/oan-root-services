@@ -8316,6 +8316,108 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn identity_directory_binding_bootstrap_is_not_repeated_after_complete() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let controller_did = "did:oan:AGUS:9DirectoryBootstrapOnce";
+        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+        let mut binding = verify_controller_authorization_for_submission(&state, &request)
+            .unwrap()
+            .unwrap();
+        let package = package_from_request(&state, &request);
+        persist_resource_acceptance(&state, &package).await.unwrap();
+        let mut bindings = BTreeMap::new();
+        bindings.insert(
+            verified_authority_binding_key(&binding.controller_did, &binding.resource_did),
+            binding.clone(),
+        );
+        state
+            .data
+            .write(
+                "authority-bindings/verified-controller-bindings.json",
+                &bindings,
+            )
+            .unwrap();
+        bootstrap_identity_binding_projections(&state)
+            .await
+            .unwrap();
+
+        binding.verification_method = format!("{controller_did}#unexpected-key");
+        let mut changed_bindings = BTreeMap::new();
+        changed_bindings.insert(
+            verified_authority_binding_key(&binding.controller_did, &binding.resource_did),
+            binding,
+        );
+        state
+            .data
+            .write(
+                "authority-bindings/verified-controller-bindings.json",
+                &changed_bindings,
+            )
+            .unwrap();
+        bootstrap_identity_binding_projections(&state)
+            .await
+            .unwrap();
+
+        let response = api_identity_directory(State(state)).await.unwrap();
+        let item = response.0["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["did"] == controller_did)
+            .unwrap();
+        let keys = item["publicKeys"].as_array().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0]["id"], format!("{controller_did}#key-1"));
+    }
+
+    #[tokio::test]
+    async fn identity_directory_resource_backfill_is_not_repeated_after_complete() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let package = package_from_request(&state, &request);
+        repository::persist_resource_acceptance_impl(&state, &package)
+            .await
+            .unwrap();
+        backfill_identity_resource_projections(&state, 1)
+            .await
+            .unwrap();
+        let sqlite = state.sqlite.as_ref().unwrap();
+        sqlx::query(&format!(
+            "DELETE FROM {ROOT_IDENTITY_RESOURCE_TABLE} WHERE resource_did = ?"
+        ))
+        .bind(resource_did())
+        .execute(sqlite.pool())
+        .await
+        .unwrap();
+
+        backfill_identity_resource_projections(&state, 1)
+            .await
+            .unwrap();
+        let response = api_identity_directory(State(state)).await.unwrap();
+
+        assert!(response.0["items"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn identity_directory_replaces_resource_identity_projection() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
