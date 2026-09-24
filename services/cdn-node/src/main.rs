@@ -188,7 +188,7 @@ fn default_nonce_ttl_seconds() -> i64 {
 }
 
 fn default_root_did() -> String {
-    "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
+    "did:oan:AGRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz".to_owned()
 }
 
 fn default_root_did_document_file() -> PathBuf {
@@ -1792,6 +1792,7 @@ mod tests {
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: did.to_owned(),
+            controller: Some(oan_core::DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: key_id.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -1805,10 +1806,11 @@ mod tests {
             assertion_method: vec![key_id],
             capability_invocation: vec![],
             service: vec![],
+            proof: None,
             oan_metadata: Some(OanMetadata {
-                subject_type: ResourceType::InfrastructureNode,
-                resource_type: ResourceType::InfrastructureNode,
-                node_role: Some("root".to_owned()),
+                subject_type: oan_core::SubjectType::InfrastructureNode,
+                resource_type: ResourceType::RootNode,
+                external_identifiers: vec![],
                 identity_type: Some("root".to_owned()),
                 controller_did: None,
                 publisher_did: None,
@@ -1835,6 +1837,7 @@ mod tests {
         let did_document = oan_core::DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: resource_did.to_owned(),
+            controller: Some(oan_core::DidController::Did(resource_did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: format!("{resource_did}#key-1"),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -1848,10 +1851,11 @@ mod tests {
             assertion_method: vec![format!("{resource_did}#key-1")],
             capability_invocation: vec![],
             service: vec![],
+            proof: None,
             oan_metadata: Some(OanMetadata {
-                subject_type: ResourceType::Skill,
+                subject_type: oan_core::SubjectType::Skill,
                 resource_type: ResourceType::Skill,
-                node_role: None,
+                external_identifiers: vec![],
                 identity_type: None,
                 controller_did: None,
                 publisher_did: None,
@@ -1888,7 +1892,7 @@ mod tests {
             metadata: ResourceMetadata {
                 resource_did: resource_did.to_owned(),
                 resource_type: ResourceType::Skill,
-                subject_type: ResourceType::Skill,
+                subject_type: oan_core::SubjectType::Skill,
                 publisher_did: None,
                 subject_did: Some(resource_did.to_owned()),
                 name: "Contract Review Skill".to_owned(),

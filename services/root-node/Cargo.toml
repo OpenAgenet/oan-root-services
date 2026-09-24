@@ -15,6 +15,7 @@ chrono.workspace = true
 ed25519-dalek.workspace = true
 oan-bulletin.workspace = true
 oan-core.workspace = true
+oan-did-oan = { path = "../../../oan-protocol-common/crates/oan-did-oan" }
 oan-credentials.workspace = true
 oan-crypto.workspace = true
 oan-package.workspace = true

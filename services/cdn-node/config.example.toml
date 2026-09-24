@@ -21,7 +21,7 @@ mode = "static-token"
 static_tokens = ["local-dev-admin-token"]
 
 [security.trusted_upstream]
-root_did = "did:oan:INRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz"
+root_did = "did:oan:AGRT:7YpQm9Kx2VnRb6Ts3WfHa4Cd5Ej8LgNz"
 
 [upstream]
 root_endpoint = "http://localhost:8000"

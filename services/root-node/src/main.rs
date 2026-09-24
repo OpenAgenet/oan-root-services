@@ -15,7 +15,11 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use oan_bulletin::{Bulletin, BulletinEvent, BulletinEventCore, BulletinEventType};
-use oan_core::{CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType};
+#[cfg(test)]
+use oan_core::DataIntegrityProof;
+use oan_core::{
+    CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType, SubjectType,
+};
 use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, sign_bytes, signature_input,
     signing_key_from_bytes, SigningKey,
@@ -3961,19 +3965,12 @@ fn normalize_chain_metadata_hash(value: &str) -> String {
 }
 
 fn validate_infrastructure_did_prefix(
-    subject_type: GovernanceSubjectType,
+    _subject_type: GovernanceSubjectType,
     did: &str,
 ) -> std::result::Result<(), String> {
-    let expected_prefix = match subject_type {
-        GovernanceSubjectType::Registrar => "did:oan:INRG:",
-        GovernanceSubjectType::Discovery => "did:oan:INDS:",
-        GovernanceSubjectType::VcIssuer => "did:oan:INVC:",
-    };
-    if did.starts_with(expected_prefix) {
-        Ok(())
-    } else {
-        Err("infrastructure_did_prefix_mismatch".to_owned())
-    }
+    oan_did_oan::DidOan::parse(did)
+        .map(|_| ())
+        .map_err(|_| "infrastructure_did_format_mismatch".to_owned())
 }
 
 fn validate_infrastructure_did_document_profile(
@@ -4002,18 +3999,16 @@ fn validate_infrastructure_did_document_profile(
         .oan_metadata
         .as_ref()
         .ok_or_else(|| "did_document_oan_metadata_required".to_owned())?;
-    if metadata.subject_type != ResourceType::InfrastructureNode
-        || metadata.resource_type != ResourceType::InfrastructureNode
-    {
+    if metadata.subject_type != SubjectType::InfrastructureNode {
         return Err("did_document_infrastructure_metadata_required".to_owned());
     }
-    let expected_node_role = match subject_type {
-        GovernanceSubjectType::Registrar => "registrar",
-        GovernanceSubjectType::Discovery => "discovery",
-        GovernanceSubjectType::VcIssuer => "vc_issuer",
+    let expected_resource_type = match subject_type {
+        GovernanceSubjectType::Registrar => ResourceType::RegistrarNode,
+        GovernanceSubjectType::Discovery => ResourceType::DiscoveryNode,
+        GovernanceSubjectType::VcIssuer => ResourceType::VcIssuerNode,
     };
-    if metadata.node_role.as_deref() != Some(expected_node_role) {
-        return Err("did_document_node_role_mismatch".to_owned());
+    if metadata.resource_type != expected_resource_type {
+        return Err("did_document_infrastructure_role_mismatch".to_owned());
     }
     let expected_identity_type = match subject_type {
         GovernanceSubjectType::Registrar => "registrar-node",
@@ -6386,15 +6381,15 @@ mod tests {
     }
 
     fn registrar_did() -> &'static str {
-        "did:oan:INRG:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
+        "did:oan:P9aBc:6HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
     }
 
     fn discovery_did() -> &'static str {
-        "did:oan:INDS:8HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
+        "did:oan:P9aBc:8HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
     }
 
     fn resource_did() -> &'static str {
-        "did:oan:SKLG:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
+        "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
     }
 
     fn openagenet_test_tag_tree() -> CapabilityTagTree {
@@ -6428,6 +6423,7 @@ mod tests {
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: did.to_owned(),
+            controller: Some(oan_core::DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: key_id.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -6439,8 +6435,18 @@ mod tests {
             }],
             authentication: vec![key_id.clone()],
             assertion_method: vec![key_id.clone()],
-            capability_invocation: vec![key_id],
+            capability_invocation: vec![key_id.clone()],
             service: vec![],
+            proof: Some(DataIntegrityProof {
+                proof_type: "Ed25519Signature2020".to_owned(),
+                creator: key_id.clone(),
+                created: Utc::now(),
+                proof_purpose: "assertionMethod".to_owned(),
+                proof_value: "fixture".to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                hash_algorithm: Some("sha256".to_owned()),
+                verification_method: Some(key_id),
+            }),
             oan_metadata: None,
         }
     }
@@ -6457,11 +6463,6 @@ mod tests {
             GovernanceSubjectType::Registrar => "OANRegistrarService",
             GovernanceSubjectType::Discovery => "OANDiscoveryService",
             GovernanceSubjectType::VcIssuer => "OANVcIssuerService",
-        };
-        let node_role = match role {
-            GovernanceSubjectType::Registrar => "registrar",
-            GovernanceSubjectType::Discovery => "discovery",
-            GovernanceSubjectType::VcIssuer => "vc_issuer",
         };
         let identity_type = match role {
             GovernanceSubjectType::Registrar => "registrar-node",
@@ -6482,9 +6483,13 @@ mod tests {
             port: None,
         }];
         document.oan_metadata = Some(OanMetadata {
-            subject_type: ResourceType::InfrastructureNode,
-            resource_type: ResourceType::InfrastructureNode,
-            node_role: Some(node_role.to_owned()),
+            subject_type: SubjectType::InfrastructureNode,
+            resource_type: match role {
+                GovernanceSubjectType::Registrar => ResourceType::RegistrarNode,
+                GovernanceSubjectType::Discovery => ResourceType::DiscoveryNode,
+                GovernanceSubjectType::VcIssuer => ResourceType::VcIssuerNode,
+            },
+            external_identifiers: vec![],
             identity_type: Some(identity_type.to_owned()),
             controller_did: None,
             publisher_did: None,
@@ -6515,6 +6520,7 @@ mod tests {
         DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: did.to_owned(),
+            controller: Some(oan_core::DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: key_id.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -6526,7 +6532,7 @@ mod tests {
             }],
             authentication: vec![key_id.clone()],
             assertion_method: vec![key_id.clone()],
-            capability_invocation: vec![key_id],
+            capability_invocation: vec![key_id.clone()],
             service: vec![ServiceEndpoint {
                 id: format!("{did}#download"),
                 service_type: "SkillPackageDownload".to_owned(),
@@ -6536,10 +6542,20 @@ mod tests {
                 server_type: None,
                 port: None,
             }],
+            proof: Some(DataIntegrityProof {
+                proof_type: "Ed25519Signature2020".to_owned(),
+                creator: key_id.clone(),
+                created: Utc::now(),
+                proof_purpose: "assertionMethod".to_owned(),
+                proof_value: "fixture".to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                hash_algorithm: Some("sha256".to_owned()),
+                verification_method: Some(key_id),
+            }),
             oan_metadata: Some(OanMetadata {
-                subject_type: ResourceType::Skill,
+                subject_type: SubjectType::Skill,
                 resource_type: ResourceType::Skill,
-                node_role: None,
+                external_identifiers: vec![],
                 identity_type: None,
                 controller_did: None,
                 publisher_did: Some("did:oan:AGUS:8HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned()),
@@ -6891,9 +6907,9 @@ mod tests {
     ) {
         let mut did_document = did_document_with_key(registrar_did(), key);
         did_document.oan_metadata = Some(OanMetadata {
-            subject_type: ResourceType::InfrastructureNode,
-            resource_type: ResourceType::InfrastructureNode,
-            node_role: Some("registrar".to_owned()),
+            subject_type: SubjectType::InfrastructureNode,
+            resource_type: ResourceType::RegistrarNode,
+            external_identifiers: vec![],
             identity_type: Some("registrar-node".to_owned()),
             controller_did: None,
             publisher_did: None,
@@ -7178,6 +7194,7 @@ mod tests {
         let controller_document = DidDocument {
             context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
             id: controller_did.to_owned(),
+            controller: Some(oan_core::DidController::Did(controller_did.to_owned())),
             verification_method: vec![VerificationMethod {
                 id: controller_method.clone(),
                 method_type: "Ed25519VerificationKey2020".to_owned(),
@@ -7191,8 +7208,22 @@ mod tests {
             assertion_method: vec![controller_method.clone()],
             capability_invocation: vec![controller_method.clone()],
             service: vec![],
+            proof: Some(DataIntegrityProof {
+                proof_type: "Ed25519Signature2020".to_owned(),
+                creator: controller_method.clone(),
+                created: Utc::now(),
+                proof_purpose: "assertionMethod".to_owned(),
+                proof_value: "fixture".to_owned(),
+                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
+                hash_algorithm: Some("sha256".to_owned()),
+                verification_method: Some(controller_method.clone()),
+            }),
             oan_metadata: None,
         };
+        request.submission.did_document.controller =
+            Some(oan_core::DidController::Did(controller_did.to_owned()));
+        request.submission.did_document.verification_method[0].controller =
+            controller_did.to_owned();
         let metadata = request
             .submission
             .did_document
@@ -7374,7 +7405,11 @@ mod tests {
             .oan_metadata
             .as_mut()
             .unwrap()
-            .controller_did = Some("did:oan:AGUS:ControllerMissingProof".to_owned());
+            .controller_did = Some(discovery_did().to_owned());
+        request.submission.did_document.controller =
+            Some(oan_core::DidController::Did(discovery_did().to_owned()));
+        request.submission.did_document.verification_method[0].controller =
+            discovery_did().to_owned();
         refresh_resource_submission_hashes_for_test(&mut request);
         resign_resource_verify_request(&state, &mut request, &registrar_key);
 
@@ -7923,7 +7958,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("infrastructure_did_prefix_mismatch"));
+        assert!(err.message.contains("infrastructure_did_format_mismatch"));
     }
 
     #[tokio::test]
