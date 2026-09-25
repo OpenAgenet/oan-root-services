@@ -685,6 +685,19 @@ pub(super) async fn persist_resource_acceptance_impl(
         let next_attempt_at = now.clone();
         let mut tx = sqlite.pool().begin().await?;
 
+        if let Some(existing_hash) = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT did_document_hash FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = ? AND version = ?"
+        ))
+        .bind(resource_did)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if existing_hash != package.did_document_hash {
+                return Err(anyhow::anyhow!("resource_version_conflict"));
+            }
+        }
+
         sqlx::query(&format!(
             r#"
             INSERT INTO {ROOT_SUBJECT_VERSION_TABLE}(subject_did, version, did_document_hash, metadata_hash, package_json, archive_path, accepted_at)
@@ -823,6 +836,19 @@ pub(super) async fn persist_resource_acceptance_impl(
         let next_attempt_at = now.clone();
 
         let mut tx = postgres.pool().begin().await?;
+
+        if let Some(existing_hash) = sqlx::query_scalar::<_, String>(&format!(
+            "SELECT did_document_hash FROM {ROOT_SUBJECT_VERSION_TABLE} WHERE subject_did = $1 AND version = $2"
+        ))
+        .bind(resource_did)
+        .bind(version)
+        .fetch_optional(&mut *tx)
+        .await?
+        {
+            if existing_hash != package.did_document_hash {
+                return Err(anyhow::anyhow!("resource_version_conflict"));
+            }
+        }
 
         let publication_cursor = sqlx::query(&format!(
             r#"

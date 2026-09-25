@@ -31,7 +31,7 @@ use oan_package::{
 #[cfg(test)]
 use oan_protocol::OAN_RESOURCE_PROTOCOL_VERSION;
 use oan_protocol::{
-    HealthResponse, InfrastructureAuthorizationVcIssuePayload,
+    validate_resource_routing_code, HealthResponse, InfrastructureAuthorizationVcIssuePayload,
     InfrastructureAuthorizationVcIssueRequest, ResourceVerifyAndPublishRequest,
     RootAuthorizeRequest, PATH_ROOT_INFRASTRUCTURE_AUTHORIZATION_VCS_ISSUE,
     PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH, PURPOSE_CONTROLLER_AUTHORIZATION_REGISTRATION,
@@ -5037,6 +5037,7 @@ fn verify_resource_request(
     )
     .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
+    validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
 }
 
@@ -5218,6 +5219,14 @@ fn archive_resource_verified(state: &AppState, package: &ResourcePackage) -> Res
         name.trim_end_matches(".json"),
         package.package_version
     );
+    if let Ok(existing) = state
+        .data
+        .read::<ResourcePackage>(format!("{prefix}/resource-package.json"))
+    {
+        if existing.did_document_hash != package.did_document_hash {
+            return Err(anyhow!("resource_version_conflict"));
+        }
+    }
     state
         .data
         .write(format!("{prefix}/did-document.json"), &package.did_document)?;
@@ -6389,7 +6398,7 @@ mod tests {
     }
 
     fn resource_did() -> &'static str {
-        "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
+        "did:oan:6HkPq:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu"
     }
 
     fn openagenet_test_tag_tree() -> CapabilityTagTree {
@@ -8559,6 +8568,32 @@ mod tests {
         assert_eq!(outbox[0].1.package_version, package.package_version);
         assert!(outbox[0].1.publication_cursor > 0);
         outbox[0].1.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sqlite_resource_version_rejects_same_did_and_version_with_different_document_hash() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let package = package_from_request(&state, &request);
+        repository::persist_resource_acceptance_impl(&state, &package)
+            .await
+            .unwrap();
+
+        let mut conflicting = package.clone();
+        conflicting.did_document_hash = "sha256:conflicting-document-hash".to_owned();
+        let error = repository::persist_resource_acceptance_impl(&state, &conflicting)
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "resource_version_conflict");
     }
 
     #[tokio::test]
