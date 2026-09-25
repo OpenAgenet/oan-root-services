@@ -8948,7 +8948,6 @@ allowed_origins = []
 [node]
 name = "Root Node"
 role = "root"
-did_semantic_code = "AGRT"
 
 [security.admin]
 mode = "static-token"
