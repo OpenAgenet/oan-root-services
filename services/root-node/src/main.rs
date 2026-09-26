@@ -870,13 +870,19 @@ struct InfrastructureAuthorizationCredentialSubject {
     id: String,
     role: String,
     #[serde(rename = "subjectType")]
-    subject_type: u8,
+    subject_type: String,
+    #[serde(rename = "resourceType")]
+    resource_type: String,
+    #[serde(rename = "didDocumentHash")]
+    did_document_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoint: Option<String>,
     #[serde(rename = "authorizedDomains", alias = "authorized_domains", default)]
     authorized_domains: Vec<String>,
     #[serde(rename = "didDocumentFile")]
-    did_document_file: String,
+    did_document_file: Option<String>,
+    #[serde(rename = "governanceBindingId")]
+    governance_binding_id: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -4177,13 +4183,26 @@ fn build_infrastructure_authorization_credential(
         "credentialSubject": {
             "id": payload.subject_did,
             "role": subject_type.label(),
-            "subjectType": subject_type.code(),
+            "subjectType": "infrastructure_node",
+            "resourceType": format!("{}_node", subject_type.label()),
+            "didDocumentHash": did_document_stable_hash,
             "endpoint": payload.endpoint,
             "authorizedDomains": payload.authorized_domains,
             "didDocumentFile": "did-document.json"
         },
         "credentialStatus": credential_status
     });
+    let governance_binding_id = if governance_subject.last_sequence > 0 {
+        format!(
+            "{}:{}",
+            governance_subject.last_sequence, governance_subject.last_event_digest
+        )
+    } else if !governance_subject.policy_hash.is_empty() {
+        governance_subject.policy_hash.clone()
+    } else {
+        did_document_stable_hash.to_owned()
+    };
+    unsigned["credentialSubject"]["governanceBindingId"] = json!(governance_binding_id);
     let proof = build_infrastructure_authorization_proof(
         &unsigned,
         format!("{}#key-1", state.root_did),
@@ -7883,6 +7902,23 @@ mod tests {
         assert_eq!(
             response.0["credential"]["credentialSubject"]["role"],
             "registrar"
+        );
+        assert_eq!(
+            response.0["credential"]["credentialSubject"]["subjectType"],
+            "infrastructure_node"
+        );
+        assert_eq!(
+            response.0["credential"]["credentialSubject"]["resourceType"],
+            "registrar_node"
+        );
+        assert_eq!(
+            response.0["credential"]["credentialSubject"]["didDocumentHash"],
+            response.0["didDocumentStableHash"]
+        );
+        assert!(
+            response.0["credential"]["credentialSubject"]["governanceBindingId"]
+                .as_str()
+                .is_some()
         );
         assert_eq!(
             response.0["credential"]["credentialSubject"]["didDocumentFile"],
