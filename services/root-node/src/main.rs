@@ -7266,6 +7266,39 @@ mod tests {
     }
 
     #[test]
+    fn verify_resource_request_rejects_unreliable_registrar_wrong_routing_code() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        let invalid_resource_did =
+            "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
+        request.submission.resource_did = invalid_resource_did.clone();
+        request.submission.did_document =
+            resource_document_with_key(&invalid_resource_did, &resource_key);
+        request
+            .submission
+            .subject_control_proof
+            .challenge
+            .subject_did = invalid_resource_did;
+        refresh_resource_submission_hashes_for_test(&mut request);
+        resign_resource_verify_request(&state, &mut request, &registrar_key);
+
+        assert_eq!(
+            verify_resource_request(&state, &request).unwrap_err(),
+            "resource_routing_code_mismatch"
+        );
+    }
+
+    #[test]
     fn build_resource_metadata_prefers_submission_metadata() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
