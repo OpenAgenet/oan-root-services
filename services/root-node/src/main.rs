@@ -850,6 +850,10 @@ struct GovernanceSubjectRecord {
 struct TrustIndexerStatus {
     package_id: Option<String>,
     bulletin_object_id: Option<String>,
+    #[serde(default)]
+    sequence_gap_detected: bool,
+    #[serde(default)]
+    digest_gap_detected: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1642,10 +1646,14 @@ async fn fetch_trust_indexer_status(
             response.status().as_u16()
         ));
     }
-    response
+    let status = response
         .json::<TrustIndexerStatus>()
         .await
-        .map_err(|err| format!("trust_indexer_status_decode_failed:{err}"))
+        .map_err(|err| format!("trust_indexer_status_decode_failed:{err}"))?;
+    if status.sequence_gap_detected || status.digest_gap_detected {
+        return Err("trust_indexer_status_not_healthy".to_owned());
+    }
+    Ok(status)
 }
 
 fn validate_governance_subject_binding(
@@ -2439,7 +2447,9 @@ async fn issue_infrastructure_authorization_vc(
         &governance_subject,
     )
     .map_err(ApiError::forbidden)?;
-    let indexer_status = fetch_trust_indexer_status(&state).await.unwrap_or_default();
+    let indexer_status = fetch_trust_indexer_status(&state)
+        .await
+        .map_err(ApiError::forbidden)?;
     let credential = build_infrastructure_authorization_credential(
         &state,
         subject_type,
@@ -6636,6 +6646,7 @@ mod tests {
     #[derive(Clone)]
     struct MockTrustIndexerState {
         active: bool,
+        unhealthy: bool,
         subject_did: String,
         subject_type: GovernanceSubjectType,
         metadata_hash: String,
@@ -6644,6 +6655,25 @@ mod tests {
 
     async fn mock_trust_indexer(
         active: bool,
+        subject_type: GovernanceSubjectType,
+        subject_did: String,
+        metadata_hash: String,
+        authorized_domains: Vec<String>,
+    ) -> String {
+        mock_trust_indexer_with_health(
+            active,
+            false,
+            subject_type,
+            subject_did,
+            metadata_hash,
+            authorized_domains,
+        )
+        .await
+    }
+
+    async fn mock_trust_indexer_with_health(
+        active: bool,
+        unhealthy: bool,
         subject_type: GovernanceSubjectType,
         subject_did: String,
         metadata_hash: String,
@@ -6705,14 +6735,17 @@ mod tests {
                 })),
             )
         }
-        async fn status_handler() -> Json<Value> {
+        async fn status_handler(State(state): State<MockTrustIndexerState>) -> Json<Value> {
             Json(json!({
                 "package_id": "0xpackage",
-                "bulletin_object_id": "0xbulletin"
+                "bulletin_object_id": "0xbulletin",
+                "sequence_gap_detected": state.unhealthy,
+                "digest_gap_detected": state.unhealthy
             }))
         }
         let mock_state = MockTrustIndexerState {
             active,
+            unhealthy,
             subject_did,
             subject_type,
             metadata_hash,
@@ -7869,6 +7902,30 @@ mod tests {
         let registrar = authorization_state.registrars.get(registrar_did()).unwrap();
         assert_eq!(registrar.status, "active");
         assert!(registrar.did_document_snapshot.is_some());
+    }
+
+    #[tokio::test]
+    async fn issue_infrastructure_authorization_vc_rejects_unhealthy_indexer() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let request = infrastructure_vc_issue_request(&state, &registrar_key, "registrar");
+        let endpoint = mock_trust_indexer_with_health(
+            true,
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            request.payload.did_document_stable_hash.clone(),
+            vec!["*".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, endpoint);
+
+        let err = issue_infrastructure_authorization_vc(State(state), Json(request))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, StatusCode::FORBIDDEN);
+        assert!(err.message.contains("trust_indexer_status_not_healthy"));
     }
 
     #[tokio::test]
