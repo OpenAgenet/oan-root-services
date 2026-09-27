@@ -7299,6 +7299,36 @@ mod tests {
     }
 
     #[test]
+    fn verify_resource_request_rejects_did_document_resource_type_mismatch() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        request
+            .submission
+            .did_document
+            .oan_metadata
+            .as_mut()
+            .unwrap()
+            .resource_type = ResourceType::McpServer;
+        refresh_resource_submission_hashes_for_test(&mut request);
+        resign_resource_verify_request(&state, &mut request, &registrar_key);
+
+        assert_eq!(
+            verify_resource_request(&state, &request).unwrap_err(),
+            "subject type and resource type combination is invalid"
+        );
+    }
+
+    #[test]
     fn build_resource_metadata_prefers_submission_metadata() {
         let dir = tempdir().unwrap();
         let state = app_state(dir.path());
