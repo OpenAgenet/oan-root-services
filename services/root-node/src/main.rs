@@ -7886,10 +7886,7 @@ mod tests {
             response.0["credential"]["proof"]["cryptoSuite"],
             "ed25519-sha256"
         );
-        assert_eq!(
-            response.0["credential"]["proof"]["hashAlgorithm"],
-            "sha256"
-        );
+        assert_eq!(response.0["credential"]["proof"]["hashAlgorithm"], "sha256");
         assert!(
             response.0["credential"]["proof"]["proofValue"]
                 .as_str()
