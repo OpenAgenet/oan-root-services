@@ -3926,6 +3926,9 @@ fn validate_infrastructure_did_document_profile(
     if metadata.resource_type != expected_resource_type {
         return Err("did_document_infrastructure_role_mismatch".to_owned());
     }
+    did_document
+        .validate_infrastructure_profile(expected_resource_type.clone())
+        .map_err(|_| "did_document_infrastructure_profile_invalid".to_owned())?;
     let expected_service_type = match subject_type {
         GovernanceSubjectType::Registrar => "OANRegistrarService",
         GovernanceSubjectType::Discovery => "OANDiscoveryService",
