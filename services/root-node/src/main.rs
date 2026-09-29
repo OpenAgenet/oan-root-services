@@ -884,6 +884,7 @@ struct DiscoveryNotifyTargetLease {
     discovery_did: String,
     target_cursor: i64,
     delivered_cursor: i64,
+    lease_owner: String,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -2698,20 +2699,11 @@ fn effective_worker_batch_size(
 
 fn effective_discovery_target_item_batch_size(
     configured: usize,
-    claimed_target_count: usize,
-    concurrency: usize,
-    claimed_cursor_lag: i64,
+    _claimed_target_count: usize,
+    _concurrency: usize,
+    _claimed_cursor_lag: i64,
 ) -> usize {
-    let base = configured.max(1);
-    let lag = claimed_cursor_lag.max(0) as usize;
-    let active_targets = claimed_target_count.max(1);
-    if active_targets <= concurrency.max(1) / 2 && lag > base.saturating_mul(active_targets * 2) {
-        return base.saturating_mul(4).min(1_000);
-    }
-    if active_targets <= concurrency.max(1) && lag > base.saturating_mul(active_targets) {
-        return base.saturating_mul(2).min(500);
-    }
-    base
+    configured.max(1)
 }
 
 fn record_discovery_worker_runtime(state: &AppState, sample: DiscoveryWorkerRuntimeSample) {
@@ -5597,8 +5589,15 @@ async fn mark_discovery_target_notified(
     state: &AppState,
     discovery_did: &str,
     delivered_cursor: i64,
+    lease_owner: &str,
 ) -> Result<()> {
-    repository::mark_discovery_target_notified_impl(state, discovery_did, delivered_cursor).await?;
+    repository::mark_discovery_target_notified_impl(
+        state,
+        discovery_did,
+        delivered_cursor,
+        lease_owner,
+    )
+    .await?;
     invalidate_status_counts_cache(state);
     Ok(())
 }
@@ -5607,8 +5606,9 @@ async fn mark_discovery_target_retry(
     state: &AppState,
     discovery_did: &str,
     error: &str,
+    lease_owner: &str,
 ) -> Result<()> {
-    repository::mark_discovery_target_retry_impl(state, discovery_did, error).await?;
+    repository::mark_discovery_target_retry_impl(state, discovery_did, error, lease_owner).await?;
     invalidate_status_counts_cache(state);
     Ok(())
 }
@@ -5900,6 +5900,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         &state,
                         &lease.discovery_did,
                         "discovery_not_authorized",
+                        &lease.lease_owner,
                     )
                     .await?;
                     return Ok::<Value, anyhow::Error>(json!({
@@ -5913,6 +5914,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         &state,
                         &lease.discovery_did,
                         "discovery_not_active",
+                        &lease.lease_owner,
                     )
                     .await?;
                     return Ok(json!({
@@ -5928,7 +5930,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                 )
                 .await
                 {
-                    mark_discovery_target_retry(&state, &lease.discovery_did, &reason).await?;
+                    mark_discovery_target_retry(
+                        &state,
+                        &lease.discovery_did,
+                        &reason,
+                        &lease.lease_owner,
+                    )
+                    .await?;
                     mark_local_governance_inactive(
                         &state,
                         GovernanceSubjectType::Discovery,
@@ -5944,8 +5952,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                 let sync_url = match discovery_sync_url(&auth) {
                     Ok(url) => url,
                     Err(err) => {
-                        mark_discovery_target_retry(&state, &lease.discovery_did, &err.to_string())
-                            .await?;
+                        mark_discovery_target_retry(
+                            &state,
+                            &lease.discovery_did,
+                            &err.to_string(),
+                            &lease.lease_owner,
+                        )
+                        .await?;
                         return Ok(json!({
                             "kind": "failed",
                             "discoveryDid": lease.discovery_did,
@@ -6001,6 +6014,7 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 &state,
                                 &lease.discovery_did,
                                 delivered_cursor,
+                                &lease.lease_owner,
                             )
                             .await?;
                             if delivered_cursor < lease.target_cursor {
@@ -6012,8 +6026,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                                 "discovery_partial_sync:delivered={delivered_cursor}:target={}:rejected={rejected_count}:cursorLag={cursor_lag}",
                                 batch_target_cursor
                             );
-                            mark_discovery_target_retry(&state, &lease.discovery_did, &error)
-                                .await?;
+                            mark_discovery_target_retry(
+                                &state,
+                                &lease.discovery_did,
+                                &error,
+                                &lease.lease_owner,
+                            )
+                            .await?;
                             return Ok(json!({
                                 "kind": "partial",
                                 "rootDid": state.root_did,
@@ -6072,7 +6091,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                         } else {
                             format!("status:{status}:{body}")
                         };
-                        mark_discovery_target_retry(&state, &lease.discovery_did, &error).await?;
+                        mark_discovery_target_retry(
+                            &state,
+                            &lease.discovery_did,
+                            &error,
+                            &lease.lease_owner,
+                        )
+                        .await?;
                         Ok(json!({
                             "kind": "failed",
                             "discoveryDid": lease.discovery_did,
@@ -6083,7 +6108,13 @@ async fn run_discovery_notify_cycle(state: &AppState) -> Result<Value> {
                     }
                     Err(err) => {
                         let error = err.to_string();
-                        mark_discovery_target_retry(&state, &lease.discovery_did, &error).await?;
+                        mark_discovery_target_retry(
+                            &state,
+                            &lease.discovery_did,
+                            &error,
+                            &lease.lease_owner,
+                        )
+                        .await?;
                         Ok(json!({
                             "kind": "failed",
                             "discoveryDid": lease.discovery_did,
@@ -7279,8 +7310,7 @@ mod tests {
             &resource_key,
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
-        let invalid_resource_did =
-            "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
+        let invalid_resource_did = "did:oan:K7mQ9:7HkPq7Vm3RdT9Ya2WcX8Ns4Bf6GjLeZu".to_owned();
         request.submission.resource_did = invalid_resource_did.clone();
         request.submission.did_document =
             resource_document_with_key(&invalid_resource_did, &resource_key);
@@ -7382,6 +7412,18 @@ mod tests {
         assert_eq!(effective_worker_batch_size(50, 120, 4), 100);
         assert_eq!(effective_worker_batch_size(50, 300, 4), 200);
         assert_eq!(effective_worker_batch_size(2_000, 20_000, 4), 5_000);
+    }
+
+    #[test]
+    fn discovery_item_batch_size_does_not_expand_under_backlog() {
+        assert_eq!(
+            effective_discovery_target_item_batch_size(40, 2, 4, 156),
+            40
+        );
+        assert_eq!(
+            effective_discovery_target_item_batch_size(100, 1, 4, 10_000),
+            100
+        );
     }
 
     #[tokio::test]
@@ -10134,6 +10176,75 @@ capability_tree_file = "../capability-tree.json"
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn discovery_late_lease_completion_cannot_clear_new_lease() {
+        let dir = tempdir().unwrap();
+        let state = app_state_with_sqlite(dir.path()).await;
+        let discovery_did = "did:oan:2Xr85:late-lease-test";
+        let now = Utc::now().to_rfc3339();
+        sqlx::query(&format!(
+            "INSERT INTO {ROOT_DISCOVERY_TARGET_TABLE}(
+                discovery_did, pending_cursor, delivered_cursor, status,
+                attempt_count, lease_owner, lease_expires_at, next_attempt_at,
+                last_error, updated_at
+             ) VALUES (?, 10, 0, 'active', 0, NULL, NULL, ?, NULL, ?)"
+        ))
+        .bind(discovery_did)
+        .bind(&now)
+        .bind(&now)
+        .execute(state.sqlite.as_ref().unwrap().pool())
+        .await
+        .unwrap();
+
+        let first = claim_discovery_targets(&state, "worker", 1, 60)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        sqlx::query(&format!(
+            "UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
+             SET lease_expires_at = '2000-01-01T00:00:00Z', next_attempt_at = ?
+             WHERE discovery_did = ?"
+        ))
+        .bind(&now)
+        .bind(discovery_did)
+        .execute(state.sqlite.as_ref().unwrap().pool())
+        .await
+        .unwrap();
+        let second = claim_discovery_targets(&state, "worker", 1, 60)
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(first.lease_owner, second.lease_owner);
+
+        mark_discovery_target_notified(&state, discovery_did, 10, &first.lease_owner)
+            .await
+            .unwrap();
+        let after_late_completion = read_discovery_target_states(&state).await.unwrap();
+        assert_eq!(after_late_completion[0].delivered_cursor, 0);
+        assert_eq!(
+            after_late_completion[0].lease_owner.as_deref(),
+            Some(second.lease_owner.as_str())
+        );
+
+        mark_discovery_target_retry(&state, discovery_did, "late failure", &first.lease_owner)
+            .await
+            .unwrap();
+        let after_late_retry = read_discovery_target_states(&state).await.unwrap();
+        assert_eq!(
+            after_late_retry[0].lease_owner.as_deref(),
+            Some(second.lease_owner.as_str())
+        );
+
+        mark_discovery_target_notified(&state, discovery_did, 10, &second.lease_owner)
+            .await
+            .unwrap();
+        let completed = read_discovery_target_states(&state).await.unwrap();
+        assert_eq!(completed[0].delivered_cursor, 10);
+        assert!(completed[0].lease_owner.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn api_status_counts_only_ready_discovery_targets() {
         let dir = tempdir().unwrap();
         let state = app_state_with_sqlite(dir.path()).await;
@@ -10401,8 +10512,8 @@ capability_tree_file = "../capability-tree.json"
         assert_eq!(result["successCount"], 1);
         let payloads = payloads.lock().unwrap();
         let payload = payloads.first().expect("sync payload should be captured");
-        assert_eq!(payload["maxPublications"], 400);
-        assert_eq!(payload["items"].as_array().unwrap().len(), 400);
+        assert_eq!(payload["maxPublications"], 100);
+        assert_eq!(payload["items"].as_array().unwrap().len(), 100);
     }
 
     #[tokio::test(flavor = "multi_thread")]

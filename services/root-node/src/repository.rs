@@ -1202,6 +1202,8 @@ pub(super) async fn claim_discovery_targets_impl(
                 let discovery_did = row.get::<String, _>(0);
                 let pending_cursor = row.get::<i64, _>(1);
                 let delivered_cursor = row.get::<i64, _>(2);
+                let lease_owner =
+                    format!("{worker_id}:{discovery_did}:{pending_cursor}:{now_rfc3339}");
                 sqlx::query(&format!(
                     r#"
                     UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
@@ -1210,7 +1212,7 @@ pub(super) async fn claim_discovery_targets_impl(
                     WHERE discovery_did = ?
                     "#
                 ))
-                .bind(worker_id)
+                .bind(&lease_owner)
                 .bind(&lease_expires_at)
                 .bind(&now_rfc3339)
                 .bind(&discovery_did)
@@ -1220,6 +1222,7 @@ pub(super) async fn claim_discovery_targets_impl(
                     discovery_did,
                     target_cursor: pending_cursor,
                     delivered_cursor,
+                    lease_owner,
                 });
             }
             sqlx::query("COMMIT").execute(&mut *conn).await?;
@@ -1246,14 +1249,14 @@ pub(super) async fn claim_discovery_targets_impl(
                 FOR UPDATE SKIP LOCKED
             )
             UPDATE {ROOT_DISCOVERY_TARGET_TABLE} AS targets
-            SET lease_owner = $3,
+            SET lease_owner = $3 || ':' || claimed.discovery_did || ':' || claimed.pending_cursor || ':' || $1,
                 lease_expires_at = $4::timestamptz,
                 attempt_count = targets.attempt_count + 1,
                 last_error = NULL,
                 updated_at = $1::timestamptz
             FROM claimed
             WHERE targets.discovery_did = claimed.discovery_did
-            RETURNING claimed.discovery_did, claimed.pending_cursor, claimed.delivered_cursor
+            RETURNING claimed.discovery_did, claimed.pending_cursor, claimed.delivered_cursor, targets.lease_owner
             "#
         ))
         .bind(&now_rfc3339)
@@ -1268,6 +1271,7 @@ pub(super) async fn claim_discovery_targets_impl(
                 discovery_did: row.get::<String, _>(0),
                 target_cursor: row.get::<i64, _>(1),
                 delivered_cursor: row.get::<i64, _>(2),
+                lease_owner: row.get::<String, _>(3),
             })
             .collect());
     }
@@ -1278,11 +1282,12 @@ pub(super) async fn mark_discovery_target_notified_impl(
     state: &AppState,
     discovery_did: &str,
     delivered_cursor: i64,
+    lease_owner: &str,
 ) -> Result<()> {
     let now = Utc::now();
     let now_text = now.to_rfc3339();
     if let Some(sqlite) = &state.sqlite {
-        sqlx::query(&format!(
+        let updated = sqlx::query(&format!(
             r#"
             UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
             SET delivered_cursor = MAX(delivered_cursor, ?),
@@ -1292,15 +1297,19 @@ pub(super) async fn mark_discovery_target_notified_impl(
                 next_attempt_at = ?,
                 last_error = NULL,
                 updated_at = ?
-            WHERE discovery_did = ?
+            WHERE discovery_did = ? AND lease_owner = ?
             "#
         ))
         .bind(delivered_cursor)
         .bind(&now_text)
         .bind(&now_text)
         .bind(discovery_did)
+        .bind(lease_owner)
         .execute(sqlite.pool())
         .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(());
+        }
         sqlx::query(&format!(
             r#"
             DELETE FROM {ROOT_DISCOVERY_ITEM_TABLE}
@@ -1314,7 +1323,7 @@ pub(super) async fn mark_discovery_target_notified_impl(
         return Ok(());
     }
     if let Some(postgres) = &state.postgres {
-        sqlx::query(&format!(
+        let updated = sqlx::query(&format!(
             r#"
             UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
             SET delivered_cursor = GREATEST(delivered_cursor, $1),
@@ -1324,15 +1333,19 @@ pub(super) async fn mark_discovery_target_notified_impl(
                 next_attempt_at = $2::timestamptz,
                 last_error = NULL,
                 updated_at = $3::timestamptz
-            WHERE discovery_did = $4
+            WHERE discovery_did = $4 AND lease_owner = $5
             "#
         ))
         .bind(delivered_cursor)
         .bind(now)
         .bind(now)
         .bind(discovery_did)
+        .bind(lease_owner)
         .execute(postgres.pool())
         .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(());
+        }
         sqlx::query(&format!(
             r#"
             DELETE FROM {ROOT_DISCOVERY_ITEM_TABLE}
@@ -1351,6 +1364,7 @@ pub(super) async fn mark_discovery_target_retry_impl(
     state: &AppState,
     discovery_did: &str,
     error: &str,
+    lease_owner: &str,
 ) -> Result<()> {
     let retry_after = (Utc::now()
         + chrono::Duration::seconds(state.config.security.workers.retry_backoff_seconds))
@@ -1365,13 +1379,14 @@ pub(super) async fn mark_discovery_target_retry_impl(
                 next_attempt_at = ?,
                 last_error = ?,
                 updated_at = ?
-            WHERE discovery_did = ?
+            WHERE discovery_did = ? AND lease_owner = ?
             "#
         ))
         .bind(&retry_after)
         .bind(error)
         .bind(&now)
         .bind(discovery_did)
+        .bind(lease_owner)
         .execute(sqlite.pool())
         .await?;
         return Ok(());
@@ -1385,13 +1400,14 @@ pub(super) async fn mark_discovery_target_retry_impl(
                 next_attempt_at = $1::timestamptz,
                 last_error = $2,
                 updated_at = $3::timestamptz
-            WHERE discovery_did = $4
+            WHERE discovery_did = $4 AND lease_owner = $5
             "#
         ))
         .bind(&retry_after)
         .bind(error)
         .bind(&now)
         .bind(discovery_did)
+        .bind(lease_owner)
         .execute(postgres.pool())
         .await?;
     }
