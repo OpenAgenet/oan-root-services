@@ -25,7 +25,10 @@ use oan_credentials::{
     CredentialStatusReference,
     InfrastructureAuthorizationCredentialSubject, OanInfrastructureAuthorizationCredential,
 };
-use oan_crypto::{build_data_integrity_proof, hash_json_with_suite, signing_key_from_bytes, SigningKey};
+use oan_crypto::{
+    build_data_integrity_proof, hash_json_with_suite, signing_key_from_bytes,
+    verify_did_document_proof, SigningKey,
+};
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
     RootProof,
@@ -3996,6 +3999,8 @@ fn validate_infrastructure_did_document_profile(
     did_document
         .validate_infrastructure_profile(expected_resource_type.clone())
         .map_err(|_| "did_document_infrastructure_profile_invalid".to_owned())?;
+    verify_did_document_proof(did_document)
+        .map_err(|_| "did_document_proof_invalid".to_owned())?;
     let expected_service_type = match subject_type {
         GovernanceSubjectType::Registrar => "OANRegistrarService",
         GovernanceSubjectType::Discovery => "OANDiscoveryService",
@@ -4991,6 +4996,8 @@ fn verify_resource_request(
     )
     .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
+    verify_did_document_proof(&request.submission.did_document)
+        .map_err(|_| "did_document_proof_invalid".to_owned())?;
     validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
 }
@@ -7265,6 +7272,7 @@ mod tests {
         state: &AppState,
         request: &mut ResourceVerifyAndPublishRequest,
         registrar_key: &ed25519_dalek::SigningKey,
+        resource_key: &ed25519_dalek::SigningKey,
         controller_did: &str,
     ) {
         let controller_key = generate_ed25519_keypair();
@@ -7304,8 +7312,6 @@ mod tests {
         ));
         request.submission.did_document.controller =
             Some(oan_core::DidController::Did(controller_did.to_owned()));
-        request.submission.did_document.verification_method[0].controller =
-            controller_did.to_owned();
         let metadata = request
             .submission
             .did_document
@@ -7314,6 +7320,16 @@ mod tests {
             .unwrap();
         metadata.controller_did = Some(controller_did.to_owned());
         metadata.publisher_did = Some(controller_did.to_owned());
+        let unsigned_resource_document = {
+            let document = &mut request.submission.did_document;
+            document.proof = None;
+            document.clone()
+        };
+        request.submission.did_document.proof = Some(test_did_proof(
+            &unsigned_resource_document,
+            resource_key,
+            format!("{}#key-1", request.submission.resource_did),
+        ));
         refresh_resource_submission_hashes_for_test(request);
         let challenge = ControllerAuthorizationChallenge {
             challenge_id: "controller-auth-test".to_owned(),
@@ -7564,8 +7580,15 @@ mod tests {
             .controller_did = Some(discovery_did().to_owned());
         request.submission.did_document.controller =
             Some(oan_core::DidController::Did(discovery_did().to_owned()));
-        request.submission.did_document.verification_method[0].controller =
-            discovery_did().to_owned();
+        let unsigned = {
+            request.submission.did_document.proof = None;
+            request.submission.did_document.clone()
+        };
+        request.submission.did_document.proof = Some(test_did_proof(
+            &unsigned,
+            &resource_key,
+            format!("{}#key-1", resource_did()),
+        ));
         refresh_resource_submission_hashes_for_test(&mut request);
         resign_resource_verify_request(&state, &mut request, &registrar_key);
 
@@ -7594,6 +7617,7 @@ mod tests {
             &state,
             &mut request,
             &registrar_key,
+            &resource_key,
             "did:oan:AGUS:9ControllerProofAccepted",
         );
 
@@ -7621,6 +7645,7 @@ mod tests {
             &state,
             &mut request,
             &registrar_key,
+            &resource_key,
             "did:oan:AGUS:9ControllerProofReplay",
         );
 
@@ -7650,7 +7675,13 @@ mod tests {
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
         let controller_did = "did:oan:AGUS:9ControllerDirectoryKey";
-        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+        attach_external_controller_proof(
+            &state,
+            &mut request,
+            &registrar_key,
+            &resource_key,
+            controller_did,
+        );
 
         let publish_response = verify_resource_and_publish(State(state.clone()), Json(request))
             .await
@@ -7691,6 +7722,7 @@ mod tests {
             &state,
             &mut request,
             &registrar_key,
+            &resource_key,
             "did:oan:AGUS:9ControllerProofTampered",
         );
         request
@@ -8476,7 +8508,7 @@ mod tests {
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
         let controller_did = "did:oan:AGUS:9DirectoryBindingFirst";
-        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+        attach_external_controller_proof(&state, &mut request, &registrar_key, &resource_key, controller_did);
         let binding = verify_controller_authorization_for_submission(&state, &request)
             .unwrap()
             .unwrap();
@@ -8516,7 +8548,7 @@ mod tests {
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
         let controller_did = "did:oan:AGUS:9DirectoryBootstrapBinding";
-        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+        attach_external_controller_proof(&state, &mut request, &registrar_key, &resource_key, controller_did);
         let binding = verify_controller_authorization_for_submission(&state, &request)
             .unwrap()
             .unwrap();
@@ -8563,7 +8595,7 @@ mod tests {
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
         let controller_did = "did:oan:AGUS:9DirectoryBootstrapOnce";
-        attach_external_controller_proof(&state, &mut request, &registrar_key, controller_did);
+        attach_external_controller_proof(&state, &mut request, &registrar_key, &resource_key, controller_did);
         let mut binding = verify_controller_authorization_for_submission(&state, &request)
             .unwrap()
             .unwrap();
@@ -10901,3 +10933,4 @@ capability_tree_file = "../capability-tree.json"
         );
     }
 }
+
