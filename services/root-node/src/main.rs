@@ -6368,8 +6368,10 @@ mod tests {
         ResourceType, ServiceEndpoint, VerificationMethod,
     };
     use oan_crypto::{
-        generate_ed25519_keypair, hash_json_with_suite, public_key_jwk, public_key_multibase,
-        SigningKey as OanSigningKey, VerifyingKey as OanVerifyingKey,
+        did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite,
+        public_key_jwk, public_key_multibase, sign_bytes_multibase, verify_bytes_multibase,
+        SigningKey as OanSigningKey,
+        VerifyingKey as OanVerifyingKey,
     };
     use oan_protocol::{
         ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
@@ -6422,8 +6424,12 @@ mod tests {
             suite: CryptoSuite::Ed25519Sha256,
             key: key.verifying_key(),
         };
-        DidDocument {
-            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+        let mut document = DidDocument {
+            context: vec![
+                "https://www.w3.org/ns/did/v1".to_owned(),
+                "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+            ],
             id: did.to_owned(),
             controller: Some(oan_core::DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
@@ -6439,17 +6445,32 @@ mod tests {
             assertion_method: vec![key_id.clone()],
             capability_invocation: vec![key_id.clone()],
             service: vec![],
-            proof: Some(DataIntegrityProof {
-                proof_type: "Ed25519Signature2020".to_owned(),
-                creator: key_id.clone(),
-                created: Utc::now(),
-                proof_purpose: "assertionMethod".to_owned(),
-                proof_value: "fixture".to_owned(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                hash_algorithm: Some("sha256".to_owned()),
-                verification_method: Some(key_id),
-            }),
+            proof: None,
             oan_metadata: None,
+        };
+        document.proof = Some(test_did_proof(&document, key, key_id));
+        document
+    }
+
+    fn test_did_proof(
+        document: &DidDocument,
+        key: &ed25519_dalek::SigningKey,
+        verification_method: String,
+    ) -> DataIntegrityProof {
+        let signing_key = OanSigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: key.clone(),
+        };
+        let input = did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
+        DataIntegrityProof {
+            proof_type: "Ed25519Signature2020".to_owned(),
+            creator: String::new(),
+            created: Utc::now(),
+            proof_purpose: "assertionMethod".to_owned(),
+            proof_value: sign_bytes_multibase(&signing_key, &input).unwrap(),
+            crypto_suite: None,
+            hash_algorithm: None,
+            verification_method: Some(verification_method),
         }
     }
 
@@ -6506,6 +6527,8 @@ mod tests {
             lifecycle_state: Some("active".to_owned()),
             extra: BTreeMap::new(),
         });
+        let key_id = format!("{did}#key-1");
+        document.proof = Some(test_did_proof(&document, key, key_id));
         document
     }
 
@@ -6515,8 +6538,12 @@ mod tests {
             suite: CryptoSuite::Ed25519Sha256,
             key: key.verifying_key(),
         };
-        DidDocument {
-            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+        let mut document = DidDocument {
+            context: vec![
+                "https://www.w3.org/ns/did/v1".to_owned(),
+                "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+            ],
             id: did.to_owned(),
             controller: Some(oan_core::DidController::Did(did.to_owned())),
             verification_method: vec![VerificationMethod {
@@ -6540,16 +6567,7 @@ mod tests {
                 server_type: None,
                 port: None,
             }],
-            proof: Some(DataIntegrityProof {
-                proof_type: "Ed25519Signature2020".to_owned(),
-                creator: key_id.clone(),
-                created: Utc::now(),
-                proof_purpose: "assertionMethod".to_owned(),
-                proof_value: "fixture".to_owned(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                hash_algorithm: Some("sha256".to_owned()),
-                verification_method: Some(key_id),
-            }),
+            proof: None,
             oan_metadata: Some(OanMetadata {
                 subject_type: SubjectType::Skill,
                 resource_type: ResourceType::Skill,
@@ -6592,7 +6610,9 @@ mod tests {
                 lifecycle_state: Some("active".to_owned()),
                 extra: Default::default(),
             }),
-        }
+        };
+        document.proof = Some(test_did_proof(&document, key, key_id));
+        document
     }
 
     fn app_state(dir: &std::path::Path) -> AppState {
@@ -6655,6 +6675,46 @@ mod tests {
             cdn_worker_notify: Arc::new(Notify::new()),
             discovery_worker_notify: Arc::new(Notify::new()),
         }
+    }
+
+    #[test]
+    fn test_did_fixtures_use_signed_profile_proofs() {
+        let key = generate_ed25519_keypair();
+        let document = resource_document_with_key(resource_did(), &key);
+        let proof = document.proof.as_ref().unwrap();
+
+        assert_eq!(
+            document.context,
+            vec![
+                "https://www.w3.org/ns/did/v1",
+                "https://openagenet.xyz/did-oan-specs/v1",
+                "https://w3id.org/security/suites/ed25519-2020/v1",
+            ]
+        );
+        assert!(proof.creator.is_empty());
+        assert!(proof.crypto_suite.is_none());
+        assert!(proof.hash_algorithm.is_none());
+        assert!(proof.proof_value.starts_with('z'));
+
+        let mut unsigned = document.clone();
+        unsigned.proof = None;
+        let input =
+            did_document_signature_input(&unsigned, CryptoSuite::Ed25519Sha256).unwrap();
+        let verifying_key = OanVerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: key.verifying_key(),
+        };
+        verify_bytes_multibase(&verifying_key, &input, &proof.proof_value).unwrap();
+    }
+
+    #[test]
+    fn test_did_fixtures_reject_legacy_placeholder_proof() {
+        let key = generate_ed25519_keypair();
+        let mut document = resource_document_with_key(resource_did(), &key);
+        let proof = document.proof.as_mut().unwrap();
+        proof.creator = format!("{}#key-1", document.id);
+        proof.proof_value = "fixture".to_owned();
+        assert!(document.validate_oan_resource().is_err());
     }
 
     fn package_from_request(
@@ -7213,8 +7273,12 @@ mod tests {
             suite: CryptoSuite::Ed25519Sha256,
             key: controller_key.verifying_key(),
         };
-        let controller_document = DidDocument {
-            context: vec!["https://www.w3.org/ns/did/v1".to_owned()],
+        let mut controller_document = DidDocument {
+            context: vec![
+                "https://www.w3.org/ns/did/v1".to_owned(),
+                "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+                "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
+            ],
             id: controller_did.to_owned(),
             controller: Some(oan_core::DidController::Did(controller_did.to_owned())),
             verification_method: vec![VerificationMethod {
@@ -7230,18 +7294,14 @@ mod tests {
             assertion_method: vec![controller_method.clone()],
             capability_invocation: vec![controller_method.clone()],
             service: vec![],
-            proof: Some(DataIntegrityProof {
-                proof_type: "Ed25519Signature2020".to_owned(),
-                creator: controller_method.clone(),
-                created: Utc::now(),
-                proof_purpose: "assertionMethod".to_owned(),
-                proof_value: "fixture".to_owned(),
-                crypto_suite: Some(CryptoSuite::Ed25519Sha256),
-                hash_algorithm: Some("sha256".to_owned()),
-                verification_method: Some(controller_method.clone()),
-            }),
+            proof: None,
             oan_metadata: None,
         };
+        controller_document.proof = Some(test_did_proof(
+            &controller_document,
+            &controller_key,
+            controller_method.clone(),
+        ));
         request.submission.did_document.controller =
             Some(oan_core::DidController::Did(controller_did.to_owned()));
         request.submission.did_document.verification_method[0].controller =
