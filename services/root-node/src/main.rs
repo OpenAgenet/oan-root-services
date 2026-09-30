@@ -5023,6 +5023,8 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
+    verify_did_document_proof(&bundle.controller_did_document)
+        .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method_id = verify_controller_authorization_proof(
         bundle,
@@ -7740,6 +7742,47 @@ mod tests {
 
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.message, "controller_authorization_proof_invalid");
+    }
+
+    #[tokio::test]
+    async fn verify_resource_and_publish_rejects_invalid_external_controller_did_proof() {
+        let dir = tempdir().unwrap();
+        let state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        let resource_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let mut request = resource_verify_request(
+            &state,
+            &registrar_key,
+            &resource_key,
+            PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
+        );
+        attach_external_controller_proof(
+            &state,
+            &mut request,
+            &registrar_key,
+            &resource_key,
+            "did:oan:AGUS:9ControllerDidProofTampered",
+        );
+        request
+            .submission
+            .controller_authorization_proof
+            .as_mut()
+            .unwrap()
+            .controller_did_document
+            .proof
+            .as_mut()
+            .unwrap()
+            .proof_value = "z1111111111111111111111111111111111111111111111111111111111111111"
+            .to_owned();
+        resign_resource_verify_request(&state, &mut request, &registrar_key);
+
+        let err = verify_resource_and_publish(State(state), Json(request))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.message, "controller_did_document_proof_invalid");
     }
 
     #[tokio::test]
