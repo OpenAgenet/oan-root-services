@@ -115,6 +115,12 @@ struct ServerConfig {
     endpoint: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CredentialStatusQuery {
+    subject_did: Option<String>,
+    credential_id: Option<String>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct CorsConfig {
     #[serde(default)]
@@ -1143,6 +1149,7 @@ async fn main() -> Result<()> {
         .route("/root/did", get(root_did_document))
         .route("/bulletin", get(bulletin))
         .route("/root/status", get(api_status))
+        .route("/v1/credentials/status", get(api_credential_status))
         .route("/root/registrars", get(api_registrars))
         .route("/root/registrars/{did}", get(api_registrar_detail))
         .route("/root/discovery-nodes", get(api_discovery_nodes))
@@ -3241,6 +3248,67 @@ async fn api_registrar_detail(
         })
         .collect();
     Ok(Json(json!({ "did": did, "events": events })))
+}
+
+async fn api_credential_status(
+    State(state): State<AppState>,
+    Query(query): Query<CredentialStatusQuery>,
+) -> ApiResult<Value> {
+    let subject_did = query.subject_did.clone().unwrap_or_default();
+    let credential_id = query.credential_id.clone();
+    if subject_did.is_empty() {
+        return Ok(Json(json!({
+            "issuerDid": state.root_did,
+            "credentialId": credential_id,
+            "subjectDid": subject_did,
+            "status": "unknown",
+            "reason": "subject_did_required",
+            "observedAt": Utc::now(),
+        })));
+    }
+    let authorization_state = current_authorization_state(&state);
+    let entry = authorization_state
+        .registrars
+        .get(&subject_did)
+        .map(|value| (&value.status, &value.updated_at, &value.did_document_hash))
+        .or_else(|| {
+            authorization_state
+                .discovery_nodes
+                .get(&subject_did)
+                .map(|value| (&value.status, &value.updated_at, &value.did_document_hash))
+        })
+        .or_else(|| {
+            authorization_state
+                .vc_issuers
+                .get(&subject_did)
+                .map(|value| (&value.status, &value.updated_at, &value.did_document_hash))
+        });
+    let Some((status, updated_at, did_document_hash)) = entry else {
+        return Ok(Json(json!({
+            "issuerDid": state.root_did,
+            "credentialId": credential_id,
+            "subjectDid": subject_did,
+            "status": "unknown",
+            "reason": "not_found",
+            "observedAt": Utc::now(),
+        })));
+    };
+    let bulletin = read_bulletin(&state).map_err(ApiError::internal)?;
+    let event_sequence = bulletin
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.core.subject_did == subject_did)
+        .map(|event| event.core.sequence);
+    Ok(Json(json!({
+        "issuerDid": state.root_did,
+        "credentialId": credential_id,
+        "subjectDid": subject_did,
+        "status": status,
+        "observedAt": updated_at,
+        "didDocumentHash": did_document_hash,
+        "eventSequence": event_sequence,
+    })))
 }
 
 async fn api_discovery_nodes(State(state): State<AppState>) -> ApiResult<Value> {
