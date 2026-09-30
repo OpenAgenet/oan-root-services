@@ -21,13 +21,11 @@ use oan_core::{
     CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType, SubjectType,
 };
 use oan_credentials::{
-    validate_infrastructure_authorization_credential, CredentialStatusReference,
+    sign_credential, validate_infrastructure_authorization_credential, CredentialProof,
+    CredentialStatusReference,
     InfrastructureAuthorizationCredentialSubject, OanInfrastructureAuthorizationCredential,
 };
-use oan_crypto::{
-    build_data_integrity_proof, hash_json_with_suite, sign_bytes, signature_input,
-    signing_key_from_bytes, SigningKey,
-};
+use oan_crypto::{build_data_integrity_proof, hash_json_with_suite, signing_key_from_bytes, SigningKey};
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
     RootProof,
@@ -113,6 +111,8 @@ struct Config {
 struct ServerConfig {
     host: String,
     port: u16,
+    #[serde(default)]
+    endpoint: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -2434,7 +2434,7 @@ async fn issue_infrastructure_authorization_vc(
     .map_err(ApiError::bad_request)?;
     let did_document_hash = did_document_hash_for_root(&state, &request.payload.did_document)
         .map_err(ApiError::internal)?;
-    let governance = ensure_governance_active(&state, subject_type, &request.payload.subject_did)
+    let _governance = ensure_governance_active(&state, subject_type, &request.payload.subject_did)
         .await
         .map_err(ApiError::forbidden)?;
     let governance_subject =
@@ -2448,7 +2448,7 @@ async fn issue_infrastructure_authorization_vc(
         &governance_subject,
     )
     .map_err(ApiError::forbidden)?;
-    let indexer_status = fetch_trust_indexer_status(&state)
+    let _indexer_status = fetch_trust_indexer_status(&state)
         .await
         .map_err(ApiError::forbidden)?;
     let credential = build_infrastructure_authorization_credential(
@@ -2456,9 +2456,6 @@ async fn issue_infrastructure_authorization_vc(
         subject_type,
         &request.payload,
         &did_document_stable_hash,
-        &governance,
-        &governance_subject,
-        &indexer_status,
     )
     .map_err(ApiError::internal)?;
 
@@ -3999,31 +3996,9 @@ fn build_infrastructure_authorization_proof(
     unsigned: &Value,
     verification_method: String,
     signing_key: &SigningKey,
-) -> Result<oan_core::DataIntegrityProof> {
-    let suite = signing_key.crypto_suite();
-    let proof_type = match suite {
-        CryptoSuite::Ed25519Sha256 | CryptoSuite::Ed25519Sha256Legacy => "OANEd25519Signature2026",
-        CryptoSuite::Sm2Sm3 => "OANSM2Signature2026",
-    };
-    let input = signature_input(suite.clone(), unsigned)?;
-    Ok(oan_core::DataIntegrityProof {
-        proof_type: proof_type.to_owned(),
-        creator: verification_method.clone(),
-        created: Utc::now(),
-        proof_purpose: "assertionMethod".to_owned(),
-        proof_value: sign_bytes(signing_key, &input)?,
-        crypto_suite: Some(suite.clone()),
-        hash_algorithm: Some(suite.canonical_hash_algorithm().to_owned()),
-        verification_method: Some(verification_method),
-    })
-}
-
-fn latest_governance_action_label(status: Option<&str>) -> String {
-    match status {
-        Some("active") => "active".to_owned(),
-        Some(value) if !value.is_empty() => value.to_owned(),
-        _ => "active".to_owned(),
-    }
+) -> Result<CredentialProof> {
+    sign_credential(unsigned, verification_method.clone(), verification_method, signing_key)
+        .map_err(Into::into)
 }
 
 fn build_infrastructure_authorization_credential(
@@ -4031,55 +4006,31 @@ fn build_infrastructure_authorization_credential(
     subject_type: GovernanceSubjectType,
     payload: &InfrastructureAuthorizationVcIssuePayload,
     did_document_stable_hash: &str,
-    governance: &GovernanceDecision,
-    governance_subject: &GovernanceSubjectRecord,
-    indexer_status: &TrustIndexerStatus,
 ) -> Result<OanInfrastructureAuthorizationCredential> {
     let issuance_date = Utc::now();
-    let governance_binding_id = if governance_subject.last_sequence > 0 {
-        format!(
-            "{}:{}",
-            governance_subject.last_sequence, governance_subject.last_event_digest
-        )
-    } else if !governance_subject.policy_hash.is_empty() {
-        governance_subject.policy_hash.clone()
-    } else {
-        did_document_stable_hash.to_owned()
-    };
     let credential_id = format!(
         "urn:oan:root-authorization:{}:{}",
         subject_type.label(),
         did_to_file_name(&payload.subject_did).trim_end_matches(".json")
     );
-    let mut credential_status = CredentialStatusReference {
-        id: format!("{}/v1/credentials/status", state.root_did),
+    let credential_status = CredentialStatusReference {
+        id: format!(
+            "{}/v1/credentials/status",
+            state
+                .config
+                .server
+                .endpoint
+                .as_deref()
+                .unwrap_or("http://127.0.0.1:8000")
+        ),
         status_type: "OANChainGovernanceBackedAuthorizationStatus2026".to_owned(),
         credential_id: Some(credential_id.clone()),
         subject_did: Some(payload.subject_did.clone()),
         issuer_did: Some(state.root_did.clone()),
         status: Some("active".to_owned()),
-        sequence: (governance_subject.last_sequence > 0)
-            .then_some(governance_subject.last_sequence),
-        event_digest: (!governance_subject.last_event_digest.is_empty())
-            .then_some(governance_subject.last_event_digest.clone()),
         updated_at: Some(issuance_date),
-        package_id: indexer_status.package_id.clone(),
-        bulletin_object_id: indexer_status.bulletin_object_id.clone(),
-        expected_governance_state: Some("active".to_owned()),
-        latest_action: Some(latest_governance_action_label(governance.status.as_deref())),
-        did_document_stable_hash: Some(did_document_stable_hash.to_owned()),
-        policy_hash: (!governance_subject.policy_hash.is_empty())
-            .then_some(governance_subject.policy_hash.clone()),
-        effective_from_ms: (governance_subject.effective_from_ms > 0)
-            .then_some(governance_subject.effective_from_ms),
-        expires_at_ms: (governance_subject.expires_at_ms > 0)
-            .then_some(governance_subject.expires_at_ms),
         extra: Default::default(),
     };
-    credential_status.extra.insert(
-        "chainGovernanceNoticeFile".to_owned(),
-        json!("chain-governance-notice.json"),
-    );
     let subject = InfrastructureAuthorizationCredentialSubject {
         id: payload.subject_did.clone(),
         role: subject_type.label().to_owned(),
@@ -4088,13 +4039,12 @@ fn build_infrastructure_authorization_credential(
         endpoint: payload.endpoint.clone(),
         authorized_domains: payload.authorized_domains.clone(),
         did_document_hash: did_document_stable_hash.to_owned(),
-        governance_state: "active".to_owned(),
-        governance_binding_id,
     };
     let unsigned = OanInfrastructureAuthorizationCredential {
         context: vec![
             "https://www.w3.org/2018/credentials/v1".to_owned(),
-            "https://openagenet.org/credentials/v1".to_owned(),
+            "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+            "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
         ],
         id: Some(credential_id),
         credential_type: vec![
@@ -6450,7 +6400,8 @@ mod tests {
         };
         document.context = vec![
             "https://www.w3.org/ns/did/v1".to_owned(),
-            "https://w3id.org/oan/v1".to_owned(),
+            "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
+            "https://w3id.org/security/suites/ed25519-2020/v1".to_owned(),
         ];
         document.service = vec![ServiceEndpoint {
             id: format!("{did}#service"),
@@ -6592,6 +6543,7 @@ mod tests {
                 server: ServerConfig {
                     host: "127.0.0.1".to_owned(),
                     port: 8001,
+                    endpoint: Some("http://127.0.0.1:8001".to_owned()),
                 },
                 cors: CorsConfig::default(),
                 debug: DebugConfig::default(),
@@ -7963,11 +7915,12 @@ mod tests {
             response.0["credential"]["credentialSubject"]["didDocumentHash"],
             response.0["didDocumentStableHash"]
         );
-        assert!(
-            response.0["credential"]["credentialSubject"]["governanceBindingId"]
-                .as_str()
-                .is_some()
-        );
+        assert!(response.0["credential"]["credentialSubject"]
+            .get("governanceBindingId")
+            .is_none());
+        assert!(response.0["credential"]["credentialSubject"]
+            .get("governanceState")
+            .is_none());
         assert!(response.0["credential"]["credentialSubject"]
             .get("didDocumentFile")
             .is_none());
@@ -7975,29 +7928,34 @@ mod tests {
             response.0["credential"]["credentialStatus"]["type"],
             "OANChainGovernanceBackedAuthorizationStatus2026"
         );
-        assert_eq!(
-            response.0["credential"]["credentialStatus"]["chainGovernanceNoticeFile"],
-            "chain-governance-notice.json"
-        );
-        assert_eq!(
-            response.0["credential"]["credentialStatus"]["didDocumentStableHash"],
-            response.0["didDocumentStableHash"]
-        );
+        assert!(response.0["credential"]["credentialStatus"]
+            .get("chainGovernanceNoticeFile")
+            .is_none());
+        assert!(response.0["credential"]["credentialStatus"]
+            .get("packageId")
+            .is_none());
+        assert!(response.0["credential"]["credentialStatus"]
+            .get("bulletinObjectId")
+            .is_none());
+        assert!(response.0["credential"]["credentialStatus"]
+            .get("eventDigest")
+            .is_none());
         assert_eq!(
             response.0["credential"]["proof"]["type"],
-            "OANEd25519Signature2026"
+            "Ed25519Signature2020"
         );
+        assert!(response.0["credential"]["proof"].get("creator").is_none());
+        assert!(response.0["credential"]["proof"].get("cryptoSuite").is_none());
+        assert!(response.0["credential"]["proof"].get("hashAlgorithm").is_none());
         assert_eq!(
-            response.0["credential"]["proof"]["cryptoSuite"],
-            "ed25519-sha256"
+            response.0["credential"]["proof"]["verificationMethod"],
+            format!("{}#key-1", state.root_did)
         );
-        assert_eq!(response.0["credential"]["proof"]["hashAlgorithm"], "sha256");
         assert!(
             response.0["credential"]["proof"]["proofValue"]
                 .as_str()
                 .unwrap()
-                .len()
-                > 20
+                .starts_with('z')
         );
         let authorization_state =
             load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
