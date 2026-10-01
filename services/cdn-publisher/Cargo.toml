@@ -14,6 +14,7 @@ bytes.workspace = true
 chrono.workspace = true
 futures.workspace = true
 oan-core.workspace = true
+oan-credentials.workspace = true
 oan-crypto.workspace = true
 oan-package.workspace = true
 oan-protocol.workspace = true

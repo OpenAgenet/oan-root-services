@@ -11,7 +11,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use oan_bulletin::{Bulletin, BulletinEvent, BulletinEventCore, BulletinEventType};
@@ -23,10 +22,11 @@ use oan_core::{
 use oan_credentials::{
     sign_credential_data_integrity, validate_infrastructure_authorization_credential, CredentialProof,
     CredentialStatusReference,
-    InfrastructureAuthorizationCredentialSubject, OanInfrastructureAuthorizationCredential,
+    InfrastructureAuthorizationCredentialSubject, OanIdentity,
+    OanInfrastructureAuthorizationCredential,
 };
 use oan_crypto::{
-    build_data_integrity_proof, hash_json_with_suite, signing_key_from_bytes,
+    build_data_integrity_proof, hash_json_with_suite, signing_key_from_private_key_jwk,
     verify_did_document_proof, SigningKey,
 };
 #[cfg(test)]
@@ -315,7 +315,8 @@ impl Default for WorkerSecurityConfig {
 #[derive(Clone, Debug, Deserialize)]
 struct PathConfig {
     data_dir: PathBuf,
-    keys_dir: PathBuf,
+    #[serde(default = "default_identity_file")]
+    identity_file: PathBuf,
     bulletin_file: PathBuf,
     #[serde(default = "default_authorization_state_file")]
     authorization_state_file: PathBuf,
@@ -327,6 +328,10 @@ struct PathConfig {
     capability_tree_file: PathBuf,
     #[serde(default)]
     database_url: Option<String>,
+}
+
+fn default_identity_file() -> PathBuf {
+    PathBuf::from("../../data/root/identity.json")
 }
 
 fn default_authorization_state_file() -> PathBuf {
@@ -447,14 +452,6 @@ fn default_clock_skew_seconds() -> i64 {
 
 fn default_nonce_ttl_seconds() -> i64 {
     300
-}
-
-fn crypto_suite_from_algorithm(value: &str) -> Result<CryptoSuite> {
-    match value {
-        "Ed25519" => Ok(CryptoSuite::Ed25519Sha256),
-        "SM2" => Ok(CryptoSuite::Sm2Sm3),
-        other => Err(anyhow!("unsupported_algorithm: {other}")),
-    }
 }
 
 #[derive(Clone)]
@@ -1000,19 +997,6 @@ impl IntoResponse for ApiError {
 type ApiResult<T> = std::result::Result<Json<T>, ApiError>;
 
 #[derive(Clone, Debug, Deserialize)]
-struct DevKeyFile {
-    did: String,
-    algorithm: String,
-    #[serde(rename = "privateKeyJwk")]
-    private_key_jwk: PrivateKeyJwk,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PrivateKeyJwk {
-    d: String,
-}
-
-#[derive(Clone, Debug, Deserialize)]
 struct CdnPublicationJobRef {
     #[serde(rename = "jobKey")]
     job_key: String,
@@ -1077,11 +1061,19 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| "services/root-node/config.example.toml".to_owned());
     let config = load_config(config_path)?;
     let data = JsonStore::new(&config.paths.data_dir);
-    let key: DevKeyFile = JsonStore::new(".").read(config.paths.keys_dir.join("keypair.json"))?;
-    let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
-    let signing_key = signing_key_from_bytes(
-        crypto_suite,
-        &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
+    let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
+    identity
+        .validate()
+        .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
+    let did_document = identity.did_document.clone();
+    did_document
+        .validate_infrastructure_profile(ResourceType::RootNode)
+        .map_err(|err| anyhow!("invalid root DID document profile: {err}"))?;
+    // Public projection used by existing resource/discovery paths; identity.json remains authoritative.
+    data.write("did-document.json", &did_document)?;
+    let signing_key = signing_key_from_private_key_jwk(
+        CryptoSuite::Ed25519Sha256,
+        &identity.private_key_jwk,
     )?;
     let authorization_state = load_authorization_state(&config.paths.authorization_state_file)?;
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
@@ -1106,7 +1098,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         data,
         config: config.clone(),
-        root_did: key.did,
+        root_did: identity.did,
         signing_key,
         tag_tree: oan_core::CapabilityTagTree::load_from_path(&config.paths.capability_tree_file)
             .unwrap_or_else(|_| default_tag_tree()),
@@ -1234,7 +1226,7 @@ fn load_config(path: String) -> Result<Config> {
     let mut config: Config = toml::from_str(&text)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
     config.paths.data_dir = resolve_relative(base, &config.paths.data_dir);
-    config.paths.keys_dir = resolve_relative(base, &config.paths.keys_dir);
+    config.paths.identity_file = resolve_relative(base, &config.paths.identity_file);
     config.paths.bulletin_file = resolve_relative(base, &config.paths.bulletin_file);
     config.paths.authorization_state_file =
         resolve_relative(base, &config.paths.authorization_state_file);
@@ -6698,7 +6690,7 @@ mod tests {
                 security,
                 paths: PathConfig {
                     data_dir: dir.to_path_buf(),
-                    keys_dir: dir.join("keys"),
+                    identity_file: dir.join("identity.json"),
                     database_url: None,
                     bulletin_file: dir.join("bulletin.json"),
                     capability_tree_file: dir.join("capability-tree.json"),
@@ -9332,7 +9324,7 @@ cdn_publish_subject = "oan.resource.cdn.publish.requested"
 
 [paths]
 data_dir = "../root"
-keys_dir = "../root/keys"
+identity_file = "../root/identity.json"
 bulletin_file = "../root/bulletin.json"
 authorization_state_file = "../root/authorization-state.json"
 request_nonce_file = "../root/request-nonces.json"

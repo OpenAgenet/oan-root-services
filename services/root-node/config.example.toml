@@ -37,7 +37,7 @@ failure_mode = "closed"
 
 [paths]
 data_dir = "../../data/root"
-keys_dir = "../../data/root/keys"
+identity_file = "../../data/root/identity.json"
 bulletin_file = "../../data/root/bulletin.json"
 controller_authorization_nonce_file = "../../data/root/controller-authorization-nonces.json"
 capability_tree_file = "../../docs/capability-tree-v1.json"

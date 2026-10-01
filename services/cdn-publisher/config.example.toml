@@ -13,7 +13,7 @@ max_in_flight = 200
 
 [root]
 endpoint = "http://127.0.0.1:8000"
-keys_dir = "../../data/root/keys"
+identity_file = "../../data/root/identity.json"
 admin_token = "local-dev-admin-token"
 package_batch_path = "/root/internal/cdn-publication-jobs/packages"
 mark_published_path = "/root/internal/cdn-publication-jobs/mark-published"

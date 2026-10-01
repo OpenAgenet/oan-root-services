@@ -5,11 +5,11 @@
 
 use anyhow::{anyhow, Result};
 use axum::{extract::State, routing::get, Json, Router};
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::Utc;
 use futures::StreamExt;
-use oan_core::CryptoSuite;
-use oan_crypto::{signing_key_from_bytes, SigningKey};
+use oan_core::{CryptoSuite, ResourceType};
+use oan_credentials::OanIdentity;
+use oan_crypto::{signing_key_from_private_key_jwk, SigningKey};
 use oan_package::ResourcePackage;
 use oan_protocol::{
     HealthResponse, ResourceCdnBatchPublishRequest, ResourceCdnPublishBatchItem,
@@ -67,7 +67,7 @@ struct EventConfig {
 #[derive(Clone, Debug, Deserialize)]
 struct RootConfig {
     endpoint: String,
-    keys_dir: PathBuf,
+    identity_file: PathBuf,
     #[serde(default)]
     admin_token: Option<String>,
     #[serde(default = "default_package_batch_path")]
@@ -211,19 +211,6 @@ struct RootBatchPackageItem {
     package: ResourcePackage,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct DevKeyFile {
-    did: String,
-    algorithm: String,
-    #[serde(rename = "privateKeyJwk")]
-    private_key_jwk: PrivateKeyJwk,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-struct PrivateKeyJwk {
-    d: String,
-}
-
 fn default_batch_size() -> usize {
     200
 }
@@ -300,25 +287,23 @@ fn default_package_batch_path() -> String {
     "/root/internal/cdn-publication-jobs/packages".to_owned()
 }
 
-fn crypto_suite_from_algorithm(value: &str) -> Result<CryptoSuite> {
-    match value {
-        "Ed25519" => Ok(CryptoSuite::Ed25519Sha256),
-        "SM2" => Ok(CryptoSuite::Sm2Sm3),
-        other => Err(anyhow!("unsupported_algorithm: {other}")),
-    }
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "services/cdn-publisher/config.example.toml".to_owned());
     let config = load_config(config_path)?;
-    let key: DevKeyFile = JsonStore::new(".").read(config.root.keys_dir.join("keypair.json"))?;
-    let crypto_suite = crypto_suite_from_algorithm(&key.algorithm)?;
-    let signing_key = signing_key_from_bytes(
-        crypto_suite,
-        &URL_SAFE_NO_PAD.decode(key.private_key_jwk.d)?,
+    let identity: OanIdentity = JsonStore::new(".").read(&config.root.identity_file)?;
+    identity
+        .validate()
+        .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
+    identity
+        .did_document
+        .validate_infrastructure_profile(ResourceType::RootNode)
+        .map_err(|err| anyhow!("invalid root DID document profile: {err}"))?;
+    let signing_key = signing_key_from_private_key_jwk(
+        CryptoSuite::Ed25519Sha256,
+        &identity.private_key_jwk,
     )?;
     let client = reqwest::Client::builder()
         .timeout(TokioDuration::from_secs(config.cdn.http_timeout_seconds))
@@ -331,7 +316,7 @@ async fn main() -> Result<()> {
             ..Default::default()
         })),
         pending_callbacks: Arc::new(Mutex::new(PendingCallbackBatch::default())),
-        root_did: key.did,
+        root_did: identity.did,
         signing_key,
         client,
         config: config.clone(),
@@ -361,7 +346,7 @@ fn load_config(path: impl AsRef<Path>) -> Result<Config> {
     let value = std::fs::read_to_string(path)?;
     let mut config: Config = toml::from_str(&value)?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
-    config.root.keys_dir = resolve_relative(base, &config.root.keys_dir);
+    config.root.identity_file = resolve_relative(base, &config.root.identity_file);
     Ok(config)
 }
 
@@ -1468,7 +1453,7 @@ mod tests {
                 },
                 root: RootConfig {
                     endpoint: "http://127.0.0.1:8000".to_owned(),
-                    keys_dir: PathBuf::new(),
+                    identity_file: PathBuf::new(),
                     admin_token: None,
                     package_batch_path: default_package_batch_path(),
                     mark_published_path: default_mark_published_path(),
@@ -2123,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn load_config_resolves_root_keys_dir_relative_to_config_file() {
+    fn load_config_resolves_root_identity_file_relative_to_config_file() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config").join("cdn-publisher.toml");
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
@@ -2142,7 +2127,7 @@ durable_consumer = "oan-cdn-publisher"
 
 [root]
 endpoint = "http://127.0.0.1:8000"
-keys_dir = "../root/keys"
+identity_file = "../root/identity.json"
 admin_token = "local-dev-admin-token"
 
 [cdn]
@@ -2152,10 +2137,7 @@ publish_batch_path = "/cdn/resources/batch"
         )
         .unwrap();
         let config = load_config(&config_path).unwrap();
-        assert!(config.root.keys_dir.is_absolute());
-        assert!(config
-            .root
-            .keys_dir
-            .ends_with(Path::new("root").join("keys")));
+        assert!(config.root.identity_file.is_absolute());
+        assert!(config.root.identity_file.ends_with(Path::new("root").join("identity.json")));
     }
 }
