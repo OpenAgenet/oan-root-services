@@ -1237,7 +1237,12 @@ async fn publish_packages_to_cdn(
     let response = state.client.post(url).json(&request).send().await?;
     let publish_elapsed_ms = publish_started.elapsed().as_millis();
     let status = response.status();
-    let value = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    let body = response.text().await?;
+    let value = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| {
+        json!({
+            "rawBody": body
+        })
+    });
     if !status.is_success() {
         return Err(anyhow!("cdn_publish_failed:{status}:{value}"));
     }

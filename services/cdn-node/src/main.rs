@@ -567,7 +567,10 @@ async fn publish_resource(
         &trusted_resource_upstream_policy(&state, PATH_CDN_RESOURCES),
         Utc::now(),
     )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    .map_err(|err| {
+        eprintln!("cdn trusted upstream verification failed: {err}");
+        ApiError::bad_request(err.to_string())
+    })?;
     let package = request.package;
     validate_publishable_resource(&state, &package)?;
     persist_published_resource(&state, &package)
@@ -615,7 +618,10 @@ async fn publish_resources_batch(
         &trusted_resource_upstream_policy(&state, PATH_CDN_RESOURCES_BATCH),
         Utc::now(),
     )
-    .map_err(|err| ApiError::bad_request(err.to_string()))?;
+    .map_err(|err| {
+        eprintln!("cdn trusted upstream batch verification failed: {err}");
+        ApiError::bad_request(err.to_string())
+    })?;
 
     let mut accepted = Vec::with_capacity(request.items.len());
     let mut failed = Vec::new();

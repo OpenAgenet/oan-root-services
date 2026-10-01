@@ -28,7 +28,8 @@ use oan_credentials::{
 use oan_crypto::verify_oan_data_integrity;
 use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, signing_key_from_private_key_jwk,
-    verify_did_document_proof, SigningKey,
+    verify_did_document_proof_standard_blocking,
+    verify_did_document_proof_standard_value_blocking, SigningKey,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -1195,7 +1196,7 @@ async fn main() -> Result<()> {
         .route("/root/nodes/{did}/revoke", post(revoke_node))
         .route(
             "/root/resources/verify-and-publish",
-            post(verify_resource_and_publish),
+            post(verify_resource_and_publish_raw),
         );
 
     let app = Router::new()
@@ -2174,6 +2175,34 @@ async fn verify_resource_and_publish(
     State(state): State<AppState>,
     Json(request): Json<ResourceVerifyAndPublishRequest>,
 ) -> ApiResult<Value> {
+    let raw_did_document = request
+        .did_document_raw
+        .clone()
+        .unwrap_or_else(|| serde_json::to_value(&request.submission.did_document).unwrap_or(Value::Null));
+    verify_resource_and_publish_with_raw_document(state, request, raw_did_document).await
+}
+
+async fn verify_resource_and_publish_raw(
+    State(state): State<AppState>,
+    Json(payload): Json<Value>,
+) -> ApiResult<Value> {
+    let raw_did_document = payload
+        .get("didDocumentRaw")
+        .cloned()
+        .or_else(|| payload.pointer("/submission/didDocument").cloned())
+        .ok_or_else(|| ApiError::bad_request("did_document_missing"))?;
+    verify_did_document_proof_standard_value_blocking(raw_did_document.clone())
+        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
+    let request: ResourceVerifyAndPublishRequest =
+        serde_json::from_value(payload).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    verify_resource_and_publish_with_raw_document(state, request, raw_did_document).await
+}
+
+async fn verify_resource_and_publish_with_raw_document(
+    state: AppState,
+    request: ResourceVerifyAndPublishRequest,
+    raw_did_document: Value,
+) -> ApiResult<Value> {
     let admission_started = Instant::now();
     let _admission_permit = tokio::time::timeout(
         TokioDuration::from_secs(state.config.security.workers.http_timeout_seconds.max(1)),
@@ -2186,7 +2215,8 @@ async fn verify_resource_and_publish(
     })?
     .map_err(ApiError::internal)?;
     record_admission_accepted(&state, admission_started.elapsed().as_millis());
-    verify_resource_request(&state, &request).map_err(ApiError::bad_request)?;
+    verify_resource_request_with_raw_document(&state, &request, &raw_did_document)
+        .map_err(ApiError::bad_request)?;
     ensure_governance_active(
         &state,
         GovernanceSubjectType::Registrar,
@@ -4057,7 +4087,8 @@ fn validate_infrastructure_did_document_profile(
     did_document
         .validate_infrastructure_profile(expected_resource_type.clone())
         .map_err(|_| "did_document_infrastructure_profile_invalid".to_owned())?;
-    verify_did_document_proof(did_document).map_err(|_| "did_document_proof_invalid".to_owned())?;
+    verify_did_document_proof_standard_blocking(did_document)
+        .map_err(|_| "did_document_proof_invalid".to_owned())?;
     let expected_service_type = match subject_type {
         GovernanceSubjectType::Registrar => "OANRegistrarService",
         GovernanceSubjectType::Discovery => "OANDiscoveryService",
@@ -5034,6 +5065,18 @@ fn verify_resource_request(
     state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
 ) -> std::result::Result<(), String> {
+    let raw = request
+        .did_document_raw
+        .clone()
+        .unwrap_or_else(|| serde_json::to_value(&request.submission.did_document).unwrap_or(Value::Null));
+    verify_resource_request_with_raw_document(state, request, &raw)
+}
+
+fn verify_resource_request_with_raw_document(
+    state: &AppState,
+    request: &ResourceVerifyAndPublishRequest,
+    raw_did_document: &Value,
+) -> std::result::Result<(), String> {
     let registrar_document = load_authorized_registrar_document(state, &request.registrar_did)
         .map_err(|_| "registrar_not_authorized".to_owned())?;
     let policy = trusted_upstream_policy(state, PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH);
@@ -5047,7 +5090,7 @@ fn verify_resource_request(
     )
     .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
-    verify_did_document_proof(&request.submission.did_document)
+    verify_did_document_proof_standard_value_blocking(raw_did_document.clone())
         .map_err(|_| "did_document_proof_invalid".to_owned())?;
     validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
@@ -5074,7 +5117,7 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
-    verify_did_document_proof(&bundle.controller_did_document)
+    verify_did_document_proof_standard_blocking(&bundle.controller_did_document)
         .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method_id = verify_controller_authorization_proof(
