@@ -29,6 +29,8 @@ use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, signing_key_from_bytes,
     verify_did_document_proof, SigningKey,
 };
+#[cfg(test)]
+use oan_crypto::verify_oan_data_integrity;
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
     RootProof,
@@ -8250,6 +8252,19 @@ mod tests {
                 .unwrap()
                 .starts_with('z')
         );
+        let SigningKey::Ed25519 { key, .. } = &state.signing_key else {
+            panic!("test root key must be Ed25519");
+        };
+        let root_verifying_key = OanVerifyingKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: key.verifying_key(),
+        };
+        verify_oan_data_integrity(
+            response.0["credential"].clone(),
+            public_key_jwk(&root_verifying_key),
+        )
+        .await
+        .unwrap();
         let authorization_state =
             load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
         let registrar = authorization_state.registrars.get(registrar_did()).unwrap();
