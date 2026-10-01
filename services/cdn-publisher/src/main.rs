@@ -295,16 +295,15 @@ async fn main() -> Result<()> {
     let config = load_config(config_path)?;
     let identity: OanIdentity = JsonStore::new(".").read(&config.root.identity_file)?;
     identity
-        .validate()
+        .validate_data_integrity()
+        .await
         .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
     identity
         .did_document
         .validate_infrastructure_profile(ResourceType::RootNode)
         .map_err(|err| anyhow!("invalid root DID document profile: {err}"))?;
-    let signing_key = signing_key_from_private_key_jwk(
-        CryptoSuite::Ed25519Sha256,
-        &identity.private_key_jwk,
-    )?;
+    let signing_key =
+        signing_key_from_private_key_jwk(CryptoSuite::Ed25519Sha256, &identity.private_key_jwk)?;
     let client = reqwest::Client::builder()
         .timeout(TokioDuration::from_secs(config.cdn.http_timeout_seconds))
         .build()?;
@@ -2138,6 +2137,9 @@ publish_batch_path = "/cdn/resources/batch"
         .unwrap();
         let config = load_config(&config_path).unwrap();
         assert!(config.root.identity_file.is_absolute());
-        assert!(config.root.identity_file.ends_with(Path::new("root").join("identity.json")));
+        assert!(config
+            .root
+            .identity_file
+            .ends_with(Path::new("root").join("identity.json")));
     }
 }

@@ -20,17 +20,16 @@ use oan_core::{
     CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType, SubjectType,
 };
 use oan_credentials::{
-    sign_credential_data_integrity, validate_infrastructure_authorization_credential, CredentialProof,
-    CredentialStatusReference,
-    InfrastructureAuthorizationCredentialSubject, OanIdentity,
-    OanInfrastructureAuthorizationCredential,
+    sign_credential_data_integrity, validate_infrastructure_authorization_credential,
+    CredentialProof, CredentialStatusReference, InfrastructureAuthorizationCredentialSubject,
+    OanIdentity, OanInfrastructureAuthorizationCredential,
 };
+#[cfg(test)]
+use oan_crypto::verify_oan_data_integrity;
 use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, signing_key_from_private_key_jwk,
     verify_did_document_proof, SigningKey,
 };
-#[cfg(test)]
-use oan_crypto::verify_oan_data_integrity;
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
     RootProof,
@@ -1063,7 +1062,8 @@ async fn main() -> Result<()> {
     let data = JsonStore::new(&config.paths.data_dir);
     let identity: OanIdentity = JsonStore::new(".").read(&config.paths.identity_file)?;
     identity
-        .validate()
+        .validate_data_integrity()
+        .await
         .map_err(|err| anyhow!("invalid OAN Identity: {err}"))?;
     let did_document = identity.did_document.clone();
     did_document
@@ -1071,10 +1071,8 @@ async fn main() -> Result<()> {
         .map_err(|err| anyhow!("invalid root DID document profile: {err}"))?;
     // Public projection used by existing resource/discovery paths; identity.json remains authoritative.
     data.write("did-document.json", &did_document)?;
-    let signing_key = signing_key_from_private_key_jwk(
-        CryptoSuite::Ed25519Sha256,
-        &identity.private_key_jwk,
-    )?;
+    let signing_key =
+        signing_key_from_private_key_jwk(CryptoSuite::Ed25519Sha256, &identity.private_key_jwk)?;
     let authorization_state = load_authorization_state(&config.paths.authorization_state_file)?;
     let (sqlite, postgres) = match config.paths.database_url.as_deref() {
         Some(url) if !url.is_empty() => {
@@ -3955,8 +3953,8 @@ fn validate_infrastructure_did_prefix(
     _subject_type: GovernanceSubjectType,
     did: &str,
 ) -> std::result::Result<(), String> {
-    let root = oan_did_oan::DidOan::parse(root_did)
-        .map_err(|_| "root_did_format_mismatch".to_owned())?;
+    let root =
+        oan_did_oan::DidOan::parse(root_did).map_err(|_| "root_did_format_mismatch".to_owned())?;
     let subject = oan_did_oan::DidOan::parse(did)
         .map_err(|_| "infrastructure_did_format_mismatch".to_owned())?;
     if subject.routing_code() != root.suffix_code().get(..5).unwrap_or_default() {
@@ -3981,17 +3979,29 @@ fn validate_infrastructure_suffix_prefix_unique(
         GovernanceSubjectType::Registrar => authorization_state
             .registrars
             .values()
-            .filter_map(|entry| (entry.status == "active").then_some(entry.did_document_snapshot.as_ref()).flatten())
+            .filter_map(|entry| {
+                (entry.status == "active")
+                    .then_some(entry.did_document_snapshot.as_ref())
+                    .flatten()
+            })
             .collect::<Vec<_>>(),
         GovernanceSubjectType::Discovery => authorization_state
             .discovery_nodes
             .values()
-            .filter_map(|entry| (entry.status == "active").then_some(entry.did_document_snapshot.as_ref()).flatten())
+            .filter_map(|entry| {
+                (entry.status == "active")
+                    .then_some(entry.did_document_snapshot.as_ref())
+                    .flatten()
+            })
             .collect::<Vec<_>>(),
         GovernanceSubjectType::VcIssuer => authorization_state
             .vc_issuers
             .values()
-            .filter_map(|entry| (entry.status == "active").then_some(entry.did_document_snapshot.as_ref()).flatten())
+            .filter_map(|entry| {
+                (entry.status == "active")
+                    .then_some(entry.did_document_snapshot.as_ref())
+                    .flatten()
+            })
             .collect::<Vec<_>>(),
     };
     for document in documents {
@@ -4047,8 +4057,7 @@ fn validate_infrastructure_did_document_profile(
     did_document
         .validate_infrastructure_profile(expected_resource_type.clone())
         .map_err(|_| "did_document_infrastructure_profile_invalid".to_owned())?;
-    verify_did_document_proof(did_document)
-        .map_err(|_| "did_document_proof_invalid".to_owned())?;
+    verify_did_document_proof(did_document).map_err(|_| "did_document_proof_invalid".to_owned())?;
     let expected_service_type = match subject_type {
         GovernanceSubjectType::Registrar => "OANRegistrarService",
         GovernanceSubjectType::Discovery => "OANDiscoveryService",
@@ -6421,8 +6430,7 @@ mod tests {
     use oan_crypto::{
         did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite,
         public_key_jwk, public_key_multibase, sign_bytes_multibase, verify_bytes_multibase,
-        SigningKey as OanSigningKey,
-        VerifyingKey as OanVerifyingKey,
+        SigningKey as OanSigningKey, VerifyingKey as OanVerifyingKey,
     };
     use oan_protocol::{
         ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
@@ -6749,8 +6757,7 @@ mod tests {
 
         let mut unsigned = document.clone();
         unsigned.proof = None;
-        let input =
-            did_document_signature_input(&unsigned, CryptoSuite::Ed25519Sha256).unwrap();
+        let input = did_document_signature_input(&unsigned, CryptoSuite::Ed25519Sha256).unwrap();
         let verifying_key = OanVerifyingKey::Ed25519 {
             suite: CryptoSuite::Ed25519Sha256,
             key: key.verifying_key(),
@@ -7815,8 +7822,8 @@ mod tests {
             .proof
             .as_mut()
             .unwrap()
-            .proof_value = "z1111111111111111111111111111111111111111111111111111111111111111"
-            .to_owned();
+            .proof_value =
+            "z1111111111111111111111111111111111111111111111111111111111111111".to_owned();
         resign_resource_verify_request(&state, &mut request, &registrar_key);
 
         let err = verify_resource_and_publish(State(state), Json(request))
@@ -8232,18 +8239,20 @@ mod tests {
             "Ed25519Signature2020"
         );
         assert!(response.0["credential"]["proof"].get("creator").is_none());
-        assert!(response.0["credential"]["proof"].get("cryptoSuite").is_none());
-        assert!(response.0["credential"]["proof"].get("hashAlgorithm").is_none());
+        assert!(response.0["credential"]["proof"]
+            .get("cryptoSuite")
+            .is_none());
+        assert!(response.0["credential"]["proof"]
+            .get("hashAlgorithm")
+            .is_none());
         assert_eq!(
             response.0["credential"]["proof"]["verificationMethod"],
             format!("{}#key-1", state.root_did)
         );
-        assert!(
-            response.0["credential"]["proof"]["proofValue"]
-                .as_str()
-                .unwrap()
-                .starts_with('z')
-        );
+        assert!(response.0["credential"]["proof"]["proofValue"]
+            .as_str()
+            .unwrap()
+            .starts_with('z'));
         let SigningKey::Ed25519 { key, .. } = &state.signing_key else {
             panic!("test root key must be Ed25519");
         };
@@ -8648,7 +8657,13 @@ mod tests {
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
         let controller_did = "did:oan:AGUS:9DirectoryBindingFirst";
-        attach_external_controller_proof(&state, &mut request, &registrar_key, &resource_key, controller_did);
+        attach_external_controller_proof(
+            &state,
+            &mut request,
+            &registrar_key,
+            &resource_key,
+            controller_did,
+        );
         let binding = verify_controller_authorization_for_submission(&state, &request)
             .unwrap()
             .unwrap();
@@ -8688,7 +8703,13 @@ mod tests {
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
         let controller_did = "did:oan:AGUS:9DirectoryBootstrapBinding";
-        attach_external_controller_proof(&state, &mut request, &registrar_key, &resource_key, controller_did);
+        attach_external_controller_proof(
+            &state,
+            &mut request,
+            &registrar_key,
+            &resource_key,
+            controller_did,
+        );
         let binding = verify_controller_authorization_for_submission(&state, &request)
             .unwrap()
             .unwrap();
@@ -8735,7 +8756,13 @@ mod tests {
             PATH_ROOT_RESOURCES_VERIFY_AND_PUBLISH,
         );
         let controller_did = "did:oan:AGUS:9DirectoryBootstrapOnce";
-        attach_external_controller_proof(&state, &mut request, &registrar_key, &resource_key, controller_did);
+        attach_external_controller_proof(
+            &state,
+            &mut request,
+            &registrar_key,
+            &resource_key,
+            controller_did,
+        );
         let mut binding = verify_controller_authorization_for_submission(&state, &request)
             .unwrap()
             .unwrap();
@@ -11073,4 +11100,3 @@ capability_tree_file = "../capability-tree.json"
         );
     }
 }
-
