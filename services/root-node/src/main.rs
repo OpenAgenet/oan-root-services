@@ -14,8 +14,6 @@ use axum::{
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use oan_bulletin::{Bulletin, BulletinEvent, BulletinEventCore, BulletinEventType};
-#[cfg(test)]
-use oan_core::DataIntegrityProof;
 use oan_core::{
     CapabilityTag, CapabilityTagTree, CryptoSuite, DidDocument, ResourceType, SubjectType,
 };
@@ -6565,9 +6563,9 @@ mod tests {
         ResourceType, ServiceEndpoint, VerificationMethod,
     };
     use oan_crypto::{
-        did_document_signature_input, generate_ed25519_keypair, hash_json_with_suite,
-        public_key_jwk, public_key_multibase, sign_bytes_multibase, verify_bytes_multibase,
-        SigningKey as OanSigningKey, VerifyingKey as OanVerifyingKey,
+        generate_ed25519_keypair, hash_json_with_suite, private_key_jwk, public_key_jwk,
+        public_key_multibase, sign_oan_data_integrity, SigningKey as OanSigningKey,
+        VerifyingKey as OanVerifyingKey,
     };
     use oan_protocol::{
         ControllerAuthorizationChallenge, ControllerAuthorizationProofBundle, DidControlChallenge,
@@ -6620,7 +6618,7 @@ mod tests {
             suite: CryptoSuite::Ed25519Sha256,
             key: key.verifying_key(),
         };
-        let mut document = DidDocument {
+        let document = DidDocument {
             context: vec![
                 "https://www.w3.org/ns/did/v1".to_owned(),
                 "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
@@ -6644,31 +6642,50 @@ mod tests {
             proof: None,
             oan_metadata: None,
         };
-        document.proof = Some(test_did_proof(&document, key, key_id));
-        document
+        sign_test_did_document(&document, key)
     }
 
-    fn test_did_proof(
+    fn sign_test_did_document(
         document: &DidDocument,
         key: &ed25519_dalek::SigningKey,
-        verification_method: String,
-    ) -> DataIntegrityProof {
-        let signing_key = OanSigningKey::Ed25519 {
-            suite: CryptoSuite::Ed25519Sha256,
-            key: key.clone(),
-        };
-        let input = did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
-        DataIntegrityProof {
-            context: None,
-            proof_type: "Ed25519Signature2020".to_owned(),
-            creator: verification_method.clone(),
-            created: Utc::now(),
-            proof_purpose: "assertionMethod".to_owned(),
-            proof_value: sign_bytes_multibase(&signing_key, &input).unwrap(),
-            crypto_suite: None,
-            hash_algorithm: None,
-            verification_method: Some(verification_method),
+    ) -> DidDocument {
+        for _ in 0..10 {
+            let mut unsigned = document.clone();
+            unsigned.proof = None;
+            let did = unsigned.id.clone();
+            let signing_key = OanSigningKey::Ed25519 {
+                suite: CryptoSuite::Ed25519Sha256,
+                key: key.clone(),
+            };
+            let private_jwk = private_key_jwk(&signing_key);
+            let signed = std::thread::Builder::new()
+                .name("root-test-did-signer".to_owned())
+                .stack_size(16 * 1024 * 1024)
+                .spawn(move || {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap()
+                        .block_on(sign_oan_data_integrity(
+                            serde_json::to_value(&unsigned).unwrap(),
+                            &did,
+                            private_jwk,
+                        ))
+                })
+                .unwrap()
+                .join()
+                .unwrap()
+                .unwrap();
+            let signed_document = serde_json::from_value::<DidDocument>(signed).unwrap();
+            if verify_did_document_proof_standard_value_blocking(
+                serde_json::to_value(&signed_document).unwrap(),
+            )
+            .is_ok()
+            {
+                return signed_document;
+            }
         }
+        panic!("test DID document signer produced an invalid standard proof");
     }
 
     fn infrastructure_document_with_key(
@@ -6724,9 +6741,7 @@ mod tests {
             lifecycle_state: Some("active".to_owned()),
             extra: BTreeMap::new(),
         });
-        let key_id = format!("{did}#key-1");
-        document.proof = Some(test_did_proof(&document, key, key_id));
-        document
+        sign_test_did_document(&document, key)
     }
 
     fn resource_document_with_key(did: &str, key: &ed25519_dalek::SigningKey) -> DidDocument {
@@ -6735,7 +6750,7 @@ mod tests {
             suite: CryptoSuite::Ed25519Sha256,
             key: key.verifying_key(),
         };
-        let mut document = DidDocument {
+        let document = DidDocument {
             context: vec![
                 "https://www.w3.org/ns/did/v1".to_owned(),
                 "https://openagenet.xyz/did-oan-specs/v1".to_owned(),
@@ -6808,8 +6823,7 @@ mod tests {
                 extra: Default::default(),
             }),
         };
-        document.proof = Some(test_did_proof(&document, key, key_id));
-        document
+        sign_test_did_document(&document, key)
     }
 
     fn app_state(dir: &std::path::Path) -> AppState {
@@ -6888,7 +6902,11 @@ mod tests {
                 "https://w3id.org/security/suites/ed25519-2020/v1",
             ]
         );
-        assert_eq!(proof.creator, format!("{}#key-1", document.id));
+        assert!(proof.creator.is_empty());
+        assert!(serde_json::to_value(proof)
+            .unwrap()
+            .get("creator")
+            .is_none());
         assert_eq!(
             proof.verification_method.as_deref(),
             Some(format!("{}#key-1", document.id).as_str())
@@ -6897,14 +6915,8 @@ mod tests {
         assert!(proof.hash_algorithm.is_none());
         assert!(proof.proof_value.starts_with('z'));
 
-        let mut unsigned = document.clone();
-        unsigned.proof = None;
-        let input = did_document_signature_input(&unsigned, CryptoSuite::Ed25519Sha256).unwrap();
-        let verifying_key = OanVerifyingKey::Ed25519 {
-            suite: CryptoSuite::Ed25519Sha256,
-            key: key.verifying_key(),
-        };
-        verify_bytes_multibase(&verifying_key, &input, &proof.proof_value).unwrap();
+        verify_did_document_proof_standard_value_blocking(serde_json::to_value(&document).unwrap())
+            .unwrap();
     }
 
     #[test]
@@ -7430,7 +7442,10 @@ mod tests {
         .unwrap();
     }
 
-    fn refresh_resource_submission_hashes_for_test(request: &mut ResourceVerifyAndPublishRequest) {
+    fn refresh_resource_submission_hashes_for_test(
+        request: &mut ResourceVerifyAndPublishRequest,
+        resource_key: &ed25519_dalek::SigningKey,
+    ) {
         let did_document_hash =
             hash_json_with_suite(CryptoSuite::Ed25519Sha256, &request.submission.did_document)
                 .map(|hash| format!("sha256:{hash}"))
@@ -7462,6 +7477,19 @@ mod tests {
         )
         .map(|hash| format!("sha256:{hash}"))
         .unwrap();
+        let resource_signing_key = OanSigningKey::Ed25519 {
+            suite: CryptoSuite::Ed25519Sha256,
+            key: resource_key.clone(),
+        };
+        request.submission.subject_control_proof.proof = build_data_integrity_proof(
+            &request.submission.subject_control_proof.challenge,
+            request.submission.resource_did.clone(),
+            format!("{}#key-1", request.submission.resource_did),
+            &resource_signing_key,
+        )
+        .unwrap();
+        request.submission.subject_control_proof.proof_hash =
+            Some(hash_proof(&request.submission.subject_control_proof.proof).unwrap());
         request.did_document_raw =
             Some(serde_json::to_value(&request.submission.did_document).unwrap());
     }
@@ -7503,11 +7531,7 @@ mod tests {
             proof: None,
             oan_metadata: None,
         };
-        controller_document.proof = Some(test_did_proof(
-            &controller_document,
-            &controller_key,
-            controller_method.clone(),
-        ));
+        controller_document = sign_test_did_document(&controller_document, &controller_key);
         request.submission.did_document.controller =
             Some(oan_core::DidController::Did(controller_did.to_owned()));
         let metadata = request
@@ -7518,17 +7542,9 @@ mod tests {
             .unwrap();
         metadata.controller_did = Some(controller_did.to_owned());
         metadata.publisher_did = Some(controller_did.to_owned());
-        let unsigned_resource_document = {
-            let document = &mut request.submission.did_document;
-            document.proof = None;
-            document.clone()
-        };
-        request.submission.did_document.proof = Some(test_did_proof(
-            &unsigned_resource_document,
-            resource_key,
-            format!("{}#key-1", request.submission.resource_did),
-        ));
-        refresh_resource_submission_hashes_for_test(request);
+        request.submission.did_document =
+            sign_test_did_document(&request.submission.did_document, resource_key);
+        refresh_resource_submission_hashes_for_test(request, resource_key);
         let challenge = ControllerAuthorizationChallenge {
             challenge_id: "controller-auth-test".to_owned(),
             resource_did: request.submission.resource_did.clone(),
@@ -7613,7 +7629,7 @@ mod tests {
             .subject_control_proof
             .challenge
             .subject_did = invalid_resource_did;
-        refresh_resource_submission_hashes_for_test(&mut request);
+        refresh_resource_submission_hashes_for_test(&mut request, &resource_key);
         resign_resource_verify_request(&state, &mut request, &registrar_key);
 
         assert_eq!(
@@ -7643,7 +7659,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .resource_type = ResourceType::McpServer;
-        refresh_resource_submission_hashes_for_test(&mut request);
+        refresh_resource_submission_hashes_for_test(&mut request, &resource_key);
         resign_resource_verify_request(&state, &mut request, &registrar_key);
 
         assert_eq!(
@@ -7778,16 +7794,9 @@ mod tests {
             .controller_did = Some(discovery_did().to_owned());
         request.submission.did_document.controller =
             Some(oan_core::DidController::Did(discovery_did().to_owned()));
-        let unsigned = {
-            request.submission.did_document.proof = None;
-            request.submission.did_document.clone()
-        };
-        request.submission.did_document.proof = Some(test_did_proof(
-            &unsigned,
-            &resource_key,
-            format!("{}#key-1", resource_did()),
-        ));
-        refresh_resource_submission_hashes_for_test(&mut request);
+        request.submission.did_document =
+            sign_test_did_document(&request.submission.did_document, &resource_key);
+        refresh_resource_submission_hashes_for_test(&mut request, &resource_key);
         resign_resource_verify_request(&state, &mut request, &registrar_key);
 
         let err = verify_resource_and_publish(State(state), Json(request))
