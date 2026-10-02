@@ -2614,6 +2614,7 @@ mod tests {
                     request_nonce: "nonce-1".to_owned(),
                     body_hash: "body-hash".to_owned(),
                     proof: oan_core::DataIntegrityProof {
+                        context: None,
                         proof_type: String::new(),
                         creator: String::new(),
                         created: Utc::now(),

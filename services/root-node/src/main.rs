@@ -28,8 +28,7 @@ use oan_credentials::{
 use oan_crypto::verify_oan_data_integrity;
 use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, signing_key_from_private_key_jwk,
-    verify_did_document_proof_standard_blocking,
-    verify_did_document_proof_standard_value_blocking, SigningKey,
+    verify_did_document_proof, verify_did_document_proof_standard_value_blocking, SigningKey,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -1054,8 +1053,15 @@ struct DiscoveryNotificationTargetItem {
     item: DiscoveryNotificationItem,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async { tokio::spawn(async_main()).await? })
+}
+
+async fn async_main() -> Result<()> {
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "services/root-node/config.example.toml".to_owned());
@@ -1898,6 +1904,12 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
                 resource_type TEXT NOT NULL,
                 capability_tags_json TEXT NOT NULL,
                 authorized_domains_json TEXT NOT NULL DEFAULT '[]',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                lease_owner TEXT,
+                lease_expires_at TEXT,
+                next_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_error TEXT,
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
             CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_RESOURCE_TABLE} (
@@ -1943,6 +1955,48 @@ async fn initialize_root_sqlite(sqlite: &SqliteJsonStore) -> Result<()> {
         .execute_batch(&format!(
             "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
              ADD COLUMN authorized_domains_json TEXT NOT NULL DEFAULT '[]';"
+        ))
+        .await
+        .ok();
+    sqlite
+        .execute_batch(&format!(
+            "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+             ADD COLUMN status TEXT NOT NULL DEFAULT 'pending';"
+        ))
+        .await
+        .ok();
+    sqlite
+        .execute_batch(&format!(
+            "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+             ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0;"
+        ))
+        .await
+        .ok();
+    sqlite
+        .execute_batch(&format!(
+            "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+             ADD COLUMN lease_owner TEXT;"
+        ))
+        .await
+        .ok();
+    sqlite
+        .execute_batch(&format!(
+            "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+             ADD COLUMN lease_expires_at TEXT;"
+        ))
+        .await
+        .ok();
+    sqlite
+        .execute_batch(&format!(
+            "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+             ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP;"
+        ))
+        .await
+        .ok();
+    sqlite
+        .execute_batch(&format!(
+            "ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+             ADD COLUMN last_error TEXT;"
         ))
         .await
         .ok();
@@ -2030,6 +2084,12 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 resource_type TEXT NOT NULL,
                 capability_tags_json JSONB NOT NULL,
                 authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count BIGINT NOT NULL DEFAULT 0,
+                lease_owner TEXT,
+                lease_expires_at TIMESTAMPTZ,
+                next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_error TEXT,
                 PRIMARY KEY(discovery_did, publication_cursor)
             );
             CREATE TABLE IF NOT EXISTS {ROOT_IDENTITY_RESOURCE_TABLE} (
@@ -2122,6 +2182,18 @@ async fn initialize_root_postgres(postgres: &PostgresJsonStore) -> Result<()> {
                 ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB;
             ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
                 ADD COLUMN IF NOT EXISTS authorized_domains_json JSONB NOT NULL DEFAULT '[]'::jsonb;
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'pending';
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS attempt_count BIGINT NOT NULL DEFAULT 0;
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS lease_owner TEXT;
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP;
+            ALTER TABLE {ROOT_DISCOVERY_ITEM_TABLE}
+                ADD COLUMN IF NOT EXISTS last_error TEXT;
             CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_job_projection
             ON {ROOT_CDN_JOB_TABLE}(job_key, publication_cursor);
             CREATE INDEX IF NOT EXISTS idx_root_cdn_jobs_ready_projection
@@ -2171,14 +2243,14 @@ async fn bulletin(State(state): State<AppState>) -> ApiResult<Bulletin> {
     read_bulletin(&state).map(Json).map_err(ApiError::internal)
 }
 
+#[cfg(test)]
 async fn verify_resource_and_publish(
     State(state): State<AppState>,
     Json(request): Json<ResourceVerifyAndPublishRequest>,
 ) -> ApiResult<Value> {
-    let raw_did_document = request
-        .did_document_raw
-        .clone()
-        .unwrap_or_else(|| serde_json::to_value(&request.submission.did_document).unwrap_or(Value::Null));
+    let raw_did_document = request.did_document_raw.clone().unwrap_or_else(|| {
+        serde_json::to_value(&request.submission.did_document).unwrap_or(Value::Null)
+    });
     verify_resource_and_publish_with_raw_document(state, request, raw_did_document).await
 }
 
@@ -2191,11 +2263,27 @@ async fn verify_resource_and_publish_raw(
         .cloned()
         .or_else(|| payload.pointer("/submission/didDocument").cloned())
         .ok_or_else(|| ApiError::bad_request("did_document_missing"))?;
-    verify_did_document_proof_standard_value_blocking(raw_did_document.clone())
-        .map_err(|error| ApiError::bad_request(format!("did_document_proof_invalid: {error}")))?;
-    let request: ResourceVerifyAndPublishRequest =
-        serde_json::from_value(payload).map_err(|error| ApiError::bad_request(error.to_string()))?;
+    verify_resource_did_document_for_wire(raw_did_document.clone())?;
+    let request: ResourceVerifyAndPublishRequest = serde_json::from_value(payload)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
     verify_resource_and_publish_with_raw_document(state, request, raw_did_document).await
+}
+
+fn verify_resource_did_document_for_wire(
+    raw_did_document: Value,
+) -> std::result::Result<(), ApiError> {
+    match verify_did_document_proof_standard_value_blocking(raw_did_document.clone()) {
+        Ok(()) => Ok(()),
+        Err(standard_error) => {
+            let did_document: DidDocument = serde_json::from_value(raw_did_document)
+                .map_err(|error| ApiError::bad_request(error.to_string()))?;
+            verify_did_document_proof(&did_document).map_err(|fallback_error| {
+                ApiError::bad_request(format!(
+                    "did_document_proof_invalid: {standard_error}; fallback: {fallback_error}"
+                ))
+            })
+        }
+    }
 }
 
 async fn verify_resource_and_publish_with_raw_document(
@@ -3894,7 +3982,7 @@ async fn validate_authorization_vc_issue_request(
         &request.payload.subject_did,
     )?;
     validate_infrastructure_suffix_prefix_unique(
-        &state,
+        state,
         subject_type,
         &request.payload.subject_did,
     )?;
@@ -4087,8 +4175,10 @@ fn validate_infrastructure_did_document_profile(
     did_document
         .validate_infrastructure_profile(expected_resource_type.clone())
         .map_err(|_| "did_document_infrastructure_profile_invalid".to_owned())?;
-    verify_did_document_proof_standard_blocking(did_document)
-        .map_err(|_| "did_document_proof_invalid".to_owned())?;
+    verify_resource_did_document_for_wire(
+        serde_json::to_value(did_document).map_err(|_| "did_document_proof_invalid".to_owned())?,
+    )
+    .map_err(|_| "did_document_proof_invalid".to_owned())?;
     let expected_service_type = match subject_type {
         GovernanceSubjectType::Registrar => "OANRegistrarService",
         GovernanceSubjectType::Discovery => "OANDiscoveryService",
@@ -5061,14 +5151,14 @@ fn push_unique(items: &mut Vec<String>, value: String) {
     }
 }
 
+#[cfg(test)]
 fn verify_resource_request(
     state: &AppState,
     request: &ResourceVerifyAndPublishRequest,
 ) -> std::result::Result<(), String> {
-    let raw = request
-        .did_document_raw
-        .clone()
-        .unwrap_or_else(|| serde_json::to_value(&request.submission.did_document).unwrap_or(Value::Null));
+    let raw = request.did_document_raw.clone().unwrap_or_else(|| {
+        serde_json::to_value(&request.submission.did_document).unwrap_or(Value::Null)
+    });
     verify_resource_request_with_raw_document(state, request, &raw)
 }
 
@@ -5090,7 +5180,7 @@ fn verify_resource_request_with_raw_document(
     )
     .map_err(|err| err.to_string())?;
     request.submission.validate_shape()?;
-    verify_did_document_proof_standard_value_blocking(raw_did_document.clone())
+    verify_resource_did_document_for_wire(raw_did_document.clone())
         .map_err(|_| "did_document_proof_invalid".to_owned())?;
     validate_resource_routing_code(&request.submission.resource_did, &request.registrar_did)?;
     Ok(())
@@ -5117,8 +5207,11 @@ fn verify_controller_authorization_for_submission(
         );
         return Err("controller_authorization_proof_required".to_owned());
     };
-    verify_did_document_proof_standard_blocking(&bundle.controller_did_document)
-        .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
+    verify_resource_did_document_for_wire(
+        serde_json::to_value(&bundle.controller_did_document)
+            .map_err(|_| "controller_did_document_proof_invalid".to_owned())?,
+    )
+    .map_err(|_| "controller_did_document_proof_invalid".to_owned())?;
     let expected_publisher_did = metadata.publisher_did.as_deref();
     let verification_method_id = verify_controller_authorization_proof(
         bundle,
@@ -6565,8 +6658,9 @@ mod tests {
         };
         let input = did_document_signature_input(document, CryptoSuite::Ed25519Sha256).unwrap();
         DataIntegrityProof {
+            context: None,
             proof_type: "Ed25519Signature2020".to_owned(),
-            creator: String::new(),
+            creator: verification_method.clone(),
             created: Utc::now(),
             proof_purpose: "assertionMethod".to_owned(),
             proof_value: sign_bytes_multibase(&signing_key, &input).unwrap(),
@@ -6793,7 +6887,11 @@ mod tests {
                 "https://w3id.org/security/suites/ed25519-2020/v1",
             ]
         );
-        assert!(proof.creator.is_empty());
+        assert_eq!(proof.creator, format!("{}#key-1", document.id));
+        assert_eq!(
+            proof.verification_method.as_deref(),
+            Some(format!("{}#key-1", document.id).as_str())
+        );
         assert!(proof.crypto_suite.is_none());
         assert!(proof.hash_algorithm.is_none());
         assert!(proof.proof_value.starts_with('z'));
@@ -7264,6 +7362,7 @@ mod tests {
         )
         .map(|hash| format!("sha256:{hash}"))
         .unwrap();
+        let did_document_raw = Some(serde_json::to_value(&did_document).unwrap());
         let submission = oan_protocol::ResourceRegistrationSubmission {
             resource_did: resource_did().to_owned(),
             resource_type: ResourceType::Skill,
@@ -7299,6 +7398,7 @@ mod tests {
         ResourceVerifyAndPublishRequest {
             registrar_did: registrar_did().to_owned(),
             submission,
+            did_document_raw,
             upstream_auth,
         }
     }
@@ -7360,6 +7460,8 @@ mod tests {
         )
         .map(|hash| format!("sha256:{hash}"))
         .unwrap();
+        request.did_document_raw =
+            Some(serde_json::to_value(&request.submission.did_document).unwrap());
     }
 
     fn attach_external_controller_proof(

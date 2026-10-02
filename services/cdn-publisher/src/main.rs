@@ -287,8 +287,15 @@ fn default_package_batch_path() -> String {
     "/root/internal/cdn-publication-jobs/packages".to_owned()
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async { tokio::spawn(async_main()).await? })
+}
+
+async fn async_main() -> Result<()> {
     let config_path = env::args()
         .nth(1)
         .unwrap_or_else(|| "services/cdn-publisher/config.example.toml".to_owned());

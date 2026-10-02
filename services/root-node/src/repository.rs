@@ -8,6 +8,7 @@ use sqlx::Postgres;
 
 const MAX_CDN_PUBLICATION_PACKAGE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CDN_PUBLICATION_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const DISCOVERY_NOTIFICATION_MAX_RETRIES: i64 = 5;
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct CdnPublicationBatchCompletion {
@@ -1186,12 +1187,25 @@ pub(super) async fn claim_discovery_targets_impl(
                 FROM {ROOT_DISCOVERY_TARGET_TABLE}
                 WHERE status = 'active'
                   AND pending_cursor > delivered_cursor
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE} items
+                        WHERE items.discovery_did = {ROOT_DISCOVERY_TARGET_TABLE}.discovery_did
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE} items
+                        WHERE items.discovery_did = {ROOT_DISCOVERY_TARGET_TABLE}.discovery_did
+                          AND items.status IN ('pending', 'retry')
+                          AND items.next_attempt_at <= ?
+                    )
+                  )
                   AND next_attempt_at <= ?
                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
                 ORDER BY pending_cursor DESC, discovery_did
                 LIMIT ?
                 "#
             ))
+            .bind(&now_rfc3339)
             .bind(&now_rfc3339)
             .bind(&now_rfc3339)
             .bind(limit as i64)
@@ -1242,6 +1256,18 @@ pub(super) async fn claim_discovery_targets_impl(
                 FROM {ROOT_DISCOVERY_TARGET_TABLE}
                 WHERE status = 'active'
                   AND pending_cursor > delivered_cursor
+                  AND (
+                    NOT EXISTS (
+                        SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE} items
+                        WHERE items.discovery_did = {ROOT_DISCOVERY_TARGET_TABLE}.discovery_did
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE} items
+                        WHERE items.discovery_did = {ROOT_DISCOVERY_TARGET_TABLE}.discovery_did
+                          AND items.status IN ('pending', 'retry')
+                          AND items.next_attempt_at <= $1::timestamptz
+                    )
+                  )
                   AND next_attempt_at <= $1::timestamptz
                   AND (lease_expires_at IS NULL OR lease_expires_at <= $1::timestamptz)
                 ORDER BY pending_cursor DESC, discovery_did
@@ -1250,7 +1276,7 @@ pub(super) async fn claim_discovery_targets_impl(
             )
             UPDATE {ROOT_DISCOVERY_TARGET_TABLE} AS targets
             SET lease_owner = $3 || ':' || claimed.discovery_did || ':' || claimed.pending_cursor || ':' || $1,
-                lease_expires_at = $4::timestamptz,
+                lease_expires_at = NULL,
                 attempt_count = targets.attempt_count + 1,
                 last_error = NULL,
                 updated_at = $1::timestamptz
@@ -1354,6 +1380,338 @@ pub(super) async fn mark_discovery_target_notified_impl(
         ))
         .bind(discovery_did)
         .bind(delivered_cursor)
+        .execute(postgres.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(super) async fn mark_discovery_items_notified_impl(
+    state: &AppState,
+    discovery_did: &str,
+    delivered_cursors: &[i64],
+    lease_owner: &str,
+) -> Result<()> {
+    let now = Utc::now();
+    let max_cursor = delivered_cursors.iter().copied().max();
+    if let Some(sqlite) = &state.sqlite {
+        let mut tx = sqlite.pool().begin().await?;
+        for cursor in delivered_cursors {
+            sqlx::query(&format!(
+                r#"
+                UPDATE {ROOT_DISCOVERY_ITEM_TABLE}
+                SET status = 'delivered', delivered_at = ?, last_error = NULL
+                WHERE discovery_did = ? AND publication_cursor = ?
+                "#
+            ))
+            .bind(now.to_rfc3339())
+            .bind(discovery_did)
+            .bind(cursor)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let delivered_cursor: Option<i64> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT MAX(publication_cursor)
+            FROM {ROOT_DISCOVERY_ITEM_TABLE}
+            WHERE discovery_did = ? AND status IN ('delivered', 'dead_letter')
+              AND publication_cursor < COALESCE((
+                SELECT MIN(publication_cursor)
+                FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                WHERE discovery_did = ? AND status IN ('pending', 'retry')
+              ), 9223372036854775807)
+            "#
+        ))
+        .bind(discovery_did)
+        .bind(discovery_did)
+        .fetch_one(&mut *tx)
+        .await?;
+        let updated = sqlx::query(&format!(
+            r#"
+            UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
+            SET delivered_cursor = CASE
+                    WHEN ? IS NULL THEN delivered_cursor
+                    ELSE MAX(delivered_cursor, ?)
+                END,
+                pending_cursor = CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                        WHERE discovery_did = ? AND status IN ('pending', 'retry')
+                    ) THEN CASE
+                        WHEN ? IS NULL THEN pending_cursor
+                        ELSE MAX(pending_cursor, ?)
+                    END
+                    ELSE pending_cursor
+                END,
+                status = 'active',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                next_attempt_at = ?,
+                last_error = NULL,
+                updated_at = ?
+            WHERE discovery_did = ? AND lease_owner = ?
+            "#
+        ))
+        .bind(delivered_cursor)
+        .bind(delivered_cursor)
+        .bind(discovery_did)
+        .bind(max_cursor)
+        .bind(max_cursor)
+        .bind(now.to_rfc3339())
+        .bind(now.to_rfc3339())
+        .bind(discovery_did)
+        .bind(lease_owner)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(());
+        }
+        sqlx::query(&format!(
+            r#"
+            UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
+            SET pending_cursor = CASE
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                    WHERE discovery_did = ? AND status IN ('pending', 'retry')
+                ) THEN delivered_cursor
+                ELSE pending_cursor
+            END
+            WHERE discovery_did = ?
+            "#
+        ))
+        .bind(discovery_did)
+        .bind(discovery_did)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        let mut tx = postgres.pool().begin().await?;
+        for cursor in delivered_cursors {
+            sqlx::query(&format!(
+                r#"
+                UPDATE {ROOT_DISCOVERY_ITEM_TABLE}
+                SET status = 'delivered', delivered_at = $1::timestamptz, last_error = NULL
+                WHERE discovery_did = $2 AND publication_cursor = $3
+                "#
+            ))
+            .bind(now)
+            .bind(discovery_did)
+            .bind(cursor)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let delivered_cursor: Option<i64> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT MAX(publication_cursor)
+            FROM {ROOT_DISCOVERY_ITEM_TABLE}
+            WHERE discovery_did = $1 AND status IN ('delivered', 'dead_letter')
+              AND publication_cursor < COALESCE((
+                SELECT MIN(publication_cursor)
+                FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                WHERE discovery_did = $1 AND status IN ('pending', 'retry')
+              ), 9223372036854775807)
+            "#
+        ))
+        .bind(discovery_did)
+        .fetch_one(&mut *tx)
+        .await?;
+        let updated = sqlx::query(&format!(
+            r#"
+            UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
+            SET delivered_cursor = CASE
+                    WHEN $1::bigint IS NULL THEN delivered_cursor
+                    ELSE GREATEST(delivered_cursor, $1::bigint)
+                END,
+                pending_cursor = CASE
+                    WHEN NOT EXISTS (
+                        SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                        WHERE discovery_did = $2 AND status IN ('pending', 'retry')
+                    ) THEN CASE
+                        WHEN $3::bigint IS NULL THEN pending_cursor
+                        ELSE GREATEST(pending_cursor, $3::bigint)
+                    END
+                    ELSE pending_cursor
+                END,
+                status = 'active',
+                lease_owner = NULL,
+                lease_expires_at = $4::timestamptz,
+                next_attempt_at = $4::timestamptz,
+                last_error = NULL,
+                updated_at = $4::timestamptz
+            WHERE discovery_did = $2 AND lease_owner = $5
+            "#
+        ))
+        .bind(delivered_cursor)
+        .bind(discovery_did)
+        .bind(max_cursor)
+        .bind(now)
+        .bind(lease_owner)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            return Ok(());
+        }
+        sqlx::query(&format!(
+            r#"
+            UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
+            SET pending_cursor = CASE
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                    WHERE discovery_did = $1 AND status IN ('pending', 'retry')
+                ) THEN delivered_cursor
+                ELSE pending_cursor
+            END
+            WHERE discovery_did = $1
+            "#
+        ))
+        .bind(discovery_did)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(super) async fn mark_discovery_items_retry_impl(
+    state: &AppState,
+    discovery_did: &str,
+    failed_cursors: &[i64],
+    error: &str,
+) -> Result<()> {
+    if failed_cursors.is_empty() {
+        return Ok(());
+    }
+    let retry_after = (Utc::now()
+        + chrono::Duration::seconds(state.config.security.workers.retry_backoff_seconds))
+    .to_rfc3339();
+    if let Some(sqlite) = &state.sqlite {
+        for cursor in failed_cursors {
+            sqlx::query(&format!(
+                r#"
+                UPDATE {ROOT_DISCOVERY_ITEM_TABLE}
+                SET attempt_count = attempt_count + 1,
+                    status = CASE
+                        WHEN attempt_count + 1 >= ? THEN 'dead_letter'
+                        ELSE 'retry'
+                    END,
+                    next_attempt_at = ?,
+                    last_error = ?
+                WHERE discovery_did = ? AND publication_cursor = ?
+                  AND status IN ('pending', 'retry')
+                "#
+            ))
+            .bind(DISCOVERY_NOTIFICATION_MAX_RETRIES)
+            .bind(&retry_after)
+            .bind(error)
+            .bind(discovery_did)
+            .bind(cursor)
+            .execute(sqlite.pool())
+            .await?;
+        }
+        sqlx::query(&format!(
+            r#"
+            UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
+            SET delivered_cursor = MAX(
+                delivered_cursor,
+                COALESCE((
+                    SELECT MAX(publication_cursor)
+                    FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                    WHERE discovery_did = ? AND status IN ('delivered', 'dead_letter')
+                      AND publication_cursor < COALESCE((
+                          SELECT MIN(publication_cursor)
+                          FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                          WHERE discovery_did = ? AND status IN ('pending', 'retry')
+                      ), 9223372036854775807)
+                ), delivered_cursor)
+            ),
+            pending_cursor = CASE
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                    WHERE discovery_did = ? AND status IN ('pending', 'retry')
+                ) THEN MAX(
+                    pending_cursor,
+                    COALESCE((
+                        SELECT MAX(publication_cursor)
+                        FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                        WHERE discovery_did = ? AND status IN ('delivered', 'dead_letter')
+                    ), pending_cursor)
+                )
+                ELSE pending_cursor
+            END
+            WHERE discovery_did = ?
+            "#
+        ))
+        .bind(discovery_did)
+        .bind(discovery_did)
+        .bind(discovery_did)
+        .bind(discovery_did)
+        .bind(discovery_did)
+        .execute(sqlite.pool())
+        .await?;
+        return Ok(());
+    }
+    if let Some(postgres) = &state.postgres {
+        for cursor in failed_cursors {
+            sqlx::query(&format!(
+                r#"
+                UPDATE {ROOT_DISCOVERY_ITEM_TABLE}
+                SET attempt_count = attempt_count + 1,
+                    status = CASE
+                        WHEN attempt_count + 1 >= $1 THEN 'dead_letter'
+                        ELSE 'retry'
+                    END,
+                    next_attempt_at = $2::timestamptz,
+                    last_error = $3
+                WHERE discovery_did = $4 AND publication_cursor = $5
+                  AND status IN ('pending', 'retry')
+                "#
+            ))
+            .bind(DISCOVERY_NOTIFICATION_MAX_RETRIES)
+            .bind(&retry_after)
+            .bind(error)
+            .bind(discovery_did)
+            .bind(cursor)
+            .execute(postgres.pool())
+            .await?;
+        }
+        sqlx::query(&format!(
+            r#"
+            UPDATE {ROOT_DISCOVERY_TARGET_TABLE}
+            SET delivered_cursor = GREATEST(
+                delivered_cursor,
+                COALESCE((
+                    SELECT MAX(publication_cursor)
+                    FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                    WHERE discovery_did = $1 AND status IN ('delivered', 'dead_letter')
+                      AND publication_cursor < COALESCE((
+                          SELECT MIN(publication_cursor)
+                          FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                          WHERE discovery_did = $1 AND status IN ('pending', 'retry')
+                      ), 9223372036854775807)
+                ), delivered_cursor)
+            ),
+            pending_cursor = CASE
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                    WHERE discovery_did = $1 AND status IN ('pending', 'retry')
+                ) THEN GREATEST(
+                    pending_cursor,
+                    COALESCE((
+                        SELECT MAX(publication_cursor)
+                        FROM {ROOT_DISCOVERY_ITEM_TABLE}
+                        WHERE discovery_did = $1 AND status IN ('delivered', 'dead_letter')
+                    ), pending_cursor)
+                )
+                ELSE pending_cursor
+            END
+            WHERE discovery_did = $1
+            "#
+        ))
+        .bind(discovery_did)
         .execute(postgres.pool())
         .await?;
     }
@@ -1641,7 +1999,8 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     INSERT INTO {ROOT_DISCOVERY_ITEM_TABLE}(
                         discovery_did, publication_cursor, resource_did, package_version,
                         package_hash, metadata_hash, did_document_hash, resource_type,
-                        capability_tags_json, authorized_domains_json
+                        capability_tags_json, authorized_domains_json, status, attempt_count,
+                        lease_owner, lease_expires_at, next_attempt_at, last_error
                     )
                     "#
                 ));
@@ -1661,7 +2020,13 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                         .push_bind(
                             serde_json::to_string(&item.item.authorized_domains)
                                 .unwrap_or_else(|_| "[]".to_owned()),
-                        );
+                        )
+                        .push("'pending'")
+                        .push("0")
+                        .push("NULL")
+                        .push("NULL")
+                        .push_bind(&now_text)
+                        .push("NULL");
                 });
                 builder.push(" ON CONFLICT(discovery_did, publication_cursor) DO NOTHING");
                 builder.build().execute(&mut *tx).await?;
@@ -1766,7 +2131,13 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     did_document_hash,
                     resource_type,
                     capability_tags_json,
-                    authorized_domains_json
+                    authorized_domains_json,
+                    status,
+                    attempt_count,
+                    lease_owner,
+                    lease_expires_at,
+                    next_attempt_at,
+                    last_error
                 )
                 SELECT
                     entry.discovery_did,
@@ -1778,7 +2149,13 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                     entry.did_document_hash,
                     entry.resource_type,
                     entry.capability_tags_json,
-                    entry.authorized_domains_json
+                    entry.authorized_domains_json,
+                    'pending',
+                    0,
+                    NULL,
+                    NULL,
+                    $2::timestamptz,
+                    NULL
                 FROM jsonb_to_recordset($1::jsonb) AS entry(
                     discovery_did text,
                     publication_cursor bigint,
@@ -1795,6 +2172,7 @@ pub(super) async fn complete_cdn_publication_jobs_impl(
                 "#
             ))
             .bind(payload)
+            .bind(Utc::now().to_rfc3339())
             .execute(&mut *tx)
             .await?;
             store_items_elapsed_ms = stage_started.elapsed().as_millis();
@@ -2648,6 +3026,9 @@ pub(super) async fn authorized_discovery_summary_items_impl(
     for item in stored_items {
         items_by_cursor.insert(item.publication_cursor, item);
     }
+    if !items_by_cursor.is_empty() {
+        return Ok(items_by_cursor.into_values().take(max_items).collect());
+    }
 
     if let Some(sqlite) = &state.sqlite {
         let window = max_items.max(1).saturating_mul(4).max(100);
@@ -2732,10 +3113,11 @@ pub(super) async fn authorized_discovery_summary_items_impl(
 async fn load_authorized_discovery_summary_items_from_store(
     state: &AppState,
     discovery_did: &str,
-    delivered_cursor: i64,
-    target_cursor: i64,
+    _delivered_cursor: i64,
+    _target_cursor: i64,
     max_items: usize,
 ) -> Result<Vec<DiscoveryNotificationItem>> {
+    let now = Utc::now();
     if let Some(sqlite) = &state.sqlite {
         let db_rows = sqlx::query(&format!(
             r#"
@@ -2743,14 +3125,15 @@ async fn load_authorized_discovery_summary_items_from_store(
                    metadata_hash, did_document_hash, resource_type, capability_tags_json,
                    authorized_domains_json
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
-            WHERE discovery_did = ? AND publication_cursor > ? AND publication_cursor <= ?
+            WHERE discovery_did = ?
+              AND status IN ('pending', 'retry')
+              AND next_attempt_at <= ?
             ORDER BY publication_cursor
             LIMIT ?
             "#
         ))
         .bind(discovery_did)
-        .bind(delivered_cursor)
-        .bind(target_cursor)
+        .bind(now.to_rfc3339())
         .bind(max_items as i64)
         .fetch_all(sqlite.pool())
         .await?;
@@ -2780,14 +3163,15 @@ async fn load_authorized_discovery_summary_items_from_store(
                    capability_tags_json::text,
                    authorized_domains_json::text
             FROM {ROOT_DISCOVERY_ITEM_TABLE}
-            WHERE discovery_did = $1 AND publication_cursor > $2 AND publication_cursor <= $3
+            WHERE discovery_did = $1
+              AND status IN ('pending', 'retry')
+              AND next_attempt_at <= $2::timestamptz
             ORDER BY publication_cursor
-            LIMIT $4
+            LIMIT $3
             "#
         ))
         .bind(discovery_did)
-        .bind(delivered_cursor)
-        .bind(target_cursor)
+        .bind(now)
         .bind(max_items as i64)
         .fetch_all(postgres.pool())
         .await?;
