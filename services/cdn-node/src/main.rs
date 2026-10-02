@@ -1891,6 +1891,7 @@ mod tests {
             resource_did: resource_did.to_owned(),
             resource_type: ResourceType::Skill,
             did_document,
+            did_document_raw: None,
             did_document_hash: String::new(),
             metadata_hash: String::new(),
             package_hash: String::new(),

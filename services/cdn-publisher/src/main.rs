@@ -1500,6 +1500,7 @@ mod tests {
                 proof: None,
                 oan_metadata: None,
             },
+            did_document_raw: None,
             did_document_hash: "sha256:document".to_owned(),
             metadata_hash: "sha256:metadata".to_owned(),
             package_hash: "sha256:package".to_owned(),
