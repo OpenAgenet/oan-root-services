@@ -22,11 +22,10 @@ use oan_credentials::{
     CredentialProof, CredentialStatusReference, InfrastructureAuthorizationCredentialSubject,
     OanIdentity, OanInfrastructureAuthorizationCredential,
 };
-#[cfg(test)]
-use oan_crypto::verify_oan_data_integrity;
 use oan_crypto::{
     build_data_integrity_proof, hash_json_with_suite, signing_key_from_private_key_jwk,
-    verify_did_document_proof, verify_did_document_proof_standard_value_blocking, SigningKey,
+    verify_did_document_proof, verify_did_document_proof_standard_value_blocking,
+    verify_oan_data_integrity, SigningKey,
 };
 use oan_package::{
     hash_resource_metadata_with_suite, ResourceMetadata, ResourcePackage, ResourcePackageClaims,
@@ -881,6 +880,26 @@ struct AuthorizationState {
     registrars: BTreeMap<String, NodeAuthorizationState>,
     discovery_nodes: BTreeMap<String, DiscoveryAuthorizationState>,
     vc_issuers: BTreeMap<String, NodeAuthorizationState>,
+    #[serde(default)]
+    governance_projections: BTreeMap<String, GovernanceProjection>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct GovernanceProjection {
+    subject_type: u8,
+    subject_type_label: String,
+    status: u8,
+    status_label: String,
+    authorized_domains: Vec<String>,
+    policy_hash: String,
+    metadata_hash: String,
+    effective_from_ms: u64,
+    expires_at_ms: u64,
+    version: u64,
+    updated_at_ms: u64,
+    last_sequence: u64,
+    last_event_digest: String,
+    synchronized_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1449,46 +1468,355 @@ async fn reconcile_governance_state(state: &AppState) -> Result<()> {
     }
     let authorization_state = current_authorization_state(state);
 
-    for did in authorization_state.registrars.keys() {
-        match ensure_governance_active(state, GovernanceSubjectType::Registrar, did).await {
-            Ok(_) => restore_local_governance_active(state, GovernanceSubjectType::Registrar, did)?,
-            Err(reason) => {
-                mark_local_governance_inactive(
-                    state,
-                    GovernanceSubjectType::Registrar,
-                    did,
-                    &reason,
-                )?;
-            }
-        }
-    }
-    for did in authorization_state.discovery_nodes.keys() {
-        match ensure_governance_active(state, GovernanceSubjectType::Discovery, did).await {
-            Ok(_) => restore_local_governance_active(state, GovernanceSubjectType::Discovery, did)?,
-            Err(reason) => {
-                mark_local_governance_inactive(
-                    state,
-                    GovernanceSubjectType::Discovery,
-                    did,
-                    &reason,
-                )?;
-            }
-        }
-    }
-    for did in authorization_state.vc_issuers.keys() {
-        match ensure_governance_active(state, GovernanceSubjectType::VcIssuer, did).await {
-            Ok(_) => restore_local_governance_active(state, GovernanceSubjectType::VcIssuer, did)?,
-            Err(reason) => {
-                mark_local_governance_inactive(
-                    state,
-                    GovernanceSubjectType::VcIssuer,
-                    did,
-                    &reason,
-                )?;
+    for (subject_type, dids) in [
+        (
+            GovernanceSubjectType::Registrar,
+            authorization_state
+                .registrars
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        (
+            GovernanceSubjectType::Discovery,
+            authorization_state
+                .discovery_nodes
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+        (
+            GovernanceSubjectType::VcIssuer,
+            authorization_state
+                .vc_issuers
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+        ),
+    ] {
+        for did in dids {
+            match ensure_governance_active(state, subject_type, &did).await {
+                Ok(_) => match fetch_governance_subject_record(state, subject_type, &did).await {
+                    Ok(subject) if governance_subject_is_active(&subject) => {
+                        if let Err(error) =
+                            sync_governance_subject(state, subject_type, &did, &subject).await
+                        {
+                            eprintln!(
+                                "failed to synchronize governance projection for {} {}: {error:#}",
+                                subject_type.label(),
+                                did
+                            );
+                        }
+                    }
+                    Ok(subject) => {
+                        mark_local_governance_inactive(
+                            state,
+                            subject_type,
+                            &did,
+                            &format!(
+                                "governance_inactive:{}",
+                                if subject.status_label.is_empty() {
+                                    "not_active"
+                                } else {
+                                    subject.status_label.as_str()
+                                }
+                            ),
+                        )?;
+                    }
+                    Err(reason) => {
+                        // Preserve the existing fail-open behavior: an unavailable or
+                        // incomplete indexer must not overwrite a known-good local state.
+                        eprintln!(
+                            "skip governance projection refresh for {} {}: {}",
+                            subject_type.label(),
+                            did,
+                            reason
+                        );
+                    }
+                },
+                Err(reason) => {
+                    mark_local_governance_inactive(state, subject_type, &did, &reason)?;
+                }
             }
         }
     }
     Ok(())
+}
+
+async fn sync_governance_subject(
+    state: &AppState,
+    subject_type: GovernanceSubjectType,
+    did: &str,
+    subject: &GovernanceSubjectRecord,
+) -> Result<()> {
+    if subject.subject_type != subject_type.code() {
+        return Err(anyhow!("governance_subject_type_mismatch"));
+    }
+    if subject.subject_did != did {
+        return Err(anyhow!("governance_subject_did_mismatch"));
+    }
+    if !governance_subject_is_active(subject) {
+        return Err(anyhow!("governance_subject_not_active"));
+    }
+    let projection_without_time = GovernanceProjection {
+        subject_type: subject.subject_type,
+        subject_type_label: subject.subject_type_label.clone(),
+        status: subject.status,
+        status_label: subject.status_label.clone(),
+        authorized_domains: subject.authorized_domains.clone(),
+        policy_hash: subject.policy_hash.clone(),
+        metadata_hash: subject.metadata_hash.clone(),
+        effective_from_ms: subject.effective_from_ms,
+        expires_at_ms: subject.expires_at_ms,
+        version: subject.version,
+        updated_at_ms: subject.updated_at_ms,
+        last_sequence: subject.last_sequence,
+        last_event_digest: subject.last_event_digest.clone(),
+        synchronized_at: Utc::now(),
+    };
+    let projection_key = format!("{}:{}", subject_type.code(), did);
+    let mut authorization_state = current_authorization_state(state);
+    let previous_projection = authorization_state
+        .governance_projections
+        .get(&projection_key)
+        .cloned();
+    let projection_changed = previous_projection
+        .as_ref()
+        .map(|previous| {
+            previous.subject_type != projection_without_time.subject_type
+                || previous.subject_type_label != projection_without_time.subject_type_label
+                || previous.status != projection_without_time.status
+                || previous.status_label != projection_without_time.status_label
+                || previous.authorized_domains != projection_without_time.authorized_domains
+                || previous.policy_hash != projection_without_time.policy_hash
+                || previous.metadata_hash != projection_without_time.metadata_hash
+                || previous.effective_from_ms != projection_without_time.effective_from_ms
+                || previous.expires_at_ms != projection_without_time.expires_at_ms
+                || previous.version != projection_without_time.version
+                || previous.updated_at_ms != projection_without_time.updated_at_ms
+                || previous.last_sequence != projection_without_time.last_sequence
+                || previous.last_event_digest != projection_without_time.last_event_digest
+        })
+        .unwrap_or(true);
+    let mut changed = projection_changed;
+    if !root_authorization_vc_is_valid(state, subject_type, did, subject).await {
+        changed = true;
+    }
+    let effective_domains = if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) {
+        validate_authorized_domain_list(&subject.authorized_domains)
+            .map_err(|error| anyhow!("invalid governed authorized domains: {error}"))?;
+        subject.authorized_domains.clone()
+    } else {
+        Vec::new()
+    };
+
+    match subject_type {
+        GovernanceSubjectType::Registrar => {
+            if let Some(entry) = authorization_state.registrars.get_mut(did) {
+                if entry.status == "governance_inactive" {
+                    entry.status = "active".to_owned();
+                    changed = true;
+                }
+                if entry.authorized_domains != effective_domains {
+                    entry.authorized_domains = effective_domains.clone();
+                    changed = true;
+                }
+                if changed {
+                    entry.updated_at = Utc::now();
+                }
+            }
+        }
+        GovernanceSubjectType::Discovery => {
+            if let Some(entry) = authorization_state.discovery_nodes.get_mut(did) {
+                if entry.status == "governance_inactive" {
+                    entry.status = "active".to_owned();
+                    changed = true;
+                }
+                if entry.authorized_domains != effective_domains {
+                    entry.authorized_domains = effective_domains.clone();
+                    changed = true;
+                }
+                if changed {
+                    entry.updated_at = Utc::now();
+                }
+            }
+        }
+        GovernanceSubjectType::VcIssuer => {
+            if let Some(entry) = authorization_state.vc_issuers.get_mut(did) {
+                if entry.status == "governance_inactive" {
+                    entry.status = "active".to_owned();
+                    changed = true;
+                }
+                if changed {
+                    entry.updated_at = Utc::now();
+                }
+            }
+        }
+    }
+    if changed {
+        persist_authorization_state(state, authorization_state)?;
+        if subject_type == GovernanceSubjectType::Discovery
+            && (state.sqlite.is_some() || state.postgres.is_some())
+        {
+            sync_discovery_target_state(state, did, "active")?;
+        }
+        refresh_root_authorization_vc(state, subject_type, did, subject).await?;
+        let mut authorization_state = current_authorization_state(state);
+        authorization_state
+            .governance_projections
+            .insert(projection_key, projection_without_time);
+        persist_authorization_state(state, authorization_state)?;
+    }
+    Ok(())
+}
+
+fn governance_subject_is_active(subject: &GovernanceSubjectRecord) -> bool {
+    match subject.status_label.as_str() {
+        "" | "active" => subject.status == 1,
+        _ => false,
+    }
+}
+
+async fn refresh_root_authorization_vc(
+    state: &AppState,
+    subject_type: GovernanceSubjectType,
+    did: &str,
+    subject: &GovernanceSubjectRecord,
+) -> Result<()> {
+    let authorization_state = current_authorization_state(state);
+    let (snapshot, endpoint) = match subject_type {
+        GovernanceSubjectType::Registrar => authorization_state
+            .registrars
+            .get(did)
+            .and_then(|entry| entry.did_document_snapshot.as_ref())
+            .map(|document| (document, "OANRegistrarService")),
+        GovernanceSubjectType::Discovery => authorization_state
+            .discovery_nodes
+            .get(did)
+            .and_then(|entry| entry.did_document_snapshot.as_ref())
+            .map(|document| (document, "OANDiscoveryService")),
+        GovernanceSubjectType::VcIssuer => authorization_state
+            .vc_issuers
+            .get(did)
+            .and_then(|entry| entry.did_document_snapshot.as_ref())
+            .map(|document| (document, "OANVcIssuerService")),
+    }
+    .ok_or_else(|| anyhow!("governance_subject_snapshot_missing:{did}"))?;
+    let endpoint = snapshot
+        .service
+        .iter()
+        .find(|service| service.service_type == endpoint)
+        .map(|service| service.service_endpoint.clone());
+    validate_infrastructure_did_prefix(&state.root_did, subject_type, did)
+        .map_err(|error| anyhow!("governance_snapshot_invalid:{error}"))?;
+    validate_infrastructure_suffix_prefix_unique(state, subject_type, did)
+        .map_err(|error| anyhow!("governance_snapshot_invalid:{error}"))?;
+    if snapshot.id != did {
+        return Err(anyhow!(
+            "governance_snapshot_invalid:did_document_subject_mismatch"
+        ));
+    }
+    let metadata = snapshot
+        .oan_metadata
+        .as_ref()
+        .ok_or_else(|| anyhow!("governance_snapshot_invalid:missing_oan_metadata"))?;
+    let expected_resource_type = match subject_type {
+        GovernanceSubjectType::Registrar => ResourceType::RegistrarNode,
+        GovernanceSubjectType::Discovery => ResourceType::DiscoveryNode,
+        GovernanceSubjectType::VcIssuer => ResourceType::VcIssuerNode,
+    };
+    if metadata.subject_type != SubjectType::InfrastructureNode
+        || metadata.resource_type != expected_resource_type
+    {
+        return Err(anyhow!("governance_snapshot_invalid:role_mismatch"));
+    }
+    let stable_hash = normalize_hash_claim(&subject.metadata_hash)
+        .map_err(|error| anyhow!("governance_subject_metadata_hash_invalid:{did}:{error}"))?;
+    let payload = InfrastructureAuthorizationVcIssuePayload {
+        subject_did: did.to_owned(),
+        role: subject_type.label().to_owned(),
+        did_document: snapshot.clone(),
+        did_document_stable_hash: stable_hash.clone(),
+        authorized_domains: if matches!(
+            subject_type,
+            GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+        ) {
+            subject.authorized_domains.clone()
+        } else {
+            Vec::new()
+        },
+        endpoint,
+    };
+    let credential =
+        build_infrastructure_authorization_credential(state, subject_type, &payload, &stable_hash)
+            .await?;
+    state
+        .data
+        .write(root_authorization_vc_path(did), &credential)?;
+    Ok(())
+}
+
+fn root_authorization_vc_path(did: &str) -> String {
+    format!(
+        "root-authorization-vcs/{}.json",
+        did_to_file_name(did).trim_end_matches(".json")
+    )
+}
+
+async fn root_authorization_vc_is_valid(
+    state: &AppState,
+    subject_type: GovernanceSubjectType,
+    did: &str,
+    subject: &GovernanceSubjectRecord,
+) -> bool {
+    let credential: OanInfrastructureAuthorizationCredential =
+        match state.data.read(root_authorization_vc_path(did)) {
+            Ok(value) => value,
+            Err(_) => return false,
+        };
+    let expected_role = subject_type.label();
+    let expected_resource_type = format!("{expected_role}_node");
+    let expected_domains: &[String] = if matches!(
+        subject_type,
+        GovernanceSubjectType::Registrar | GovernanceSubjectType::Discovery
+    ) {
+        &subject.authorized_domains
+    } else {
+        &[]
+    };
+    let Some(root_method) = state
+        .data
+        .read::<DidDocument>("did-document.json")
+        .ok()
+        .and_then(|document| {
+            document
+                .verification_method
+                .into_iter()
+                .find(|method| method.id == format!("{}#key-1", state.root_did))
+        })
+    else {
+        return false;
+    };
+    let Some(public_key_jwk) = root_method.public_key_jwk else {
+        return false;
+    };
+    credential.issuer == state.root_did
+        && credential.credential_subject.id == did
+        && credential.credential_subject.role == expected_role
+        && credential.credential_subject.resource_type == expected_resource_type
+        && credential.credential_subject.authorized_domains == *expected_domains
+        && credential.credential_subject.did_document_hash
+            == normalize_chain_metadata_hash(&subject.metadata_hash)
+        && validate_infrastructure_authorization_credential(&credential).is_ok()
+        && verify_oan_data_integrity(
+            serde_json::to_value(&credential).unwrap_or_default(),
+            public_key_jwk,
+        )
+        .await
+        .is_ok()
 }
 
 async fn ensure_governance_active(
@@ -1760,51 +2088,6 @@ fn mark_local_governance_inactive(
         did,
         reason
     );
-    Ok(())
-}
-
-fn restore_local_governance_active(
-    state: &AppState,
-    subject_type: GovernanceSubjectType,
-    did: &str,
-) -> Result<()> {
-    let mut authorization_state = current_authorization_state(state);
-    let mut changed = false;
-    match subject_type {
-        GovernanceSubjectType::Registrar => {
-            if let Some(entry) = authorization_state.registrars.get_mut(did) {
-                if entry.status == "governance_inactive" {
-                    entry.status = "active".to_owned();
-                    entry.updated_at = Utc::now();
-                    changed = true;
-                }
-            }
-        }
-        GovernanceSubjectType::Discovery => {
-            if let Some(entry) = authorization_state.discovery_nodes.get_mut(did) {
-                if entry.status == "governance_inactive" {
-                    entry.status = "active".to_owned();
-                    entry.updated_at = Utc::now();
-                    changed = true;
-                }
-            }
-            if changed && (state.sqlite.is_some() || state.postgres.is_some()) {
-                sync_discovery_target_state(state, did, "active")?;
-            }
-        }
-        GovernanceSubjectType::VcIssuer => {
-            if let Some(entry) = authorization_state.vc_issuers.get_mut(did) {
-                if entry.status == "governance_inactive" {
-                    entry.status = "active".to_owned();
-                    entry.updated_at = Utc::now();
-                    changed = true;
-                }
-            }
-        }
-    }
-    if changed {
-        persist_authorization_state(state, authorization_state)?;
-    }
     Ok(())
 }
 
@@ -8440,6 +8723,278 @@ mod tests {
                 .status,
             "revoked"
         );
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_refreshes_domains_and_projection() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let metadata_hash = format!("sha256:{}", "b".repeat(64));
+        let endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            metadata_hash.clone(),
+            vec!["finance".to_owned(), "legal".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, endpoint);
+        let registrar_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+
+        reconcile_governance_state(&state).await.unwrap();
+
+        let authorization_state =
+            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        assert_eq!(
+            authorization_state
+                .registrars
+                .get(registrar_did())
+                .unwrap()
+                .authorized_domains,
+            vec!["finance".to_owned(), "legal".to_owned()]
+        );
+        let projection = authorization_state
+            .governance_projections
+            .get(&format!(
+                "{}:{}",
+                GovernanceSubjectType::Registrar.code(),
+                registrar_did()
+            ))
+            .unwrap();
+        assert_eq!(projection.metadata_hash, metadata_hash);
+        assert_eq!(projection.last_sequence, 7);
+        assert!(state
+            .data
+            .exists(format!("{}", root_authorization_vc_path(registrar_did()))));
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_refreshes_vc_when_metadata_changes() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let first_hash = format!("sha256:{}", "c".repeat(64));
+        let first_endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            first_hash,
+            vec!["legal".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, first_endpoint);
+        reconcile_governance_state(&state).await.unwrap();
+        let first: OanInfrastructureAuthorizationCredential = state
+            .data
+            .read(root_authorization_vc_path(registrar_did()))
+            .unwrap();
+        assert_eq!(first.credential_subject.authorized_domains, vec!["legal"]);
+
+        let second_hash = format!("sha256:{}", "d".repeat(64));
+        let second_endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            second_hash.clone(),
+            vec!["finance".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, second_endpoint);
+        reconcile_governance_state(&state).await.unwrap();
+        let second: OanInfrastructureAuthorizationCredential = state
+            .data
+            .read(root_authorization_vc_path(registrar_did()))
+            .unwrap();
+        assert_eq!(
+            second.credential_subject.authorized_domains,
+            vec!["finance"]
+        );
+        assert_eq!(second.credential_subject.did_document_hash, second_hash);
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_retries_projection_when_vc_refresh_fails() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let invalid_endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            "invalid".to_owned(),
+            vec!["legal".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, invalid_endpoint);
+
+        reconcile_governance_state(&state).await.unwrap();
+
+        let failed_state =
+            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        assert!(!failed_state.governance_projections.contains_key(&format!(
+            "{}:{}",
+            GovernanceSubjectType::Registrar.code(),
+            registrar_did()
+        )));
+
+        let valid_hash = format!("sha256:{}", "e".repeat(64));
+        let valid_endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            valid_hash.clone(),
+            vec!["legal".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, valid_endpoint);
+        reconcile_governance_state(&state).await.unwrap();
+
+        let recovered_state =
+            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        assert!(recovered_state
+            .governance_projections
+            .contains_key(&format!(
+                "{}:{}",
+                GovernanceSubjectType::Registrar.code(),
+                registrar_did()
+            )));
+        let credential: OanInfrastructureAuthorizationCredential = state
+            .data
+            .read(root_authorization_vc_path(registrar_did()))
+            .unwrap();
+        assert_eq!(credential.credential_subject.did_document_hash, valid_hash);
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_repairs_missing_authorization_vc_without_projection_change()
+    {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let metadata_hash = format!("sha256:{}", "f".repeat(64));
+        let endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            metadata_hash,
+            vec!["legal".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, endpoint);
+
+        reconcile_governance_state(&state).await.unwrap();
+        std::fs::remove_file(
+            state
+                .data
+                .resolve(root_authorization_vc_path(registrar_did())),
+        )
+        .unwrap();
+        reconcile_governance_state(&state).await.unwrap();
+
+        assert!(state
+            .data
+            .exists(root_authorization_vc_path(registrar_did())));
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_refreshes_discovery_domains() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let discovery_key = generate_ed25519_keypair();
+        authorize_discovery_with_endpoint_and_domains(
+            &state,
+            &discovery_key,
+            "http://127.0.0.1:9000",
+            vec!["*".to_owned()],
+        );
+        let endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Discovery,
+            discovery_did().to_owned(),
+            format!("sha256:{}", "1".repeat(64)),
+            vec!["finance".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, endpoint);
+
+        reconcile_governance_state(&state).await.unwrap();
+
+        let authorization_state =
+            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        assert_eq!(
+            authorization_state
+                .discovery_nodes
+                .get(discovery_did())
+                .unwrap()
+                .authorized_domains,
+            vec!["finance".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_rejects_invalid_governed_domains() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let endpoint = mock_trust_indexer(
+            true,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            format!("sha256:{}", "2".repeat(64)),
+            vec!["*".to_owned(), "finance".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, endpoint);
+
+        reconcile_governance_state(&state).await.unwrap();
+
+        let authorization_state =
+            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        assert_eq!(
+            authorization_state
+                .registrars
+                .get(registrar_did())
+                .unwrap()
+                .authorized_domains,
+            vec!["*".to_owned()]
+        );
+        assert!(authorization_state.governance_projections.is_empty());
+    }
+
+    #[tokio::test]
+    async fn governance_reconciliation_rejects_inactive_subject_record() {
+        let dir = tempdir().unwrap();
+        let mut state = app_state(dir.path());
+        let registrar_key = generate_ed25519_keypair();
+        authorize_registrar(&state, &registrar_key);
+        let endpoint = mock_trust_indexer(
+            false,
+            GovernanceSubjectType::Registrar,
+            registrar_did().to_owned(),
+            format!("sha256:{}", "3".repeat(64)),
+            vec!["legal".to_owned()],
+        )
+        .await;
+        enable_trust_indexer(&mut state, endpoint);
+
+        reconcile_governance_state(&state).await.unwrap();
+
+        let authorization_state =
+            load_authorization_state(&state.config.paths.authorization_state_file).unwrap();
+        assert_eq!(
+            authorization_state
+                .registrars
+                .get(registrar_did())
+                .unwrap()
+                .status,
+            "governance_inactive"
+        );
+        assert!(authorization_state.governance_projections.is_empty());
     }
 
     #[tokio::test]
